@@ -7,7 +7,7 @@
   "exports": {
     ".": "./src/index.ts"
   },
-  "files": ["src", "skills"],
+  "files": ["src", "skills", "THIRD_PARTY_NOTICES.md"],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"

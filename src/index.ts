@@ -9,10 +9,11 @@
 
 import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
-import { readFile } from "node:fs/promises"
+import { readdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Plugin, Skill } from "@opencode/plugin"
+import { Dashboards, logExists, openInBrowser } from "./dashboard.ts"
 import {
   appendLog,
   checksPath,
@@ -29,6 +30,7 @@ import {
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
 const SKILL_ID = "autoresearch-create"
+const FINALIZE_SKILL_ID = "autoresearch-finalize"
 const OUTPUT_TAIL_LINES = 80
 
 // ── Shell helpers ─────────────────────────────────────────
@@ -104,6 +106,14 @@ async function readMaxIterations(cwd: string): Promise<number | null> {
   }
 }
 
+const HELP_TEXT = [
+  "[autoresearch] Commands:",
+  "  /autoresearch <goal>      start a session (or resume it if .auto/prompt.md exists)",
+  "  /autoresearch off         stop the loop; the log is kept",
+  "  /autoresearch dashboard   open the live results page in your browser",
+  "  /autoresearch finalize    stop the loop and split kept experiments into reviewable branches",
+].join("\n")
+
 const CONTINUE_PROMPT = [
   "[autoresearch] Continue the experiment loop.",
   "If you've lost context, re-read .auto/prompt.md, the last ~20 lines of .auto/log.jsonl,",
@@ -121,22 +131,40 @@ export default Plugin.define({
     }
     const activeKey = (sessionID: string) => `active/${sessionID}`
 
-    // ── Skill ──────────────────────────────────────────────
-    // Read before the (synchronous) transform, as the docs require.
-    const skillFile = join(ROOT, "skills", SKILL_ID, "SKILL.md")
-    const skillRaw = await readFile(skillFile, "utf8")
-    const fm = skillRaw.match(/^---\n([\s\S]*?)\n---\n/)
-    const skillDescription = fm?.[1].match(/^description:\s*(.+)$/m)?.[1].trim()
-    const skillBody = fm ? skillRaw.slice(fm[0].length) : skillRaw
+    const dashboards = new Dashboards(join(ROOT, "src", "dashboard.html"))
+
+    // ── Skills ─────────────────────────────────────────────
+    // Every skills/<id>/SKILL.md is registered. Files are read before the
+    // (synchronous) transform, as the docs require. `<SKILL_DIR>` in a skill is
+    // replaced with its absolute folder, so it can point at bundled scripts.
+    const skillsRoot = join(ROOT, "skills")
+    const skills = await Promise.all(
+      (await readdir(skillsRoot, { withFileTypes: true }))
+        .filter((d) => d.isDirectory() && existsSync(join(skillsRoot, d.name, "SKILL.md")))
+        .map(async (d) => {
+          const dir = join(skillsRoot, d.name)
+          const file = join(dir, "SKILL.md")
+          const raw = await readFile(file, "utf8")
+          const fm = raw.match(/^---\n([\s\S]*?)\n---\n/)
+          return {
+            id: d.name,
+            file,
+            description: fm?.[1].match(/^description:\s*(.+)$/m)?.[1].trim(),
+            content: (fm ? raw.slice(fm[0].length) : raw).replaceAll("<SKILL_DIR>", dir),
+          }
+        }),
+    )
 
     await ctx.skill.transform((editor) => {
-      editor.add({
-        id: Skill.ID.make(SKILL_ID),
-        name: Skill.Name.make(SKILL_ID),
-        description: skillDescription,
-        path: Skill.Info.fields.path.make(skillFile),
-        content: skillBody,
-      })
+      for (const s of skills) {
+        editor.add({
+          id: Skill.ID.make(s.id),
+          name: Skill.Name.make(s.id),
+          description: s.description,
+          path: Skill.Info.fields.path.make(s.file),
+          content: s.content,
+        })
+      }
     })
 
     // ── Tools ──────────────────────────────────────────────
@@ -216,15 +244,21 @@ export default Plugin.define({
           }
 
           await progress({ status: `running ${command}` })
-          const bench = await sh(command, cwd, timeout_seconds * 1000, signal)
+          dashboards.setStatus(cwd, { running: true, command, startedAt: Date.now() })
+          let bench: ShellResult
+          let checks: ShellResult | null = null
+          try {
+            bench = await sh(command, cwd, timeout_seconds * 1000, signal)
+            if (bench.code === 0 && existsSync(checksPath(cwd))) {
+              await progress({ status: "running checks" })
+              dashboards.setStatus(cwd, { running: true, command: "checks.sh", startedAt: Date.now() })
+              checks = await sh(checksPath(cwd), cwd, checks_timeout_seconds * 1000, signal)
+            }
+          } finally {
+            dashboards.setStatus(cwd, { running: false })
+          }
           const metrics = parseMetrics(bench.output)
           const primary = metrics[config.metric_name]
-
-          let checks: ShellResult | null = null
-          if (bench.code === 0 && existsSync(checksPath(cwd))) {
-            await progress({ status: "running checks" })
-            checks = await sh(checksPath(cwd), cwd, checks_timeout_seconds * 1000, signal)
-          }
           const checksFailed = checks !== null && checks.code !== 0
           lastChecksFailed.set(sessionID, checksFailed)
 
@@ -345,14 +379,42 @@ export default Plugin.define({
     await ctx.command.transform((editor) => {
       editor.add({
         name: "autoresearch",
-        description: "Start or resume the autoresearch loop (`/autoresearch <goal>`), or stop it (`/autoresearch off`)",
+        description: "Autoresearch loop: `<goal>` start/resume · `off` · `dashboard` · `finalize` · `help`",
         execute: async ({ sessionID, prompt, delivery }) => {
           const arg = prompt.text.trim()
-          if (arg === "off") {
+          const say = (text: string) => ctx.session.synthetic({ sessionID: sessionID as never, text })
+          const sub = arg.toLowerCase()
+
+          if (sub === "help" || sub === "--help" || sub === "-h") {
+            await say(HELP_TEXT)
+            return
+          }
+
+          if (sub === "off") {
             await ctx.storage.remove(activeKey(sessionID))
-            await ctx.session.synthetic({
+            await say("[autoresearch] Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes.")
+            return
+          }
+
+          if (sub === "dashboard" || sub === "export") {
+            const cwd = await cwdOf(sessionID)
+            const url = await dashboards.open(cwd)
+            openInBrowser(url)
+            const note = (await logExists(cwd)) ? "" : " No experiments yet; it fills in as they run."
+            await say(`[autoresearch] Live dashboard: ${url}${note}`)
+            return
+          }
+
+          if (sub === "finalize") {
+            // Turn the loop off first so it doesn't keep experimenting while branches are cut.
+            // If an experiment is mid-run, the request is delivered when the agent's current step ends.
+            await ctx.storage.remove(activeKey(sessionID))
+            await ctx.session.prompt({
+              ...prompt,
               sessionID: sessionID as never,
-              text: "[autoresearch] Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes.",
+              text: "Finalize this autoresearch session into clean, reviewable branches.",
+              skills: [...(prompt.skills ?? []), { id: Skill.ID.make(FINALIZE_SKILL_ID) }],
+              delivery,
             })
             return
           }
@@ -443,6 +505,9 @@ export default Plugin.define({
       }
     })()
 
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      dashboards.closeAll()
+    }
   },
 })

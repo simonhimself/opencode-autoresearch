@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autoresearch</title>
+<link rel="icon" href="data:,">
+<style>
+  /* Class display rules (e.g. .pill's inline-flex) would otherwise beat the hidden attribute. */
+  [hidden] { display: none !important; }
+  :root {
+    --bg: #fbfbfa; --panel: #ffffff; --fg: #1d1d1f; --muted: #6b6b70; --line: #e4e4e2; --soft: #f2f2f0;
+    --keep: #1f9d55; --discard: #9a9aa0; --crash: #d64545; --checks: #c98a12; --accent: #3b6fd8;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --panel: #1c1c1f; --fg: #e8e8ea; --muted: #9a9aa2; --line: #2e2e33; --soft: #242428;
+      --keep: #3fbf74; --discard: #75757d; --crash: #ef6b6b; --checks: #e0a83a; --accent: #6f9bf0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  .num, td.num, .stat .v { font-variant-numeric: tabular-nums; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 14px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; word-break: break-word; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--soft); color: var(--muted); white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--discard); }
+  .pill.live .dot { background: var(--keep); }
+  .pill.reconnecting .dot { background: var(--checks); }
+  .pill.running { color: var(--fg); max-width: 100%; }
+  .pill.running code { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; max-width: 38ch; }
+  .spin { width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .note { font-size: 12px; color: var(--muted); margin: -6px 0 12px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; min-width: 0; }
+  .stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .stat .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+  .stat .d { font-size: 12px; color: var(--muted); }
+  .good { color: var(--keep) !important; } .bad { color: var(--crash) !important; } .warn { color: var(--checks) !important; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 14px; }
+  #chart { position: relative; padding: 8px 8px 4px; }
+  #chart svg { display: block; width: 100%; }
+  #chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); padding: 0 8px 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  #tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 12px; padding: 6px 8px; border-radius: 6px; max-width: 280px; display: none; z-index: 2; }
+  #tip b { font-variant-numeric: tabular-nums; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 13px; }
+  th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th.num, td.num { text-align: right; white-space: nowrap; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: var(--soft); }
+  tr.detail td { background: var(--soft); padding: 8px 10px 10px 36px; }
+  .tog { color: var(--muted); display: inline-block; width: 12px; transition: transform .12s; }
+  tr.open .tog { transform: rotate(90deg); }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 4px; white-space: nowrap; border: 1px solid currentColor; }
+  .s-keep { color: var(--keep); } .s-discard { color: var(--discard); } .s-crash { color: var(--crash); } .s-checks_failed { color: var(--checks); }
+  .commit { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .desc { min-width: 220px; word-break: break-word; }
+  dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; font-size: 12.5px; }
+  dl.kv dt { color: var(--muted); font-family: var(--mono); }
+  dl.kv dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
+  .kvh { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; margin: 6px 0 3px; }
+  .kvh:first-child { margin-top: 0; }
+  .empty { text-align: center; color: var(--muted); padding: 48px 16px; }
+  @media (max-width: 480px) { main { padding: 10px; } .stat .v { font-size: 17px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1 id="name">autoresearch</h1>
+      <div class="sub" id="metricinfo"></div>
+    </div>
+    <div class="spacer"></div>
+    <span class="pill running" id="running" hidden><span class="spin"></span><code id="runcmd"></code><span class="num" id="elapsed">00:00</span></span>
+    <span class="pill" id="conn"><span class="dot"></span><span id="conntext">connecting</span></span>
+  </header>
+  <div class="note" id="segnote" hidden></div>
+  <div id="content"><div class="empty">Loading…</div></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const STATUS_LABEL = { keep: "kept", discard: "discarded", crash: "crash", checks_failed: "checks failed" };
+const STATUS_VAR = { keep: "--keep", discard: "--discard", crash: "--crash", checks_failed: "--checks" };
+
+// ---------- helpers ----------
+function h(tag, attrs, ...kids) {
+  // Build DOM nodes; all text goes through textContent so model-written strings are never parsed as HTML.
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v; else if (k.startsWith("on")) el.addEventListener(k.slice(2), v); else el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid != null) el.append(kid instanceof Node ? kid : String(kid));
+  return el;
+}
+function svg(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  return el;
+}
+const isNum = (x) => typeof x === "number" && Number.isFinite(x);
+function fmt(x) {
+  if (!isNum(x)) return "—";
+  return String(Number(x.toPrecision(5)));
+}
+const better = (a, b, dir) => (dir === "higher" ? a > b : a < b);
+function pct(v, base) {
+  if (!isNum(v) || !isNum(base) || base === 0) return null;
+  return ((v - base) / Math.abs(base)) * 100;
+}
+function fmtPct(p) {
+  if (p == null) return "—";
+  const s = Math.abs(p) >= 100 ? p.toFixed(0) : Math.abs(p) >= 10 ? p.toFixed(1) : p.toFixed(2);
+  return (p > 0 ? "+" : "") + s + "%";
+}
+// A change is "good" when it moves in the configured direction.
+const pctClass = (p, dir) => (p == null || p === 0 ? "" : (dir === "higher" ? p > 0 : p < 0) ? "good" : "bad");
+// Free-form note values are shown as written; only figures (metrics) get rounded.
+function valText(v, round) {
+  if (v == null) return "null";
+  if (typeof v === "string") return v;
+  if (typeof v === "number") return round ? fmt(v) : String(v);
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+}
+function mmss(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60;
+  const p = (n) => String(n).padStart(2, "0");
+  return (hh ? hh + ":" + p(mm) : p(mm)) + ":" + p(ss);
+}
+
+// ---------- state ----------
+let model = null;            // { config, runs, hiddenSegments }
+const expanded = new Set();  // run numbers whose detail row is open (survives re-renders)
+let fetchSeq = 0;
+
+function parseLog(text) {
+  const entries = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e && (e.type === "config" || e.type === "run")) entries.push(e);
+    } catch { /* skip unparsable lines */ }
+  }
+  // Mirror currentSegment() in state.ts: last config wins; only its runs count.
+  const configs = entries.filter((e) => e.type === "config");
+  const config = configs[configs.length - 1] || null;
+  const runs = config ? entries.filter((e) => e.type === "run" && e.segment === config.segment) : [];
+  const segs = new Set(entries.map((e) => e.segment));
+  const hiddenSegments = config ? [...segs].filter((s) => s !== config.segment).length : 0;
+  return { config, runs, hiddenSegments };
+}
+
+async function loadLog() {
+  const seq = ++fetchSeq;
+  try {
+    const res = await fetch("/log.jsonl", { cache: "no-store" });
+    const text = res.ok ? await res.text() : "";
+    if (seq !== fetchSeq) return; // a newer fetch started; drop this stale one
+    model = parseLog(text);
+  } catch {
+    if (seq !== fetchSeq) return;
+    if (!model) model = { config: null, runs: [], hiddenSegments: 0 };
+  }
+  render();
+}
+
+// ---------- rendering ----------
+function render() {
+  const { config, runs, hiddenSegments } = model;
+  const content = $("content");
+  content.replaceChildren();
+  const segnote = $("segnote");
+  segnote.hidden = !hiddenSegments;
+  segnote.textContent = hiddenSegments ? `${hiddenSegments} earlier segment${hiddenSegments > 1 ? "s" : ""} hidden` : "";
+
+  if (!config) {
+    $("name").textContent = "autoresearch";
+    $("metricinfo").textContent = "";
+    document.title = "autoresearch";
+    content.append(h("div", { class: "card empty" }, "No experiments yet"));
+    return;
+  }
+  const dir = config.direction === "higher" ? "higher" : "lower";
+  $("name").textContent = config.name || "autoresearch";
+  document.title = (config.name || "autoresearch") + " · autoresearch";
+  $("metricinfo").textContent = `${config.metric_name || "metric"}${config.metric_unit ? " (" + config.metric_unit + ")" : ""} · ${dir} is better`;
+
+  if (!runs.length) {
+    content.append(h("div", { class: "card empty" }, "No experiments yet"));
+    return;
+  }
+  // Mirror summarize() in state.ts: baseline = first run; best = best kept run (baseline counts as kept).
+  const baseline = isNum(runs[0].metric) ? runs[0].metric : null;
+  let best = baseline;
+  for (const r of runs) if (r.status === "keep" && isNum(r.metric) && (best == null || better(r.metric, best, dir))) best = r.metric;
+
+  content.append(renderStats(runs, baseline, best, dir, config), renderChartCard(), renderTable(runs, baseline, dir));
+  drawChart(runs, baseline, dir, config);
+}
+
+function stat(k, v, d, cls) {
+  return h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v " + (cls || "") }, v), h("div", { class: "d" }, d || " "));
+}
+
+function renderStats(runs, baseline, best, dir, config) {
+  const unit = config.metric_unit ? " " + config.metric_unit : "";
+  const imp = pct(best, baseline);
+  const count = (s) => runs.filter((r) => r.status === s).length;
+  const breakdown = `${count("keep")} kept · ${count("discard")} discarded · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
+  let conf = null;
+  for (let i = runs.length - 1; i >= 0; i--) if (isNum(runs[i].confidence)) { conf = runs[i].confidence; break; }
+  let confLabel = "not enough data", confCls = "";
+  if (conf != null) {
+    if (conf >= 2) { confLabel = "likely real"; confCls = "good"; }
+    else if (conf >= 1) { confLabel = "marginal"; confCls = "warn"; }
+    else { confLabel = "within noise"; confCls = "bad"; }
+  }
+  return h("div", { class: "stats" },
+    stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), "run #" + runs[0].run),
+    stat("Best", fmt(best) + (best != null ? unit : ""), best != null && best !== baseline ? "kept" : "baseline"),
+    stat("Improvement", fmtPct(imp), "vs baseline", pctClass(imp, dir)),
+    stat("Runs", String(runs.length), breakdown),
+    stat("Confidence", conf == null ? "—" : fmt(conf) + "×", confLabel, confCls),
+  );
+}
+
+function renderChartCard() {
+  const legend = h("div", { class: "legend" },
+    ...["keep", "discard", "crash", "checks_failed"].map((s) =>
+      h("span", {}, h("span", { class: "dot", style: `background:var(${STATUS_VAR[s]})` }), STATUS_LABEL[s])),
+    h("span", {}, h("span", { style: "display:inline-block;width:14px;border-top:2px solid var(--keep)" }), "best so far"),
+    h("span", {}, h("span", { style: "display:inline-block;width:14px;border-top:1px dashed var(--muted)" }), "baseline"));
+  return h("div", { class: "card" }, h("div", { id: "chart" }, h("div", { id: "tip" })), legend);
+}
+
+// "Nice" axis ticks (1, 2, 5 × 10^n).
+function ticks(min, max, n) {
+  const span = max - min, raw = span / Math.max(1, n);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => span / s <= n) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-9; v += step) out.push(Number(v.toPrecision(12)));
+  return out;
+}
+
+let chartArgs = null;
+function drawChart(...args) {
+  chartArgs = args;
+  const [runs, baseline, dir, config] = args;
+  const box = $("chart");
+  if (!box) return;
+  box.querySelector("svg")?.remove();
+  const W = Math.max(280, box.clientWidth - 16), H = W < 500 ? 200 : 260;
+  const m = { l: 52, r: 12, t: 10, b: 26 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+
+  // Crash runs often carry a placeholder metric (e.g. 0), so they don't shape the Y range; they're pinned to the bottom edge.
+  const scaled = runs.filter((r) => r.status !== "crash" && isNum(r.metric)).map((r) => r.metric);
+  if (!scaled.length && isNum(baseline)) scaled.push(baseline);
+  let lo = scaled.length ? Math.min(...scaled) : 0, hi = scaled.length ? Math.max(...scaled) : 1;
+  if (hi === lo) { const pad = Math.abs(lo) * 0.05 || 1; lo -= pad; hi += pad; }
+  const padY = (hi - lo) * 0.08; lo -= padY; hi += padY;
+  const nums = runs.map((r) => r.run).filter(isNum);
+  let xlo = Math.min(...nums), xhi = Math.max(...nums);
+  if (xhi === xlo) { xlo -= 1; xhi += 1; }
+  const X = (v) => m.l + ((v - xlo) / (xhi - xlo)) * pw;
+  const Y = (v) => m.t + (1 - (v - lo) / (hi - lo)) * ph;
+
+  const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "metric per run" });
+  const gridColor = "var(--line)";
+  for (const t of ticks(lo, hi, H < 220 ? 4 : 5)) {
+    s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: gridColor }));
+    const tx = svg("text", { x: m.l - 6, y: Y(t) + 4, "text-anchor": "end" }); tx.textContent = fmt(t); s.append(tx);
+  }
+  const xt = ticks(xlo, xhi, Math.max(2, Math.floor(pw / 60))).filter((v) => Number.isInteger(v));
+  for (const t of xt) {
+    const tx = svg("text", { x: X(t), y: H - 8, "text-anchor": "middle" }); tx.textContent = "#" + t; s.append(tx);
+  }
+  s.append(svg("line", { x1: m.l, x2: W - m.r, y1: m.t + ph, y2: m.t + ph, stroke: "var(--muted)", "stroke-opacity": ".4" }));
+  if (isNum(baseline)) s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(baseline), y2: Y(baseline), stroke: "var(--muted)", "stroke-dasharray": "4 4" }));
+
+  // Best-so-far step line: starts at baseline, only kept runs can move it.
+  if (isNum(baseline)) {
+    let best = baseline, d = `M${X(runs[0].run)},${Y(best)}`;
+    for (const r of runs.slice(1)) {
+      if (r.status === "keep" && isNum(r.metric) && better(r.metric, best, dir)) { d += `H${X(r.run)}V${Y(r.metric)}`; best = r.metric; }
+    }
+    d += `H${X(runs[runs.length - 1].run)}`;
+    s.append(svg("path", { d, fill: "none", stroke: "var(--keep)", "stroke-width": 2, "stroke-opacity": ".75" }));
+  }
+
+  const tip = $("tip");
+  for (const r of runs) {
+    const pinned = r.status === "crash" || !isNum(r.metric);
+    const cx = X(r.run), cy = pinned ? m.t + ph : Y(r.metric);
+    const color = `var(${STATUS_VAR[r.status] || "--discard"})`;
+    let dot;
+    if (r.status === "crash") {
+      dot = svg("path", { d: `M${cx - 4},${cy - 4}L${cx + 4},${cy + 4}M${cx + 4},${cy - 4}L${cx - 4},${cy + 4}`, stroke: color, "stroke-width": 2.2 });
+    } else {
+      dot = svg("circle", { cx, cy, r: r.status === "keep" ? 4.5 : 3.5, fill: color, stroke: "var(--panel)", "stroke-width": 1 });
+    }
+    const hit = svg("circle", { cx, cy, r: 9, fill: "transparent", style: "cursor:pointer" });
+    const show = () => {
+      tip.replaceChildren(
+        h("div", {}, h("b", {}, "#" + r.run), " · ", STATUS_LABEL[r.status] || String(r.status), " · ", h("b", {}, fmt(r.metric) + (config.metric_unit ? " " + config.metric_unit : ""))),
+        h("div", {}, String(r.description ?? "")));
+      tip.style.display = "block";
+      const bw = box.clientWidth, tw = tip.offsetWidth, th = tip.offsetHeight;
+      let left = cx + 8 + 12; if (left + tw > bw - 4) left = cx + 8 - tw - 12;
+      let top = cy + 8 - th - 8; if (top < 2) top = cy + 8 + 12;
+      tip.style.left = Math.max(4, left) + "px"; tip.style.top = top + "px";
+    };
+    hit.addEventListener("mouseenter", show);
+    hit.addEventListener("click", show);
+    hit.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+    s.append(dot, hit);
+  }
+  box.append(s);
+}
+
+function renderTable(runs, baseline, dir) {
+  const tbody = h("tbody");
+  for (const r of [...runs].reverse()) {
+    const key = r.segment + ":" + r.run; // run numbers restart in each segment
+    const open = expanded.has(key);
+    const p = r.status === "crash" ? null : pct(r.metric, baseline);
+    const row = h("tr", { class: "row" + (open ? " open" : "") },
+      h("td", { class: "num" }, h("span", { class: "tog" }, "▸"), " ", String(r.run)),
+      h("td", {}, h("span", { class: "badge s-" + r.status }, STATUS_LABEL[r.status] || String(r.status))),
+      h("td", { class: "num" }, r.status === "crash" ? "—" : fmt(r.metric)), // crashes carry a placeholder metric
+      h("td", { class: "num " + pctClass(p, dir) }, r === runs[0] ? "baseline" : fmtPct(p)),
+      h("td", { class: "desc" }, String(r.description ?? "")),
+      h("td", { class: "commit" }, r.commit ? String(r.commit) : "—"));
+    const detail = h("tr", { class: "detail" }, h("td", { colspan: 6 }, renderDetail(r)));
+    detail.hidden = !open;
+    row.addEventListener("click", () => {
+      if (expanded.has(key)) expanded.delete(key); else expanded.add(key);
+      detail.hidden = !expanded.has(key);
+      row.classList.toggle("open", expanded.has(key));
+    });
+    tbody.append(row, detail);
+  }
+  const head = h("thead", {}, h("tr", {},
+    h("th", { class: "num" }, "#"), h("th", {}, "Status"), h("th", { class: "num" }, "Metric"),
+    h("th", { class: "num" }, "Δ base"), h("th", {}, "Description"), h("th", {}, "Commit")));
+  return h("div", { class: "card tablewrap" }, h("table", {}, head, tbody));
+}
+
+function kvList(obj, round) {
+  const dl = h("dl", { class: "kv" });
+  for (const [k, v] of Object.entries(obj)) dl.append(h("dt", {}, k), h("dd", {}, valText(v, round)));
+  return dl;
+}
+function renderDetail(r) {
+  const wrap = h("div");
+  const asi = r.asi && typeof r.asi === "object" ? r.asi : null;
+  const metrics = r.metrics && typeof r.metrics === "object" ? r.metrics : null;
+  if (asi && Object.keys(asi).length) wrap.append(h("div", { class: "kvh" }, "Notes"), kvList(asi));
+  if (metrics && Object.keys(metrics).length) wrap.append(h("div", { class: "kvh" }, "Metrics"), kvList(metrics, true));
+  const extra = [];
+  if (isNum(r.confidence)) extra.push("confidence " + fmt(r.confidence) + "×");
+  if (r.timestamp) extra.push(String(r.timestamp));
+  if (extra.length) wrap.append(h("div", { class: "kvh" }, extra.join(" · ")));
+  if (!wrap.childNodes.length) wrap.append(h("span", { class: "sub" }, "No notes"));
+  return wrap;
+}
+
+// ---------- live connection ----------
+let tickTimer = null;
+function setStatus(st) {
+  const el = $("running");
+  clearInterval(tickTimer); tickTimer = null;
+  if (!st || !st.running) { el.hidden = true; return; }
+  el.hidden = false;
+  $("runcmd").textContent = st.command ? String(st.command) : "running";
+  $("runcmd").title = st.command ? String(st.command) : "";
+  const start = isNum(st.startedAt) ? st.startedAt : Date.now();
+  const tick = () => { $("elapsed").textContent = mmss(Date.now() - start); };
+  tick();
+  tickTimer = setInterval(tick, 1000);
+}
+function setConn(state) {
+  $("conn").className = "pill " + state;
+  $("conntext").textContent = state;
+}
+
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => { setConn("live"); loadLog(); }; // fires on every (re)connect
+  es.onerror = () => {
+    setConn(es.readyState === EventSource.CLOSED ? "offline" : "reconnecting");
+    // Browsers give up on some errors (e.g. server returned non-200); retry manually then.
+    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 3000);
+  };
+  es.addEventListener("log", () => loadLog());
+  es.addEventListener("status", (ev) => {
+    try { setStatus(JSON.parse(ev.data)); } catch { /* ignore malformed status */ }
+  });
+}
+
+// Redraw the chart at the real pixel width (not a scaled viewBox) so tick labels stay readable; ignore height-only changes.
+let lastWidth = 0;
+new ResizeObserver(([e]) => {
+  const w = Math.round(e.contentRect.width);
+  if (w === lastWidth) return;
+  lastWidth = w;
+  if (chartArgs && $("chart")) drawChart(...chartArgs);
+}).observe(document.querySelector("main"));
+loadLog();
+connect();
+</script>
+</body>
+</html>

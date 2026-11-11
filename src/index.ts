@@ -13,6 +13,7 @@ import { readdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Plugin, Skill } from "@opencode/plugin"
+import { buildCompactionSummary, PLUGIN_PROMPT_PREFIX } from "./compaction.ts"
 import { Dashboards, logExists, openInBrowser } from "./dashboard.ts"
 import {
   appendLog,
@@ -86,6 +87,8 @@ const fmt = (n: number | null | undefined) =>
 /** Persisted in plugin storage under `active/<sessionID>` while the loop is on. */
 interface ActiveState {
   directory: string
+  /** Number of logged runs when the loop was turned on. Auto-continue waits until there are more. */
+  startRunCount: number
   /** Number of logged runs when we last auto-continued; detects a stalled agent. */
   lastRunCount: number
   /** Consecutive auto-continues with no new logged run. */
@@ -114,8 +117,17 @@ const HELP_TEXT = [
   "  /autoresearch finalize    stop the loop and split kept experiments into reviewable branches",
 ].join("\n")
 
+const INSTRUCTION_KEY = "autoresearch"
+const ACTIVE_INSTRUCTION = [
+  "Autoresearch mode is ON in this session: you are running an autonomous experiment loop.",
+  "Use init_experiment, run_experiment and log_experiment. Session state lives in .auto/:",
+  "prompt.md (goal and rules), log.jsonl (every run), ideas.md (backlog).",
+  "Don't ask whether to continue; keep running experiments until the user stops the loop.",
+].join(" ")
+
+// Must start with PLUGIN_PROMPT_PREFIX so the compaction summary can tell it apart from the user's messages.
 const CONTINUE_PROMPT = [
-  "[autoresearch] Continue the experiment loop.",
+  `${PLUGIN_PROMPT_PREFIX} Continue the experiment loop.`,
   "If you've lost context, re-read .auto/prompt.md, the last ~20 lines of .auto/log.jsonl,",
   ".auto/ideas.md (if present) and `git log --oneline -20` first. Then run the next experiment.",
 ].join(" ")
@@ -130,6 +142,23 @@ export default Plugin.define({
       return session.location.directory as string
     }
     const activeKey = (sessionID: string) => `active/${sessionID}`
+
+    // Loop on/off. Besides the storage flag, "on" pins a short note into the session's
+    // instructions. Instructions aren't part of the conversation, so compaction can't
+    // drop it: the agent always knows it's in autoresearch mode and where its state lives.
+    // (Instruction entries are an experimental OpenCode API, so failures are only logged.)
+    const activate = async (sessionID: string, state: ActiveState) => {
+      await ctx.storage.set(activeKey(sessionID), state as never)
+      await ctx.session.instructions.entry
+        .put({ sessionID: sessionID as never, key: INSTRUCTION_KEY as never, value: ACTIVE_INSTRUCTION })
+        .catch((err) => console.error("[autoresearch] couldn't pin instructions:", err))
+    }
+    const deactivate = async (sessionID: string) => {
+      await ctx.storage.remove(activeKey(sessionID))
+      await ctx.session.instructions.entry
+        .remove({ sessionID: sessionID as never, key: INSTRUCTION_KEY as never })
+        .catch(() => {}) // fine if it was never pinned
+    }
 
     const dashboards = new Dashboards(join(ROOT, "src", "dashboard.html"))
 
@@ -391,7 +420,7 @@ export default Plugin.define({
           }
 
           if (sub === "off") {
-            await ctx.storage.remove(activeKey(sessionID))
+            await deactivate(sessionID)
             await say("[autoresearch] Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes.")
             return
           }
@@ -408,7 +437,7 @@ export default Plugin.define({
           if (sub === "finalize") {
             // Turn the loop off first so it doesn't keep experimenting while branches are cut.
             // If an experiment is mid-run, the request is delivered when the agent's current step ends.
-            await ctx.storage.remove(activeKey(sessionID))
+            await deactivate(sessionID)
             await ctx.session.prompt({
               ...prompt,
               sessionID: sessionID as never,
@@ -421,8 +450,8 @@ export default Plugin.define({
 
           const cwd = await cwdOf(sessionID)
           const runCount = (await readLog(cwd)).filter((e) => e.type === "run").length
-          const state: ActiveState = { directory: cwd, lastRunCount: runCount, stalls: 0 }
-          await ctx.storage.set(activeKey(sessionID), state as never)
+          const state: ActiveState = { directory: cwd, startRunCount: runCount, lastRunCount: runCount, stalls: 0 }
+          await activate(sessionID, state)
 
           if (existsSync(promptPath(cwd))) {
             await ctx.session.prompt({
@@ -444,6 +473,27 @@ export default Plugin.define({
       })
     })
 
+    // ── Compaction ─────────────────────────────────────────
+    // While the loop is on, write the compaction summary from .auto/ instead of letting
+    // the model summarize the chat (see compaction.ts for why). Setting event.result
+    // skips the model call. Sessions without an active loop are left untouched.
+    await ctx.session.hook("compaction", async (event) => {
+      const state = (await ctx.storage.get(activeKey(event.sessionID))) as ActiveState | undefined
+      if (!state) return
+      try {
+        const userMessages = event.messages.flatMap((m) =>
+          m.role === "user"
+            ? [m.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n")]
+            : [],
+        )
+        const summary = await buildCompactionSummary(state.directory, userMessages)
+        event.result = { summary, metadata: { source: "opencode-autoresearch" } }
+      } catch (err) {
+        // Leave event.result unset: OpenCode then writes its normal summary.
+        console.error("[autoresearch] compaction summary failed, using the default:", err)
+      }
+    })
+
     // ── Keep looping ───────────────────────────────────────
     // session.idle fires after every finished turn. If autoresearch is active for that
     // session, nudge it to continue. Storage is re-read on every event so `/autoresearch off`
@@ -460,6 +510,9 @@ export default Plugin.define({
 
         const entries = await readLog(state.directory)
         const runCount = entries.filter((e) => e.type === "run").length
+        // Until the first experiment is logged, the agent is still setting up and may be
+        // waiting for the user's answers. Nudging it then would push past those questions.
+        if (runCount <= (state.startRunCount ?? 0)) return
         const stalls = runCount > state.lastRunCount ? 0 : state.stalls + 1
 
         const { runs } = currentSegment(entries)
@@ -467,7 +520,7 @@ export default Plugin.define({
         const hitMax = max !== null && runs.length >= max
 
         if (stalls >= MAX_STALLS || hitMax) {
-          await ctx.storage.remove(activeKey(sessionID))
+          await deactivate(sessionID)
           await ctx.session.synthetic({
             sessionID: sessionID as never,
             text: hitMax
@@ -495,7 +548,7 @@ export default Plugin.define({
           const sessionID = event.data.sessionID as string
           if (event.type === "session.execution.interrupted") {
             // The user pressed stop: respect it and turn the loop off.
-            await ctx.storage.remove(activeKey(sessionID))
+            await deactivate(sessionID)
           } else {
             void onIdle(sessionID)
           }

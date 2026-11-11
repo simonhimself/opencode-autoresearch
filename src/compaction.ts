@@ -30,6 +30,16 @@ const ASI_FIELDS: [key: string, label: string][] = [
 
 /** Our own auto-continue prompts start with this; they aren't the user's instructions. */
 export const PLUGIN_PROMPT_PREFIX = "[autoresearch]"
+/** Marks the user's text inside a plugin prompt (`/autoresearch <text>` on resume), so it can be kept. */
+export const USER_CONTEXT_LABEL = "Additional context from the user:"
+
+/** The user's own words in a message, or "" if it's purely one of the plugin's prompts. */
+function userText(message: string): string {
+  const m = message.trim()
+  if (!m.startsWith(PLUGIN_PROMPT_PREFIX)) return m
+  const i = m.indexOf(USER_CONTEXT_LABEL)
+  return i === -1 ? "" : m.slice(i + USER_CONTEXT_LABEL.length).trim()
+}
 
 export async function buildCompactionSummary(cwd: string, userMessages: string[]): Promise<string> {
   const entries = await readLog(cwd)
@@ -76,10 +86,7 @@ function sessionSection(config: ReturnType<typeof currentSegment>["config"], run
 
 /** The user's own messages: steering like "focus on X" or "don't touch Y" must survive compaction. */
 function userSection(messages: string[]): string {
-  const notes = messages
-    .map((m) => m.trim())
-    .filter((m) => m && !m.startsWith(PLUGIN_PROMPT_PREFIX))
-    .slice(-MAX_USER_NOTES)
+  const notes = messages.map(userText).filter(Boolean).slice(-MAX_USER_NOTES)
   if (!notes.length) return ""
   const lines = notes.map((m) => `- ${truncate(m.replace(/\s+/g, " "), MAX_USER_NOTE_CHARS)}`)
   return ["## What the user said in this session (oldest first)", "", ...lines].join("\n")

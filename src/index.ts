@@ -13,7 +13,7 @@ import { readdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Plugin, Skill } from "@opencode/plugin"
-import { buildCompactionSummary, PLUGIN_PROMPT_PREFIX } from "./compaction.ts"
+import { buildCompactionSummary, PLUGIN_PROMPT_PREFIX, USER_CONTEXT_LABEL } from "./compaction.ts"
 import { Dashboards, logExists, openInBrowser } from "./dashboard.ts"
 import {
   appendLog,
@@ -457,7 +457,7 @@ export default Plugin.define({
             await ctx.session.prompt({
               ...prompt,
               sessionID: sessionID as never,
-              text: `${CONTINUE_PROMPT}${arg ? `\n\nAdditional context from the user: ${arg}` : ""}`,
+              text: `${CONTINUE_PROMPT}${arg ? `\n\n${USER_CONTEXT_LABEL} ${arg}` : ""}`,
               delivery,
             })
           } else {
@@ -495,13 +495,15 @@ export default Plugin.define({
     })
 
     // ── Keep looping ───────────────────────────────────────
-    // session.idle fires after every finished turn. If autoresearch is active for that
-    // session, nudge it to continue. Storage is re-read on every event so `/autoresearch off`
-    // takes effect immediately.
+    // session.execution.succeeded fires when a turn finishes. If autoresearch is active for
+    // that session, nudge it to continue. Storage is re-read on every event so
+    // `/autoresearch off` takes effect immediately.
+    // (Not session.idle: it's in the event list but isn't delivered to plugins, as tested
+    // on OpenCode 2.2.5.)
     const controller = new AbortController()
     const inFlight = new Set<string>()
 
-    const onIdle = async (sessionID: string) => {
+    const onTurnEnd = async (sessionID: string) => {
       if (inFlight.has(sessionID)) return
       inFlight.add(sessionID)
       try {
@@ -533,7 +535,7 @@ export default Plugin.define({
         await ctx.storage.set(activeKey(sessionID), { ...state, lastRunCount: runCount, stalls } as never)
         await ctx.session.prompt({ sessionID: sessionID as never, text: CONTINUE_PROMPT, delivery: "queue" })
       } catch (err) {
-        console.error("[autoresearch] idle handler failed:", err)
+        console.error("[autoresearch] turn-end handler failed:", err)
       } finally {
         inFlight.delete(sessionID)
       }
@@ -542,7 +544,7 @@ export default Plugin.define({
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.idle", "session.execution.interrupted"],
+          types: ["session.execution.succeeded", "session.execution.interrupted"],
           signal: controller.signal,
         })) {
           const sessionID = event.data.sessionID as string
@@ -550,7 +552,7 @@ export default Plugin.define({
             // The user pressed stop: respect it and turn the loop off.
             await deactivate(sessionID)
           } else {
-            void onIdle(sessionID)
+            void onTurnEnd(sessionID)
           }
         }
       } catch (err) {

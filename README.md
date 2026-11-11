@@ -42,9 +42,25 @@ Then, in a project with a **clean git tree**:
 | `autoresearch-create` skill | The setup interview and the loop rules. |
 | `autoresearch-finalize` skill | Groups kept experiments and runs `finalize.sh` to cut one branch per group from the merge-base, then verifies the branches add up to the original. |
 | Live dashboard | A local page (127.0.0.1 only) with a chart, stats and every run's notes. It updates as experiments finish and shows when one is running. |
-| Auto-continue | After each turn, re-prompts the session while the loop is on. Stops on `/autoresearch off`, when you interrupt, at `maxIterations`, or after 3 turns with no new experiment. |
+| Auto-continue | After each turn, re-prompts the session while the loop is on. Starts once the first experiment is logged, so it never talks over the setup questions. Stops on `/autoresearch off`, when you interrupt, at `maxIterations`, or after 3 turns with no new experiment. |
+| Compaction summary | While the loop is on, long sessions are summarized from `.auto/` instead of by the model (see below). |
 
 Not ported: the in-terminal widget and full-screen dashboard, `.auto/hooks/`, `workingDir`, keyboard shortcuts.
+
+## Long runs and compaction
+
+When a session gets close to the model's context limit, OpenCode *compacts* it: older conversation is replaced by a summary. A model-written summary can lose which ideas already failed or what the current best is, and the loop then re-tries dead ends.
+
+While the loop is on, this plugin writes that summary itself from `.auto/`, so nothing important is lost and no model call is needed:
+
+- goal, metric, baseline and best result
+- `.auto/prompt.md` (the rules) and `.auto/ideas.md`
+- the last 50 runs with their notes (`hypothesis`, `learned`, `next_focus`…)
+- your own messages from the session, so steering like "don't touch the e2e folder" survives
+
+OpenCode still keeps the most recent ~15k tokens of conversation next to the summary (`compaction.keep.tokens`). The plugin also pins a short "autoresearch mode is on" note into the session's instructions while the loop runs. Instructions aren't part of the conversation, so compaction never removes it.
+
+If building the summary fails, OpenCode's normal summary is used. Not tested yet: providers set to `"compaction": { "type": "native" }` (OpenAI Responses), which compact on the provider's side.
 
 ## ⚠️ Discarding runs `git clean`
 

@@ -33,6 +33,7 @@ describe("buildCompactionSummary", () => {
       "Set up and start an autoresearch session. Goal: speed up tests",
       "[autoresearch] Continue the experiment loop.",
       "please don't touch the e2e folder",
+      "[autoresearch] Continue the experiment loop.\n\nAdditional context from the user: one experiment per turn",
     ])
 
     expect(s).toContain("Goal: speed up tests")
@@ -47,6 +48,8 @@ describe("buildCompactionSummary", () => {
     // the plugin's own auto-continue prompts are filtered out of the user's messages
     const userSection = s.split("## What the user said")[1].split("\n## ")[0]
     expect(userSection).not.toContain("[autoresearch]")
+    // …but the user's own text inside one (`/autoresearch <text>` on resume) is kept
+    expect(userSection).toContain("- one experiment per turn")
   })
 
   test("works before any run, and without optional files", async () => {

@@ -1,0 +1,24 @@
+{
+  "name": "opencode-autoresearch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Autonomous experiment loop for OpenCode v2 (a minimal port of pi-autoresearch)",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src", "skills"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.22"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "latest",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT"
+}

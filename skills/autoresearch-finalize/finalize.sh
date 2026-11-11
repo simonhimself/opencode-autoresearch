@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+
+" "$groups_file" "$DATA_DIR" || fail "Failed to parse#!/usr/bin/env bash
 set -euo pipefail
 
 # Adapted from pi-autoresearch (MIT, (c) 2026 Tobi Lutke, David Cortés):
@@ -8,6 +9,7 @@ set -euo pipefail
 #   - preflight rejects a goal slug that clashes with an existing `autoresearch/<goal>` branch
 #   - rollback switches back to the original branch before deleting, and also removes a
 #     branch whose commit failed (previously both were left behind)
+#   - groups.json and temp paths reach node as arguments, not pasted into its source
 #   - after a successful run or a verification failure, the script returns to the original
 #     branch and pops its own stash (previously the session files under .auto/ stayed hidden
 #     in the stash until the user ran `git stash pop`); restore is guarded so the stash is
@@ -76,8 +78,8 @@ parse_groups() {
   DATA_DIR=$(mktemp -d)
   node -e "
 const fs = require('fs');
-const config = JSON.parse(fs.readFileSync('$groups_file', 'utf-8'));
-const outDir = '$DATA_DIR';
+const config = JSON.parse(fs.readFileSync(process.argv[1], 'utf-8'));
+const outDir = process.argv[2];
 fs.writeFileSync(outDir + '/base', config.base);
 fs.writeFileSync(outDir + '/trunk', config.trunk || 'main');
 fs.writeFileSync(outDir + '/final_tree', config.final_tree);
@@ -89,7 +91,7 @@ config.groups.forEach((group, idx) => {
   fs.writeFileSync(outDir + '/' + idx + '.last_commit', group.last_commit);
   fs.writeFileSync(outDir + '/' + idx + '.slug', group.slug);
 });
-" || fail "Failed to parse $groups_file — check JSON syntax."
+" "$groups_file" "$DATA_DIR" || fail "Failed to parse $groups_file — check JSON syntax."
 
   BASE=$(cat "$DATA_DIR/base")
   TRUNK=$(cat "$DATA_DIR/trunk")

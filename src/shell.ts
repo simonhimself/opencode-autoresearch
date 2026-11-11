@@ -122,7 +122,9 @@ export async function commitKeep(cwd: string, message: string): Promise<KeepResu
  */
 export async function revertToHead(cwd: string): Promise<{ ok: boolean; output: string }> {
   const restore = await git(["restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE], cwd)
+  // If restoring failed, stop: deleting untracked files on top of a half-done revert would
+  // lose work while the tool reports that nothing was logged.
+  if (restore.code !== 0) return { ok: false, output: restore.output.trim() }
   const clean = await git(["clean", "-fd", ...SCOPE], cwd)
-  const ok = restore.code === 0 && clean.code === 0
-  return { ok, output: [restore.output, clean.output].join("\n").trim() }
+  return { ok: clean.code === 0, output: [restore.output, clean.output].join("\n").trim() }
 }

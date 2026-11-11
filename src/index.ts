@@ -106,7 +106,8 @@ const ACTIVE_INSTRUCTION = [
 
 // Must start with PLUGIN_PROMPT_PREFIX so the compaction summary can tell it apart from the user's messages.
 const CONTINUE_PROMPT = [
-  `${PLUGIN_PROMPT_PREFIX} Continue the experiment loop.`,
+  `${PLUGIN_PROMPT_PREFIX} Continue the experiment loop. The loop is ON now; earlier`,
+  "[autoresearch] notices saying it was stopped, paused or off are out of date.",
   "If you've lost context, re-read .auto/prompt.md, the last ~20 lines of .auto/log.jsonl,",
   ".auto/ideas.md (if present) and `git log --oneline -20` first. Then run the next experiment.",
 ].join(" ")
@@ -147,12 +148,23 @@ export default Plugin.define({
     }
 
     /**
-     * Post a notice into a session WITHOUT starting a model turn (resume: false). Without it,
-     * every notice cost a model reply, and a reply on an idle loop counted as a stall.
+     * Two ways to post a notice (both are session input that the model also sees):
+     * - notify: loop-state changes (stopped, paused, taken over…). resume: false, so no model
+     *   turn is spent; it's delivered with the next turn. Because it can arrive late, the
+     *   continue prompt says that older "loop off" notices are out of date.
+     * - tell: the answer to a command the user just typed (status, help…). It must show up
+     *   now, so it starts a turn; the model only needs to acknowledge it.
      */
     const notify = (sessionID: string, text: string) =>
       ctx.session
         .synthetic({ sessionID: sessionID as never, text: `${PLUGIN_PROMPT_PREFIX} ${text}`, resume: false })
+        .catch((err) => console.error("[autoresearch] notice failed:", err))
+    const tell = (sessionID: string, text: string) =>
+      ctx.session
+        .synthetic({
+          sessionID: sessionID as never,
+          text: `${PLUGIN_PROMPT_PREFIX} ${text}\n\n(Shown to the user. No action needed; at most acknowledge it in one line.)`,
+        })
         .catch((err) => console.error("[autoresearch] notice failed:", err))
 
     /** Other sessions with a loop on in this project. Only one loop per project is allowed. */
@@ -344,7 +356,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         async execute(input, { sessionID }) {
-          const { status, metric, description, metrics = {}, asi = {} } = input as {
+          let { status, metric, description, metrics = {}, asi = {} } = input as {
             status: RunStatus
             metric: number
             description: string
@@ -375,6 +387,14 @@ export default Plugin.define({
                 content: `ERROR: metric ${metric} doesn't match the measured ${config.metric_name}=${pending.primary}. Log the measured value.`,
               }
             }
+          }
+
+          // For discard/checks_failed, record what was actually measured (agents sometimes pass a
+          // placeholder like 0, which then skewed the confidence estimate). Crashes keep theirs.
+          let metricNote = ""
+          if (status !== "keep" && status !== "crash" && pending.primary !== undefined && pending.primary !== metric) {
+            metricNote = ` (recorded the measured ${config.metric_name}=${fmt(pending.primary)})`
+            metric = pending.primary
           }
 
           let commit: string | null = null
@@ -436,7 +456,7 @@ export default Plugin.define({
           const max = await readMaxIterations(cwd)
           return {
             content:
-              `Run #${runs.length + 1} logged as ${status}${commit ? ` @ ${commit}` : ""}${gitNote}.\n` +
+              `Run #${runs.length + 1} logged as ${status}${commit ? ` @ ${commit}` : ""}${gitNote}${metricNote}.\n` +
               `baseline ${fmt(baseline)} → best ${fmt(best)} ${config.metric_unit}${delta}${conf}` +
               (max !== null ? `\nRuns: ${runs.length + 1}/${max}` : ""),
           }
@@ -452,7 +472,7 @@ export default Plugin.define({
           "Autoresearch loop: `<goal>` start/resume · `status` · `off` · `dashboard` · `finalize` · `help`",
         execute: async ({ sessionID, prompt, delivery }) => {
           const arg = prompt.text.trim()
-          const say = (text: string) => notify(sessionID, text)
+          const say = (text: string) => tell(sessionID, text)
           const sub = arg.toLowerCase().replace(/[.!]+$/, "")
 
           if (sub === "help" || sub === "--help" || sub === "-h") {
@@ -463,7 +483,14 @@ export default Plugin.define({
           // "stop", "pause"… mean off. (They used to be taken as a goal and resumed the loop.)
           if (OFF_WORDS.has(sub)) {
             await deactivate(sessionID)
-            await say("Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes.")
+            const unlogged = await ctx.storage.get(runKey(sessionID))
+            await say(
+              "Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes." +
+                (unlogged
+                  ? " An experiment was measured but not logged yet: its code changes are still in the working tree " +
+                    "and would be part of the next experiment. Log it or revert them before resuming."
+                  : ""),
+            )
             return
           }
 

@@ -87,9 +87,12 @@ describe("revertToHead", () => {
   test("reports failure when git can't run (index.lock)", async () => {
     const dir = repo()
     writeFileSync(join(dir, "code.txt"), "v2\n")
+    writeFileSync(join(dir, "untracked.txt"), "u\n")
     writeFileSync(join(dir, ".git", "index.lock"), "")
     const res = await revertToHead(dir)
     expect(res.ok).toBe(false)
+    // nothing half-done: the untracked file isn't deleted when the restore step failed
+    expect(existsSync(join(dir, "untracked.txt"))).toBe(true)
     rmSync(join(dir, ".git", "index.lock"))
   })
 

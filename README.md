@@ -48,10 +48,10 @@ Then it:
 
 ### 2. Let it run
 
-Each experiment follows the same steps: change something → run the benchmark → **keep** (commit) if it's better, **discard** (revert) if not → write down what it learned. Then the next one. You don't need to reply; the plugin re-prompts the agent after every turn.
+Each experiment follows the same steps: change something → run the benchmark → **keep** (commit the code change) if it's better, **discard** (revert to the last commit) if not → write down what it learned. Then the next one. You don't need to reply; the plugin re-prompts the agent after every turn.
 
 It stops when:
-- you run `/autoresearch off`, or press stop in OpenCode
+- you run `/autoresearch off` (or `stop` / `pause`), or press stop in OpenCode
 - it reaches `maxIterations` (see [Settings](#settings))
 - 3 turns pass with no new experiment (then it pauses rather than spinning)
 
@@ -88,8 +88,9 @@ Run `/autoresearch` again in a project that has `.auto/prompt.md` and it picks u
 | Command | What it does |
 |---|---|
 | `/autoresearch <goal>` | Start a session, or resume one if `.auto/prompt.md` exists. On resume, the text is passed on as extra instructions. |
-| `/autoresearch off` | Stop the loop. The log and files are kept. |
-| `/autoresearch dashboard` | Open the live dashboard (also `export`). |
+| `/autoresearch status` | Is the loop on? Runs so far, baseline → best, dashboard link. |
+| `/autoresearch off` | Stop the loop. The log and files are kept. `stop` and `pause` work too. |
+| `/autoresearch dashboard` | Open the live dashboard (also `export`). `dashboard off` closes its local web server. |
 | `/autoresearch finalize` | Stop the loop and turn the kept experiments into reviewable branches. |
 | `/autoresearch help` | List these commands. |
 
@@ -114,7 +115,7 @@ Everything lives in `.auto/` at the project root:
 { "maxIterations": 50 }
 ```
 
-`maxIterations` is the most experiments one session may run. Set it to limit time and token use; the loop stops by itself when it's reached.
+`maxIterations` is the most runs per *segment*, counting the baseline (so `6` = baseline + 5 experiments). A segment starts with `init_experiment`; the agent starts a new one when the goal or the way of measuring changes. Set it to limit time and token use: the loop stops by itself when it's reached, and `/autoresearch` won't restart a segment that's already full. Raise the number to continue.
 
 ## Long runs and compaction
 
@@ -132,8 +133,10 @@ OpenCode still keeps the most recent ~15k tokens of conversation next to it. The
 
 - **Discarding deletes untracked files.** Discarded and crashed runs are reverted with `git checkout -- .` and `git clean -fd`; only `.auto/` is spared. That's why it insists on a clean tree and its own branch. Don't point it at a working copy with unsaved work.
 - **Your permission rules don't cover the plugin's git commands.** It runs git itself, so shell rules like `git checkout *: ask` don't apply to them.
-- **Some commands cost a model reply.** `/autoresearch help`, `dashboard` and `off` post a short notice, and OpenCode has the model answer it.
-- **Errors pause the loop.** If the model provider fails mid-turn, the loop doesn't retry by itself. Send any message to wake it up again.
+- **Keep commits leave `.auto/` out.** The session files change on every run, so they stay uncommitted on the experiment branch (`git status` shows them). That's expected; finalize handles them.
+- **One loop per project.** Starting `/autoresearch` in a second session turns the loop off in the first one.
+- **Approving the first branch.** If your permission rules ask before `git checkout *`, the agent stops once at setup to create the `autoresearch/…` branch. Allow `git checkout -b autoresearch/*` to skip that.
+- **Errors pause the loop.** If the model provider fails mid-turn, the plugin posts a notice and doesn't retry by itself. Send any message to continue.
 - **Several projects at once are fine.** Each project's loop is handled only by its own copy of the plugin.
 
 ## Not included (compared with pi-autoresearch)

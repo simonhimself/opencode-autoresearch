@@ -8,6 +8,11 @@ set -euo pipefail
 #   - preflight rejects a goal slug that clashes with an existing `autoresearch/<goal>` branch
 #   - rollback switches back to the original branch before deleting, and also removes a
 #     branch whose commit failed (previously both were left behind)
+#   - after a successful run or a verification failure, the script returns to the original
+#     branch and pops its own stash (previously the session files under .auto/ stayed hidden
+#     in the stash until the user ran `git stash pop`); restore is guarded so the stash is
+#     never popped onto the wrong branch
+#   - the ideas backlog is captured before stashing, so the summary always shows it
 
 # autoresearch-finalize — creates independent branches from an autoresearch session
 #
@@ -199,27 +204,81 @@ rollback_on_failure() {
   # -f is safe here: the user's own uncommitted work was stashed before we
   # started, so the only changes in the tree are files this script copied in.
   git reset --quiet HEAD -- . 2>/dev/null || true
-  if [ -n "${ORIG_BRANCH:-}" ]; then
-    git checkout -f "$ORIG_BRANCH" --quiet 2>/dev/null || true
-  fi
+  restore_workspace -f
   for branch in ${CREATED_BRANCHES[@]+"${CREATED_BRANCHES[@]}"}; do
     git branch -D "$branch" 2>/dev/null || true
   done
-  if [ "$STASHED" = true ]; then
-    git stash pop --quiet 2>/dev/null \
-      || echo -e "${YELLOW}⚠ Could not restore stashed changes. Run 'git stash list' to recover.${NC}"
-  fi
   cleanup_data
   echo -e "${RED}Rolled back to '$ORIG_BRANCH'. No branches left behind.${NC}"
 }
 
+# Go back to the original branch and pop our stash. Safe to call more than once.
+# Every command is guarded: this also runs from an EXIT trap under `set -e`.
+# The stash is only popped once we're confirmed back on the original branch,
+# otherwise the session files would land on a group branch.
+restore_workspace() {
+  local force="${1:-}"
+  [ -n "${ORIG_BRANCH:-}" ] || return 0
+  if [ "$(git branch --show-current 2>/dev/null || true)" != "$ORIG_BRANCH" ]; then
+    if [ "$force" = "-f" ]; then
+      git checkout -f "$ORIG_BRANCH" --quiet 2>/dev/null || true
+    else
+      git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
+    fi
+  fi
+  if [ "$(git branch --show-current 2>/dev/null || true)" != "$ORIG_BRANCH" ]; then
+    if [ "$STASHED" = true ]; then
+      echo -e "${YELLOW}⚠ Could not switch back to '$ORIG_BRANCH', so your uncommitted changes (including .auto/ session files) are still stashed. Run 'git checkout $ORIG_BRANCH && git stash pop' to restore them.${NC}"
+      STASHED=false
+    else
+      echo -e "${YELLOW}⚠ Could not switch back to '$ORIG_BRANCH'. Run 'git checkout $ORIG_BRANCH'.${NC}"
+    fi
+    return 0
+  fi
+  if [ "$STASHED" = true ]; then
+    STASHED=false
+    if git stash pop --quiet 2>/dev/null; then
+      echo -e "${GREEN}Restored your uncommitted changes (including .auto/ session files).${NC}"
+    else
+      echo -e "${YELLOW}⚠ Could not restore stashed changes automatically. They are still in the stash: run 'git stash list' and 'git stash pop' to recover them.${NC}"
+    fi
+  fi
+}
+
+on_exit_restore() {
+  restore_workspace || true
+  cleanup_data
+}
+
+# Copy the ideas backlog now, before stashing hides it, so the summary can show it.
+capture_ideas() {
+  local ideas_file=""
+  if [ -f ".auto/ideas.md" ]; then
+    ideas_file=".auto/ideas.md"
+  elif [ -f "autoresearch.ideas.md" ]; then
+    ideas_file="autoresearch.ideas.md"
+  fi
+  if [ -n "$ideas_file" ]; then
+    cp "$ideas_file" "$DATA_DIR/ideas" 2>/dev/null || true
+    echo "$ideas_file" > "$DATA_DIR/ideas_name"
+  fi
+}
+
+# Uncommitted changes are normal here (.auto/log.jsonl modified, .auto/ideas.md
+# untracked). They must be stashed, or checking out the merge-base fails on
+# modified tracked .auto/ files. restore_workspace puts them back afterwards.
 stash_if_dirty() {
   if ! git diff --quiet 2>/dev/null \
     || ! git diff --cached --quiet 2>/dev/null \
     || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
-    warn "Stashing uncommitted changes..."
-    git stash -u
-    STASHED=true
+    warn "Stashing uncommitted changes (restored automatically at the end)..."
+    local before after
+    before=$(git rev-parse -q --verify refs/stash 2>/dev/null || true)
+    git stash push -u --quiet -m "autoresearch-finalize: uncommitted changes"
+    after=$(git rev-parse -q --verify refs/stash 2>/dev/null || true)
+    if [ -n "$after" ] && [ "$after" != "$before" ]; then
+      STASHED=true
+    fi
   fi
 }
 
@@ -269,6 +328,7 @@ create_branches() {
   echo ""
 
   trap rollback_on_failure EXIT
+  capture_ideas
   stash_if_dirty
 
   for i in $(seq 0 $((GROUP_COUNT - 1))); do
@@ -278,9 +338,10 @@ create_branches() {
   info "Created ${#CREATED_BRANCHES[@]} branches (all from merge-base, independent):"
   for branch in ${CREATED_BRANCHES[@]+"${CREATED_BRANCHES[@]}"}; do echo "  $branch"; done
 
-  # Disarm rollback — creation succeeded. Verify failures intentionally leave
-  # branches intact so the user can inspect and fix manually.
-  trap - EXIT
+  # Swap rollback for restore — creation succeeded. Verify failures intentionally
+  # leave branches intact so the user can inspect and fix manually, but any exit
+  # from here on still returns to the original branch and pops the stash.
+  trap on_exit_restore EXIT
 }
 
 # ---------------------------------------------------------------------------
@@ -380,6 +441,7 @@ verify_branches() {
 
   echo ""
   if [ $errors -gt 0 ]; then
+    restore_workspace || true
     echo -e "${RED}Verification failed with $errors error(s).${NC}"
     echo -e "${RED}Branches are intact — inspect and fix manually, or delete and retry.${NC}"
     echo "  Branches: ${CREATED_BRANCHES[*]:-}"
@@ -426,23 +488,15 @@ print_summary() {
   echo "  rm -r .auto    # session folder (current layout)"
   echo "  rm -f autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md    # legacy flat files, if any"
 
-  local ideas_file=""
-  if [ -f ".auto/ideas.md" ]; then
-    ideas_file=".auto/ideas.md"
-  elif [ -f "autoresearch.ideas.md" ]; then
-    ideas_file="autoresearch.ideas.md"
-  fi
-  if [ -n "$ideas_file" ]; then
+  # Read from the copy taken before stashing, not the working tree.
+  if [ -f "$DATA_DIR/ideas" ]; then
     echo ""
-    echo "Ideas backlog (from $ideas_file):"
+    echo "Ideas backlog (from $(cat "$DATA_DIR/ideas_name")):"
     echo ""
-    sed 's/^/  /' "$ideas_file"
+    sed 's/^/  /' "$DATA_DIR/ideas"
   fi
 
   echo ""
-  if [ "$STASHED" = true ]; then
-    warn "Changes were stashed. Run 'git stash pop' to restore or 'git stash drop' to discard."
-  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -459,7 +513,9 @@ main() {
   preflight
   create_branches
   verify_branches
+  restore_workspace
   print_summary
+  trap - EXIT
   cleanup_data
 }
 

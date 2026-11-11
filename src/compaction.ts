@@ -89,7 +89,11 @@ function userSection(messages: string[]): string {
   const notes = messages.map(userText).filter(Boolean).slice(-MAX_USER_NOTES)
   if (!notes.length) return ""
   const lines = notes.map((m) => `- ${truncate(m.replace(/\s+/g, " "), MAX_USER_NOTE_CHARS)}`)
-  return ["## What the user said in this session (oldest first)", "", ...lines].join("\n")
+  return [
+    "## What the user said in this session (oldest first; later messages override earlier ones)",
+    "",
+    ...lines,
+  ].join("\n")
 }
 
 async function fileSection(title: string, file: string, cwd: string, max: number): Promise<string> {
@@ -106,7 +110,8 @@ async function fileSection(title: string, file: string, cwd: string, max: number
 function recentRunsSection(allRuns: RunEntry[]): string {
   if (!allRuns.length) return "## Recent runs\n\nNo runs yet. Start with the baseline."
   const recent = allRuns.slice(-RECENT_RUNS)
-  const baselineOf = (segment: number) => allRuns.find((r) => r.segment === segment)?.metric ?? null
+  const baselineOf = (segment: number) =>
+    allRuns.find((r) => r.segment === segment && r.status === "keep")?.metric ?? null
   const lines = recent.map((r) => {
     const parts = [
       `#${r.run} ${r.status.padEnd("checks_failed".length)} ${r.status === "crash" ? "—" : fmt(r.metric) + delta(r.metric, baselineOf(r.segment))}`,
@@ -137,7 +142,8 @@ function asiParts(asi: Record<string, unknown> | undefined): string[] {
   return out
 }
 
-const fmt = (n: number) => (Number.isInteger(n) ? String(n) : n.toPrecision(5))
+// Up to 5 significant digits, without trailing zeros.
+const fmt = (n: number) => String(Number(n.toPrecision(5)))
 
 function delta(value: number, baseline: number | null): string {
   if (baseline === null || baseline === 0 || value === baseline) return ""

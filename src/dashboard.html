@@ -202,20 +202,23 @@ function render() {
     content.append(h("div", { class: "card empty" }, "No experiments yet"));
     return;
   }
-  // Mirror summarize() in state.ts: baseline = first run; best = best kept run (baseline counts as kept).
-  const baseline = isNum(runs[0].metric) ? runs[0].metric : null;
+  // Mirror summarize() in state.ts: baseline = first kept run (a crashed first run's placeholder
+  // metric must not become the baseline); best = best kept run (baseline counts as kept).
+  // Until a run is kept there is no baseline, best or improvement.
+  const baseRun = runs.find((r) => r.status === "keep" && isNum(r.metric)) || null;
+  const baseline = baseRun ? baseRun.metric : null;
   let best = baseline;
   for (const r of runs) if (r.status === "keep" && isNum(r.metric) && (best == null || better(r.metric, best, dir))) best = r.metric;
 
-  content.append(renderStats(runs, baseline, best, dir, config), renderChartCard(), renderTable(runs, baseline, dir));
-  drawChart(runs, baseline, dir, config);
+  content.append(renderStats(runs, baseRun, baseline, best, dir, config), renderChartCard(), renderTable(runs, baseRun, baseline, dir));
+  drawChart(runs, baseRun, dir, config);
 }
 
 function stat(k, v, d, cls) {
   return h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v " + (cls || "") }, v), h("div", { class: "d" }, d || " "));
 }
 
-function renderStats(runs, baseline, best, dir, config) {
+function renderStats(runs, baseRun, baseline, best, dir, config) {
   const unit = config.metric_unit ? " " + config.metric_unit : "";
   const imp = pct(best, baseline);
   const count = (s) => runs.filter((r) => r.status === s).length;
@@ -229,8 +232,8 @@ function renderStats(runs, baseline, best, dir, config) {
     else { confLabel = "within noise"; confCls = "bad"; }
   }
   return h("div", { class: "stats" },
-    stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), "run #" + runs[0].run),
-    stat("Best", fmt(best) + (best != null ? unit : ""), best != null && best !== baseline ? "kept" : "baseline"),
+    stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), baseRun ? "run #" + baseRun.run : "no kept run yet"),
+    stat("Best", fmt(best) + (best != null ? unit : ""), best == null ? " " : best !== baseline ? "kept" : "baseline"),
     stat("Improvement", fmtPct(imp), "vs baseline", pctClass(imp, dir)),
     stat("Runs", String(runs.length), breakdown),
     stat("Confidence", conf == null ? "—" : fmt(conf) + "×", confLabel, confCls),
@@ -259,7 +262,8 @@ function ticks(min, max, n) {
 let chartArgs = null;
 function drawChart(...args) {
   chartArgs = args;
-  const [runs, baseline, dir, config] = args;
+  const [runs, baseRun, dir, config] = args;
+  const baseline = baseRun ? baseRun.metric : null;
   const box = $("chart");
   if (!box) return;
   box.querySelector("svg")?.remove();
@@ -292,10 +296,10 @@ function drawChart(...args) {
   s.append(svg("line", { x1: m.l, x2: W - m.r, y1: m.t + ph, y2: m.t + ph, stroke: "var(--muted)", "stroke-opacity": ".4" }));
   if (isNum(baseline)) s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(baseline), y2: Y(baseline), stroke: "var(--muted)", "stroke-dasharray": "4 4" }));
 
-  // Best-so-far step line: starts at baseline, only kept runs can move it.
+  // Best-so-far step line: starts at the baseline run (first kept run), only later kept runs can move it.
   if (isNum(baseline)) {
-    let best = baseline, d = `M${X(runs[0].run)},${Y(best)}`;
-    for (const r of runs.slice(1)) {
+    let best = baseline, d = `M${X(baseRun.run)},${Y(best)}`;
+    for (const r of runs.slice(runs.indexOf(baseRun) + 1)) {
       if (r.status === "keep" && isNum(r.metric) && better(r.metric, best, dir)) { d += `H${X(r.run)}V${Y(r.metric)}`; best = r.metric; }
     }
     d += `H${X(runs[runs.length - 1].run)}`;
@@ -332,7 +336,7 @@ function drawChart(...args) {
   box.append(s);
 }
 
-function renderTable(runs, baseline, dir) {
+function renderTable(runs, baseRun, baseline, dir) {
   const tbody = h("tbody");
   for (const r of [...runs].reverse()) {
     const key = r.segment + ":" + r.run; // run numbers restart in each segment
@@ -342,7 +346,7 @@ function renderTable(runs, baseline, dir) {
       h("td", { class: "num" }, h("span", { class: "tog" }, "▸"), " ", String(r.run)),
       h("td", {}, h("span", { class: "badge s-" + r.status }, STATUS_LABEL[r.status] || String(r.status))),
       h("td", { class: "num" }, r.status === "crash" ? "—" : fmt(r.metric)), // crashes carry a placeholder metric
-      h("td", { class: "num " + pctClass(p, dir) }, r === runs[0] ? "baseline" : fmtPct(p)),
+      h("td", { class: "num " + pctClass(p, dir) }, r === baseRun ? "baseline" : fmtPct(p)),
       h("td", { class: "desc" }, String(r.description ?? "")),
       h("td", { class: "commit" }, r.commit ? String(r.commit) : "—"));
     const detail = h("tr", { class: "detail" }, h("td", { colspan: 6 }, renderDetail(r)));

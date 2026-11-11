@@ -61,7 +61,14 @@ export async function readLog(cwd: string): Promise<LogEntry[]> {
 
 export async function appendLog(cwd: string, entry: LogEntry): Promise<void> {
   await mkdir(autoDir(cwd), { recursive: true })
-  await appendFile(logPath(cwd), JSON.stringify(entry) + "\n")
+  // If the file was edited by hand and lost its final newline, add one first.
+  // Otherwise the new entry would be glued onto the last line and both lost.
+  let prefix = ""
+  if (existsSync(logPath(cwd))) {
+    const raw = await readFile(logPath(cwd), "utf8")
+    if (raw.length && !raw.endsWith("\n")) prefix = "\n"
+  }
+  await appendFile(logPath(cwd), prefix + JSON.stringify(entry) + "\n")
 }
 
 /** The active config is the most recent init_experiment; runs before it belong to older segments. */
@@ -77,9 +84,13 @@ export function currentSegment(entries: LogEntry[]) {
 export const isBetter = (a: number, b: number, direction: Direction) =>
   direction === "lower" ? a < b : a > b
 
-/** Baseline = first run of the segment; best = best kept run (baseline counts as kept). */
-export function summarize(runs: RunEntry[], direction: Direction) {
-  const baseline = runs[0]?.metric ?? null
+/**
+ * Baseline = first KEPT run of the segment; best = best kept run (baseline included).
+ * Only kept runs count: a crash's metric is a placeholder (often 0), and a crashed first
+ * run used to become an unbeatable "best".
+ */
+export function summarize(runs: Pick<RunEntry, "status" | "metric">[], direction: Direction) {
+  const baseline = runs.find((r) => r.status === "keep")?.metric ?? null
   let best: number | null = baseline
   for (const r of runs) {
     if (r.status !== "keep") continue

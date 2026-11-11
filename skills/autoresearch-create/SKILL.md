@@ -12,7 +12,7 @@ Adapted from pi-autoresearch (https://github.com/davebcn87/pi-autoresearch).
 
 - **`init_experiment`**: configure the session (name, metric, unit, direction). Call again to start a new segment with a fresh baseline when the target changes.
 - **`run_experiment`**: runs `./.auto/measure.sh` (or a given command), times it, parses `METRIC name=value` lines, runs `.auto/checks.sh` if present.
-- **`log_experiment`**: records the result. `keep` commits everything. `discard` / `crash` / `checks_failed` revert all code changes (tracked edits *and* untracked files), but `.auto/` is preserved. Always pass `asi`.
+- **`log_experiment`**: records the result of the last `run_experiment`, exactly once. `keep` commits your code changes (never `.auto/`) and only works for a successful run with the measured metric value. `discard` / `crash` / `checks_failed` revert everything to the last commit (staged, unstaged and untracked changes), but `.auto/` is preserved. Always pass `asi`. If it returns an ERROR, nothing was logged: fix the cause and log again.
 
 ## Session files (`.auto/` at the project root)
 
@@ -68,6 +68,7 @@ Adapted from pi-autoresearch (https://github.com/davebcn87/pi-autoresearch).
 
 - For fast, noisy benchmarks (< 5s), run the workload several times inside the script and report the **median**. This makes the confidence score meaningful.
 - Print whatever helps you decide what to try next: phase timings, error counts, cache hit rates, etc. You may extend the script mid-session.
+- **If you change how the metric is measured** (more repetitions, a different workload, a new timer), earlier numbers are no longer comparable: call `init_experiment` again to start a new segment with a fresh baseline. Adding extra output lines is fine without that.
 
 ### `.auto/checks.sh` (optional)
 
@@ -83,7 +84,8 @@ Only create it when the user's constraints need correctness checks. It runs afte
 - **Simpler is better.** Removing code at equal performance = keep. Ugly complexity for a tiny gain = discard.
 - **Don't thrash.** Reverting the same idea repeatedly? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log `crash` and move on.
-- **Update `.auto/prompt.md` → "What's Been Tried"** every few runs.
+- **Update `.auto/prompt.md` → "What's Been Tried"** every few runs. After setup, don't commit `.auto/` changes yourself; the plugin leaves them uncommitted on purpose and finalize handles them.
+- **Descriptions are plain text.** Backticks are fine; they're stored as written.
 - **Ideas backlog:** append promising-but-later ideas to `.auto/ideas.md`.
 - **Resuming:** if `.auto/prompt.md` exists, read it, the tail of `.auto/log.jsonl`, and `git log`, then continue.
 - **If `run_experiment` says STOP** (maxIterations), summarize the results for the user and stop.

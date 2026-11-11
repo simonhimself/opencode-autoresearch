@@ -12,16 +12,21 @@ If the autoresearch loop is still on, the user should run `/autoresearch off` fi
 
 ## Step 1: Analyze and propose groups
 
+The experiment branch usually has uncommitted `.auto/` changes (`.auto/log.jsonl` modified, `.auto/ideas.md` untracked, and so on). That's expected. Don't commit them and don't put them in any group. The script stashes them while it works and puts them back at the end.
+
 1. Read `.auto/log.jsonl`. Use only `"type":"run"` entries with `"status":"keep"` and a non-null `commit`. The first kept run is usually the baseline and has no code change.
 2. Read `.auto/prompt.md` for context.
 3. Find the trunk branch (`main`, or `master`, or whatever `git symbolic-ref refs/remotes/origin/HEAD` points to), then the merge-base: `git merge-base HEAD <trunk>`.
 4. Expand every short commit hash to a full one: `git rev-parse <short>`.
-5. For each kept commit, get its diff stat: `$BASE..<commit>` for the first, `<prev_kept>..<commit>` after that. Ignore `.auto/` files.
+5. For each kept commit, get its diff stat: `$BASE..<commit>` for the first (or `<last setup commit>..<commit>` if you give setup its own group, see below), `<prev_kept>..<commit>` after that. Ignore `.auto/` files. Also check for leftovers after the last kept commit: `git diff --stat <last_kept> HEAD -- . ':!.auto'` should print nothing.
 6. Group kept commits into logical changesets:
    - **Keep the order.** Group N's commits come before group N+1's.
    - **No two groups may touch the same file.** Each branch is applied to the merge-base on its own, so a shared file would conflict. If two groups share a file, merge them.
    - **Flag cross-file dependencies.** If group 2 calls something group 1 adds, say "group 2 depends on group 1, review together", or merge them if the link is tight.
    - **Small and focused.** One idea per group. No fixed count: 1 is fine, 15 is fine.
+   - **Every commit lands in some group.** A group covers *all* commits from the previous group's `last_commit` (or the merge-base) up to its own `last_commit`, experiments or not. `.auto/` files are dropped, everything else is kept. The script then checks that the groups together equal the whole experiment branch.
+   - **Give setup commits their own first group.** Commits that aren't experiments (typically the setup commit that adds `.auto/prompt.md`, `.auto/measure.sh` and maybe `.gitignore`) sit before the first kept run. If they change any non-`.auto` file, add a first group such as `"slug": "setup"` whose `last_commit` is the last setup commit. Otherwise those changes get mixed into the first experiment's branch. If they only touch `.auto/` files, no setup group is needed (the script would skip it as empty anyway). The setup group has no metric, so the "no metric data" warning for it is expected.
+   - **Nothing may be left after the last group.** Non-`.auto` changes in commits after the last group's `last_commit` (e.g. a discarded experiment that was committed, or a manual fix) make the union check fail. Extend the last group to HEAD or add a final group for them.
 
 Show the user the proposal, for example:
 
@@ -72,8 +77,10 @@ bash <SKILL_DIR>/finalize.sh /tmp/autoresearch-groups.json
 
 The script creates `autoresearch/<goal>/01-<slug>`, `02-…` branches from the merge-base and checks that together they equal the original branch. It also checks that no `.auto/` files leaked in and that no commit is empty. Then it prints a summary with cleanup commands and the ideas backlog.
 
-- If creating branches fails, it rolls back: deletes the new branches, returns to the original branch and restores any stash.
-- If verification fails, it exits non-zero but leaves the branches so you can inspect them.
+Uncommitted changes (normally the `.auto/` session files) are stashed while the script runs, because checking out the merge-base would otherwise fail. In every outcome the script returns to the original branch and pops that stash, so `.auto/log.jsonl`, `.auto/ideas.md` and the rest are back afterwards. If it can't, it prints a warning: then run `git stash list` and `git stash pop` on the original branch.
+
+- If creating branches fails, it rolls back: deletes the new branches, returns to the original branch and restores the stash.
+- If verification fails, it exits non-zero but leaves the branches so you can inspect them. It still returns to the original branch and restores the stash.
 
 ## Step 3: Report
 
@@ -86,5 +93,6 @@ Tell the user:
 
 - **One kept experiment:** one branch is fine.
 - **The script reports a file in multiple groups:** merge those groups and rerun.
-- **Commits on the branch that aren't experiments:** skip them. Only kept runs from the log count.
+- **Commits on the branch that aren't experiments:** they can't be skipped, since each group takes everything in its commit range. Put non-`.auto` changes from setup commits in their own first group (see Step 1). Other ones go in the group whose range contains them, or in a separate group if they're unrelated.
+- **The union check fails:** some non-`.auto` change isn't covered by any group, usually because it comes after the last group's `last_commit`. Delete the created branches (ask the user first), fix `groups.json` and rerun.
 - **A branch name already exists:** pick a different `goal` slug, or ask the user before deleting the old branch.

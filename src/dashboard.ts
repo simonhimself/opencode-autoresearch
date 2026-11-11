@@ -6,7 +6,8 @@
 //                       event "log"    → the log changed, re-fetch /log.jsonl
 //                       event "status" → {running, command?, startedAt?}, sent on connect + on change
 //
-// Only listens on 127.0.0.1. Log changes are picked up by polling the file
+// Only listens on 127.0.0.1 and rejects any Host header other than
+// 127.0.0.1:<port> / localhost:<port> (DNS-rebinding guard). Log changes are picked up by polling the file
 // (fs.watchFile), so edits made outside this plugin (e.g. by pi) show up too.
 
 import { spawn } from "node:child_process"
@@ -40,7 +41,14 @@ export class Dashboards {
     if (existing) return existing.url
 
     const clients = new Set<ServerResponse>()
+    let allowedHosts = new Set<string>()
     const server = createServer(async (req, res) => {
+      // DNS-rebinding guard: a hostile page can point its own domain at 127.0.0.1,
+      // but the browser still sends that domain in Host, so only accept our own names.
+      if (!allowedHosts.has((req.headers.host ?? "").toLowerCase())) {
+        res.writeHead(403).end()
+        return
+      }
       const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname
       try {
         if (path === "/") {
@@ -80,6 +88,7 @@ export class Dashboards {
         else reject(new Error("dashboard server did not get a port"))
       })
     })
+    allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`])
 
     // Poll the log once a second; the callback also fires when the file is first created.
     watchFile(logPath(directory), { interval: 1000 }, (curr, prev) => {
@@ -100,13 +109,27 @@ export class Dashboards {
     if (entry) for (const c of entry.clients) send(c, "status", status)
   }
 
+  /** URL of the open dashboard for a directory, or null if none is open. */
+  isOpen(directory: string): string | null {
+    return this.servers.get(directory)?.url ?? null
+  }
+
+  /** Stop one directory's dashboard. Returns false if none was open. */
+  close(directory: string): boolean {
+    const entry = this.servers.get(directory)
+    if (!entry) return false
+    this.servers.delete(directory)
+    unwatchFile(logPath(directory))
+    for (const c of entry.clients) c.end()
+    entry.clients.clear()
+    entry.server.close()
+    // Drop idle keep-alive sockets too, so the port stops accepting right away.
+    entry.server.closeAllConnections?.()
+    return true
+  }
+
   closeAll(): void {
-    for (const [directory, entry] of this.servers) {
-      unwatchFile(logPath(directory))
-      for (const c of entry.clients) c.end()
-      entry.server.close()
-    }
-    this.servers.clear()
+    for (const directory of [...this.servers.keys()]) this.close(directory)
   }
 }
 

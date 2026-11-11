@@ -7,7 +7,6 @@
 //   - the skill    = how to set up a session for a specific goal
 //   - .auto/ files = the durable state, so any fresh agent can resume
 
-import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 import { readdir, readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
@@ -15,6 +14,7 @@ import { fileURLToPath } from "node:url"
 import { Plugin, Skill } from "@opencode/plugin"
 import { buildCompactionSummary, PLUGIN_PROMPT_PREFIX, USER_CONTEXT_LABEL } from "./compaction.ts"
 import { Dashboards, logExists, openInBrowser } from "./dashboard.ts"
+import { bash, commitKeep, revertToHead, type ShellResult } from "./shell.ts"
 import {
   appendLog,
   checksPath,
@@ -34,60 +34,23 @@ const SKILL_ID = "autoresearch-create"
 const FINALIZE_SKILL_ID = "autoresearch-finalize"
 const OUTPUT_TAIL_LINES = 80
 
-// ── Shell helpers ─────────────────────────────────────────
-
-interface ShellResult {
-  code: number | null
-  output: string
-  durationMs: number
-  timedOut: boolean
-}
-
-/** Run a bash command, merging stdout+stderr, with a timeout and abort support. */
-function sh(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<ShellResult> {
-  return new Promise((resolve) => {
-    const started = performance.now()
-    // detached: gives the command its own process group so we can kill the whole tree.
-    const child = spawn("bash", ["-c", command], { cwd, detached: true, env: process.env })
-    let output = ""
-    let timedOut = false
-    child.stdout.on("data", (d) => (output += d))
-    child.stderr.on("data", (d) => (output += d))
-    const kill = () => {
-      try {
-        process.kill(-child.pid!, "SIGKILL")
-      } catch {}
-    }
-    const timer = setTimeout(() => {
-      timedOut = true
-      kill()
-    }, timeoutMs)
-    signal?.addEventListener("abort", kill, { once: true })
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      signal?.removeEventListener("abort", kill)
-      resolve({ code, output, durationMs: performance.now() - started, timedOut })
-    })
-    child.on("error", (err) => {
-      clearTimeout(timer)
-      resolve({ code: -1, output: String(err), durationMs: performance.now() - started, timedOut })
-    })
-  })
-}
-
-const git = (args: string, cwd: string) => sh(`git ${args}`, cwd, 60_000)
-
 const tail = (text: string, n = OUTPUT_TAIL_LINES) => text.trimEnd().split("\n").slice(-n).join("\n")
 
+/** Up to 5 significant digits, without trailing zeros (4.4, not 4.4000). */
 const fmt = (n: number | null | undefined) =>
-  n === null || n === undefined ? "–" : Number.isInteger(n) ? String(n) : n.toPrecision(5)
+  n === null || n === undefined ? "–" : String(Number(n.toPrecision(5)))
 
 // ── Per-session runtime state ─────────────────────────────
 
 /** Persisted in plugin storage under `active/<sessionID>` while the loop is on. */
 interface ActiveState {
   directory: string
-  /** Number of logged runs when the loop was turned on. Auto-continue waits until there are more. */
+  /**
+   * True when the loop was started without .auto/prompt.md: the agent is setting up and may
+   * be waiting for the user's answers, so no nudges until the first experiment is logged.
+   */
+  setup?: boolean
+  /** Number of logged runs when the loop was turned on. */
   startRunCount: number
   /** Number of logged runs when we last auto-continued; detects a stalled agent. */
   lastRunCount: number
@@ -95,15 +58,26 @@ interface ActiveState {
   stalls: number
 }
 
+/**
+ * Persisted under `run/<sessionID>` by run_experiment and consumed by log_experiment, so each
+ * logged result is tied to an actual measurement (and survives a plugin reload in between).
+ */
+interface PendingRun {
+  exitCode: number | null
+  timedOut: boolean
+  checksFailed: boolean
+  /** Measured value of the primary metric; undefined if the METRIC line was missing. */
+  primary?: number
+}
+
 const MAX_STALLS = 3
 
-/** Remembers whether the last run_experiment's checks failed, so log_experiment can refuse `keep`. */
-const lastChecksFailed = new Map<string, boolean>()
-
+/** `maxIterations` from .auto/config.json; also accepts a numeric string. Null = no limit. */
 async function readMaxIterations(cwd: string): Promise<number | null> {
   try {
     const raw = JSON.parse(await readFile(join(cwd, ".auto", "config.json"), "utf8"))
-    return typeof raw.maxIterations === "number" ? raw.maxIterations : null
+    const n = Number(raw.maxIterations)
+    return raw.maxIterations !== undefined && raw.maxIterations !== null && Number.isFinite(n) && n > 0 ? n : null
   } catch {
     return null
   }
@@ -111,11 +85,16 @@ async function readMaxIterations(cwd: string): Promise<number | null> {
 
 const HELP_TEXT = [
   "[autoresearch] Commands:",
-  "  /autoresearch <goal>      start a session (or resume it if .auto/prompt.md exists)",
-  "  /autoresearch off         stop the loop; the log is kept",
-  "  /autoresearch dashboard   open the live results page in your browser",
-  "  /autoresearch finalize    stop the loop and split kept experiments into reviewable branches",
+  "  /autoresearch <goal>          start a session (or resume it if .auto/prompt.md exists)",
+  "  /autoresearch status          is the loop on? runs so far, best result, dashboard link",
+  "  /autoresearch off             stop the loop; the log is kept (also: stop, pause)",
+  "  /autoresearch dashboard       open the live results page in your browser",
+  "  /autoresearch dashboard off   close the dashboard's local web server",
+  "  /autoresearch finalize        stop the loop and split kept experiments into reviewable branches",
+  "  /autoresearch help            this list",
 ].join("\n")
+
+const OFF_WORDS = new Set(["off", "stop", "pause", "end", "quit", "cancel", "exit"])
 
 const INSTRUCTION_KEY = "autoresearch"
 const ACTIVE_INSTRUCTION = [
@@ -142,6 +121,7 @@ export default Plugin.define({
       return session.location.directory as string
     }
     const activeKey = (sessionID: string) => `active/${sessionID}`
+    const runKey = (sessionID: string) => `run/${sessionID}`
 
     // OpenCode runs one copy of this plugin per project (location). Every copy receives every
     // session's events, and plugin storage is shared between them (both verified live). So each
@@ -164,6 +144,30 @@ export default Plugin.define({
       await ctx.session.instructions.entry
         .remove({ sessionID: sessionID as never, key: INSTRUCTION_KEY as never })
         .catch(() => {}) // fine if it was never pinned
+    }
+
+    /**
+     * Post a notice into a session WITHOUT starting a model turn (resume: false). Without it,
+     * every notice cost a model reply, and a reply on an idle loop counted as a stall.
+     */
+    const notify = (sessionID: string, text: string) =>
+      ctx.session
+        .synthetic({ sessionID: sessionID as never, text: `${PLUGIN_PROMPT_PREFIX} ${text}`, resume: false })
+        .catch((err) => console.error("[autoresearch] notice failed:", err))
+
+    /** Other sessions with a loop on in this project. Only one loop per project is allowed. */
+    const otherLoopsHere = async (sessionID: string, directory: string) => {
+      const found: string[] = []
+      let after: string | undefined
+      do {
+        const page = await ctx.storage.scan({ prefix: "active/", after, limit: 100 })
+        for (const { key, value } of page.entries) {
+          const sid = key.slice("active/".length)
+          if (sid !== sessionID && (value as unknown as ActiveState)?.directory === directory) found.push(sid)
+        }
+        after = page.next
+      } while (after)
+      return found
     }
 
     const dashboards = new Dashboards(join(ROOT, "src", "dashboard.html"))
@@ -283,19 +287,21 @@ export default Plugin.define({
           let bench: ShellResult
           let checks: ShellResult | null = null
           try {
-            bench = await sh(command, cwd, timeout_seconds * 1000, signal)
-            if (bench.code === 0 && existsSync(checksPath(cwd))) {
+            bench = await bash(command, cwd, timeout_seconds * 1000, signal)
+            if (bench.code === 0 && !bench.timedOut && existsSync(checksPath(cwd))) {
               await progress({ status: "running checks" })
               dashboards.setStatus(cwd, { running: true, command: "checks.sh", startedAt: Date.now() })
-              checks = await sh(checksPath(cwd), cwd, checks_timeout_seconds * 1000, signal)
+              // Relative path: an absolute one breaks when the project path contains spaces.
+              checks = await bash("./.auto/checks.sh", cwd, checks_timeout_seconds * 1000, signal)
             }
           } finally {
             dashboards.setStatus(cwd, { running: false })
           }
           const metrics = parseMetrics(bench.output)
           const primary = metrics[config.metric_name]
-          const checksFailed = checks !== null && checks.code !== 0
-          lastChecksFailed.set(sessionID, checksFailed)
+          const checksFailed = checks !== null && (checks.code !== 0 || checks.timedOut)
+          const pending: PendingRun = { exitCode: bench.code, timedOut: bench.timedOut, checksFailed, primary }
+          await ctx.storage.set(runKey(sessionID), pending as never)
 
           const lines = [
             `exit: ${bench.code}${bench.timedOut ? " (TIMED OUT)" : ""} · wall: ${(bench.durationMs / 1000).toFixed(2)}s`,
@@ -313,8 +319,9 @@ export default Plugin.define({
       editor.add({
         name: "log_experiment",
         description:
-          "Record the result of the last run_experiment. `keep` commits all changes; `discard`, `crash` and " +
-          "`checks_failed` revert code changes (the .auto/ folder is preserved). Always include `asi` notes: " +
+          "Record the result of the last run_experiment (each run is logged exactly once). `keep` commits the code " +
+          "changes (not .auto/) and needs a successful run with the measured metric; `discard`, `crash` and " +
+          "`checks_failed` revert everything to the last commit (.auto/ is preserved). Always include `asi` notes: " +
           "what you learned, so a future agent doesn't repeat dead ends.",
         input: {
           type: "object",
@@ -347,35 +354,62 @@ export default Plugin.define({
           const cwd = await cwdOf(sessionID)
           const { config, runs } = currentSegment(await readLog(cwd))
           if (!config) return { content: "ERROR: No session. Call init_experiment first." }
-          if (status === "keep" && lastChecksFailed.get(sessionID)) {
-            return { content: "ERROR: checks failed on the last run, so it can't be kept. Log it as checks_failed." }
+
+          // Each logged result must belong to exactly one measurement.
+          const pending = (await ctx.storage.get(runKey(sessionID))) as PendingRun | undefined
+          if (!pending) {
+            return { content: "ERROR: No unlogged run. Call run_experiment first; each run is logged once." }
+          }
+          if (status === "keep") {
+            if (pending.exitCode !== 0 || pending.timedOut) {
+              return { content: "ERROR: The benchmark failed or timed out, so this run can't be kept. Log it as crash." }
+            }
+            if (pending.checksFailed) {
+              return { content: "ERROR: checks failed on this run, so it can't be kept. Log it as checks_failed." }
+            }
+            if (pending.primary === undefined) {
+              return { content: `ERROR: The run printed no METRIC ${config.metric_name}=… line, so it can't be kept. Log it as crash.` }
+            }
+            if (Math.abs(pending.primary - metric) > 1e-9 * Math.max(1, Math.abs(pending.primary))) {
+              return {
+                content: `ERROR: metric ${metric} doesn't match the measured ${config.metric_name}=${pending.primary}. Log the measured value.`,
+              }
+            }
           }
 
           let commit: string | null = null
           let gitNote = ""
           if (status === "keep") {
-            await git("add -A", cwd)
-            const msg = `autoresearch: ${description} (${config.metric_name}=${fmt(metric)})`
-            const res = await git(`commit -q -m ${JSON.stringify(msg)}`, cwd)
-            if (res.code === 0) {
-              commit = (await git("rev-parse --short HEAD", cwd)).output.trim()
-            } else {
-              gitNote = /nothing to commit/.test(res.output) ? " (nothing to commit)" : `\nWARNING: commit failed:\n${tail(res.output, 20)}`
+            // `.auto/` isn't committed (see commitKeep); the message goes to git as data, not through a shell.
+            const res = await commitKeep(cwd, `autoresearch: ${description} (${config.metric_name}=${fmt(metric)})`)
+            if (!res.ok) {
+              // Don't log a keep that isn't in git: the changes stay in place, unstaged.
+              return {
+                content:
+                  `ERROR: Couldn't commit, so the run was NOT logged:\n${tail(res.error, 20)}\n` +
+                  "Fix the cause and call log_experiment again, or log it as discard to revert.",
+              }
             }
+            commit = res.commit
+            if (!commit) gitNote = " (no code change to commit)"
           } else {
-            // Revert tracked changes and remove untracked files, but never touch .auto/.
+            // Back to the last kept state, staged changes included; .auto/ is never touched.
             // This is why the skill insists on a dedicated branch with a clean tree.
-            await git("checkout -- . ':(exclude).auto'", cwd)
-            await git("clean -fd -- . ':(exclude).auto'", cwd)
+            const res = await revertToHead(cwd)
+            if (!res.ok) {
+              return {
+                content:
+                  `ERROR: Reverting failed, so the run was NOT logged:\n${tail(res.output, 20)}\n` +
+                  "Fix the cause (e.g. a leftover .git/index.lock) and call log_experiment again.",
+              }
+            }
             gitNote = " (changes reverted)"
           }
-          lastChecksFailed.delete(sessionID)
+          await ctx.storage.remove(runKey(sessionID))
 
-          const all = [...runs.map((r) => r.metric), metric]
-          const { baseline, best } = summarize(
-            [...runs, { status, metric } as (typeof runs)[number]],
-            config.direction,
-          )
+          // Crash metrics are placeholders; leave them out of the noise estimate.
+          const all = [...runs, { status, metric }].filter((r) => r.status !== "crash").map((r) => r.metric)
+          const { baseline, best } = summarize([...runs, { status, metric }], config.direction)
           const confidence = all.length >= 3 ? computeConfidence(all, baseline, best) : null
 
           await appendLog(cwd, {
@@ -414,29 +448,59 @@ export default Plugin.define({
     await ctx.command.transform((editor) => {
       editor.add({
         name: "autoresearch",
-        description: "Autoresearch loop: `<goal>` start/resume · `off` · `dashboard` · `finalize` · `help`",
+        description:
+          "Autoresearch loop: `<goal>` start/resume · `status` · `off` · `dashboard` · `finalize` · `help`",
         execute: async ({ sessionID, prompt, delivery }) => {
           const arg = prompt.text.trim()
-          const say = (text: string) => ctx.session.synthetic({ sessionID: sessionID as never, text })
-          const sub = arg.toLowerCase()
+          const say = (text: string) => notify(sessionID, text)
+          const sub = arg.toLowerCase().replace(/[.!]+$/, "")
 
           if (sub === "help" || sub === "--help" || sub === "-h") {
-            await say(HELP_TEXT)
+            await say(HELP_TEXT.replace(`${PLUGIN_PROMPT_PREFIX} `, ""))
             return
           }
 
-          if (sub === "off") {
+          // "stop", "pause"… mean off. (They used to be taken as a goal and resumed the loop.)
+          if (OFF_WORDS.has(sub)) {
             await deactivate(sessionID)
-            await say("[autoresearch] Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes.")
+            await say("Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes.")
+            return
+          }
+
+          if (sub === "status") {
+            const cwd = await cwdOf(sessionID)
+            const on = Boolean(await ctx.storage.get(activeKey(sessionID)))
+            const { config, runs } = currentSegment(await readLog(cwd))
+            const max = await readMaxIterations(cwd)
+            const url = dashboards.isOpen(cwd)
+            const lines = [`Loop: ${on ? "ON" : "off"}`]
+            if (config) {
+              const { baseline, best } = summarize(runs, config.direction)
+              lines.push(
+                `Session: ${config.name} · ${config.metric_name} (${config.direction} is better)`,
+                `Runs: ${runs.length}${max !== null ? `/${max}` : ""} · baseline ${fmt(baseline)} → best ${fmt(best)} ${config.metric_unit}`,
+              )
+            } else {
+              lines.push(existsSync(promptPath(cwd)) ? "Set up, but no experiments yet." : "No session in this project yet.")
+            }
+            lines.push(url ? `Dashboard: ${url}` : "Dashboard: closed (`/autoresearch dashboard` opens it)")
+            await say(lines.join("\n"))
+            return
+          }
+
+          if (sub === "dashboard off" || sub === "dashboard close") {
+            const closed = dashboards.close(await cwdOf(sessionID))
+            await say(closed ? "Dashboard closed." : "No dashboard was open for this project.")
             return
           }
 
           if (sub === "dashboard" || sub === "export") {
             const cwd = await cwdOf(sessionID)
+            const wasOpen = dashboards.isOpen(cwd)
             const url = await dashboards.open(cwd)
-            openInBrowser(url)
+            if (!wasOpen) openInBrowser(url) // don't open another tab every time
             const note = (await logExists(cwd)) ? "" : " No experiments yet; it fills in as they run."
-            await say(`[autoresearch] Live dashboard: ${url}${note}`)
+            await say(`Live dashboard: ${url}${note}`)
             return
           }
 
@@ -455,11 +519,33 @@ export default Plugin.define({
           }
 
           const cwd = await cwdOf(sessionID)
-          const runCount = (await readLog(cwd)).filter((e) => e.type === "run").length
-          const state: ActiveState = { directory: cwd, startRunCount: runCount, lastRunCount: runCount, stalls: 0 }
+          const entries = await readLog(cwd)
+          const setup = !existsSync(promptPath(cwd))
+
+          // Already at the run limit: say so instead of turning on a loop that can't run.
+          if (!setup) {
+            const max = await readMaxIterations(cwd)
+            const { runs } = currentSegment(entries)
+            if (max !== null && runs.length >= max) {
+              await say(
+                `This segment already has ${runs.length}/${max} runs (maxIterations). Raise maxIterations in ` +
+                  ".auto/config.json to continue, or run `/autoresearch finalize` to turn the results into branches.",
+              )
+              return
+            }
+          }
+
+          // One loop per project: two would edit the same files and number runs twice.
+          for (const other of await otherLoopsHere(sessionID, cwd)) {
+            await deactivate(other)
+            await notify(other, "Loop turned off here: another session started autoresearch in this project.")
+          }
+
+          const runCount = entries.filter((e) => e.type === "run").length
+          const state: ActiveState = { directory: cwd, setup, startRunCount: runCount, lastRunCount: runCount, stalls: 0 }
           await activate(sessionID, state)
 
-          if (existsSync(promptPath(cwd))) {
+          if (!setup) {
             await ctx.session.prompt({
               ...prompt,
               sessionID: sessionID as never,
@@ -518,9 +604,11 @@ export default Plugin.define({
 
         const entries = await readLog(state.directory)
         const runCount = entries.filter((e) => e.type === "run").length
-        // Until the first experiment is logged, the agent is still setting up and may be
-        // waiting for the user's answers. Nudging it then would push past those questions.
-        if (runCount <= (state.startRunCount ?? 0)) return
+        // While setting up (no prompt.md when the loop started), the agent may be waiting for
+        // the user's answers; nudging would push past those questions. Only in that case do we
+        // wait for the first logged experiment. (Applying this to resumes too left loops stuck
+        // "on" forever when the first turn logged nothing.)
+        if (state.setup && runCount <= state.startRunCount) return
         const stalls = runCount > state.lastRunCount ? 0 : state.stalls + 1
 
         const { runs } = currentSegment(entries)
@@ -529,15 +617,17 @@ export default Plugin.define({
 
         if (stalls >= MAX_STALLS || hitMax) {
           await deactivate(sessionID)
-          await ctx.session.synthetic({
-            sessionID: sessionID as never,
-            text: hitMax
-              ? `[autoresearch] maxIterations (${max}) reached. Loop stopped.`
-              : `[autoresearch] No new experiments in ${MAX_STALLS} turns. Loop paused; \`/autoresearch\` to resume.`,
-          })
+          await notify(
+            sessionID,
+            hitMax
+              ? `maxIterations (${max}) reached. Loop stopped. \`/autoresearch finalize\` turns the kept experiments into reviewable branches.`
+              : `No new experiments in ${MAX_STALLS} turns. Loop paused; \`/autoresearch\` resumes it.`,
+          )
           return
         }
 
+        // `/autoresearch off` may have landed while we were reading; don't bring the loop back.
+        if (!(await ctx.storage.get(activeKey(sessionID)))) return
         await ctx.storage.set(activeKey(sessionID), { ...state, lastRunCount: runCount, stalls } as never)
         await ctx.session.prompt({ sessionID: sessionID as never, text: CONTINUE_PROMPT, delivery: "queue" })
       } catch (err) {
@@ -550,15 +640,27 @@ export default Plugin.define({
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.execution.succeeded", "session.execution.interrupted"],
+          types: ["session.execution.succeeded", "session.execution.interrupted", "session.execution.failed"],
           signal: controller.signal,
         })) {
           const sessionID = event.data.sessionID as string
+          if (event.type === "session.execution.succeeded") {
+            void onTurnEnd(sessionID)
+            continue
+          }
+          const state = (await ctx.storage.get(activeKey(sessionID))) as ActiveState | undefined
+          if (!state || !ownsSession(state)) continue
           if (event.type === "session.execution.interrupted") {
             // The user pressed stop: respect it and turn the loop off.
             await deactivate(sessionID)
+            await notify(sessionID, "Loop turned off because the session was stopped. `/autoresearch` resumes it.")
           } else {
-            void onTurnEnd(sessionID)
+            // A provider/model error: don't retry in a loop. It stays on and continues after
+            // the next turn that finishes normally.
+            await notify(
+              sessionID,
+              "The last turn failed (provider or model error), so the loop is waiting. Send any message or `/autoresearch` to continue.",
+            )
           }
         }
       } catch (err) {

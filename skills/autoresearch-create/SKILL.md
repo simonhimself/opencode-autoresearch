@@ -87,3 +87,7 @@ Only create it when the user's constraints need correctness checks. It runs afte
 - **Ideas backlog:** append promising-but-later ideas to `.auto/ideas.md`.
 - **Resuming:** if `.auto/prompt.md` exists, read it, the tail of `.auto/log.jsonl`, and `git log`, then continue.
 - **If `run_experiment` says STOP** (maxIterations), summarize the results for the user and stop.
+
+## Messages from the user during the loop
+
+If the user writes while an experiment is in progress, finish the current `run_experiment` + `log_experiment` first. Then apply their note from the next experiment on, and add it to `.auto/prompt.md` if it's a lasting rule ("don't touch X"). Don't abandon a running experiment.

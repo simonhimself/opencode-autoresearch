@@ -143,6 +143,12 @@ export default Plugin.define({
     }
     const activeKey = (sessionID: string) => `active/${sessionID}`
 
+    // OpenCode runs one copy of this plugin per project (location). Every copy receives every
+    // session's events, and plugin storage is shared between them (both verified live). So each
+    // copy only acts on loops started in its own project; otherwise, with several projects
+    // open, each turn would get one "continue" prompt per project.
+    const ownsSession = (state: ActiveState) => state.directory === ctx.location.directory
+
     // Loop on/off. Besides the storage flag, "on" pins a short note into the session's
     // instructions. Instructions aren't part of the conversation, so compaction can't
     // drop it: the agent always knows it's in autoresearch mode and where its state lives.
@@ -479,7 +485,7 @@ export default Plugin.define({
     // skips the model call. Sessions without an active loop are left untouched.
     await ctx.session.hook("compaction", async (event) => {
       const state = (await ctx.storage.get(activeKey(event.sessionID))) as ActiveState | undefined
-      if (!state) return
+      if (!state || !ownsSession(state)) return
       try {
         const userMessages = event.messages.flatMap((m) =>
           m.role === "user"
@@ -508,7 +514,7 @@ export default Plugin.define({
       inFlight.add(sessionID)
       try {
         const state = (await ctx.storage.get(activeKey(sessionID))) as ActiveState | undefined
-        if (!state) return
+        if (!state || !ownsSession(state)) return
 
         const entries = await readLog(state.directory)
         const runCount = entries.filter((e) => e.type === "run").length

@@ -306,7 +306,7 @@ restore_workspace() {
   fi
   if [ "$STASHED" = true ]; then
     STASHED=false
-    if git stash pop --quiet 2>/dev/null; then
+    if git stash pop --quiet >/dev/null 2>&1; then
       echo -e "${GREEN}Restored your uncommitted changes (including .auto/ session files).${NC}"
     else
       echo -e "${YELLOW}⚠ Could not restore stashed changes automatically. They are still in the stash: run 'git stash list' and 'git stash pop' to recover them.${NC}"

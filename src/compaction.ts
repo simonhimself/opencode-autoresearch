@@ -57,7 +57,7 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
       "Older conversation was replaced by this summary, built from the persisted session files in `.auto/`.",
       "Those files are the source of truth. Continue the experiment loop from here.",
     ].join("\n"),
-    sessionSection(config, runs),
+    sessionSection(config, runs, allRuns.length),
     userSection(userMessages),
     await fileSection("Experiment rules", "prompt.md", cwd, MAX_PROMPT_CHARS),
     await fileSection("Ideas backlog", "ideas.md", cwd, MAX_IDEAS_CHARS),
@@ -75,7 +75,7 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
     : summary
 }
 
-function sessionSection(config: ReturnType<typeof currentSegment>["config"], runs: RunEntry[]): string {
+function sessionSection(config: ReturnType<typeof currentSegment>["config"], runs: RunEntry[], total: number): string {
   if (!config) return "## Session\n\nNo `autoresearch_init` yet. Finish setup per `.auto/prompt.md`."
   const { baseline, best } = summarize(runs, config.direction)
   const count = (s: RunEntry["status"]) => runs.filter((r) => r.status === s).length
@@ -84,7 +84,8 @@ function sessionSection(config: ReturnType<typeof currentSegment>["config"], run
     "",
     `Goal: ${oneLine(config.name, MAX_NAME_CHARS)}`,
     `Metric: ${config.metric_name} (${config.metric_unit || "no unit"}), ${config.direction} is better`,
-    `Runs so far: ${runs.length} (${count("keep")} keep · ${count("discard")} discard · ${count("crash")} crash · ${count("checks_failed")} checks_failed)`,
+    `Total runs, all segments (what maxIterations counts): ${total}`,
+    `Runs in segment ${config.segment}: ${runs.length} (${count("keep")} keep · ${count("discard")} discard · ${count("crash")} crash · ${count("checks_failed")} checks_failed)`,
   ]
   if (baseline !== null) lines.push(`Baseline: ${fmt(baseline)}${config.metric_unit}`)
   if (best !== null && best !== baseline) lines.push(`Best: ${fmt(best)}${config.metric_unit}${delta(best, baseline)}`)
@@ -119,9 +120,11 @@ function recentRunsSection(allRuns: RunEntry[]): string {
   const recent = allRuns.slice(-RECENT_RUNS)
   const baselineOf = (segment: number) =>
     allRuns.find((r) => r.segment === segment && r.status === "keep")?.metric ?? null
+  // With several segments, run numbers repeat; label them s<segment>#<run>.
+  const multi = new Set(allRuns.map((r) => r.segment)).size > 1
   const lines = recent.map((r) => {
     const parts = [
-      `#${r.run} ${r.status.padEnd("checks_failed".length)} ${r.status === "crash" ? "—" : fmt(r.metric) + delta(r.metric, baselineOf(r.segment))}`,
+      `${multi ? `s${r.segment}` : ""}#${r.run} ${r.status.padEnd("checks_failed".length)} ${r.status === "crash" ? "—" : fmt(r.metric) + delta(r.metric, baselineOf(r.segment))}`,
       // One line, capped: a description can't add headings or blow up the summary.
       r.description ? `desc: ${oneLine(r.description, MAX_DESCRIPTION_CHARS)}` : "",
       ...asiParts(r.asi),
@@ -156,7 +159,7 @@ const fmt = (n: number) => (Number.isInteger(n) || String(n).length <= 12 ? Stri
 function delta(value: number, baseline: number | null): string {
   if (baseline === null || baseline === 0 || value === baseline) return ""
   const pct = ((value - baseline) / Math.abs(baseline)) * 100
-  return ` (${pct > 0 ? "+" : ""}${pct.toFixed(1)}%)`
+  return ` (${pct > 0 ? "+" : ""}${Math.abs(pct) >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))}%)`
 }
 
 /** Cut to n characters by code point, so emoji and other surrogate pairs aren't split. */

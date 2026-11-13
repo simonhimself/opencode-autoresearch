@@ -84,6 +84,7 @@ Only create it when the user's constraints need correctness checks. It runs afte
 - **Simpler is better.** Removing code at equal performance = keep. Ugly complexity for a tiny gain = discard.
 - **Don't thrash.** Reverting the same idea repeatedly? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log `crash` and move on.
+- **"Permission denied"** from a tool means a permission rule in opencode.json blocks that command. Tell the user which command and stop; don't retry or work around it.
 - **Update `.auto/prompt.md` → "What's Been Tried"** every few runs. After setup, don't commit `.auto/` changes yourself; the plugin leaves them uncommitted on purpose and finalize handles them.
 - **Descriptions are plain text.** Backticks are fine; they're stored as written.
 - **Ideas backlog:** append promising-but-later ideas to `.auto/ideas.md`.

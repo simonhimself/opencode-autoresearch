@@ -49,6 +49,10 @@ const fmt = (n: number | null | undefined) =>
       ? String(n)
       : String(Number(n.toPrecision(8)))
 
+/** A percentage with enough digits that a tiny change doesn't read as "-0.0%". */
+const pctText = (pct: number) =>
+  `${pct > 0 ? "+" : ""}${Math.abs(pct) >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))}%`
+
 /** The parts of a tool call's context the permission check needs. */
 type ToolCtx = { sessionID: string; agent: string; messageID: string; id: string }
 
@@ -133,9 +137,12 @@ const OFF_WORDS = new Set(["off", "stop", "pause", "end", "quit", "cancel", "exi
 const INSTRUCTION_KEY = "autoresearch"
 const ACTIVE_INSTRUCTION = [
   "Autoresearch mode is ON in this session: you are running an autonomous experiment loop.",
-  "Use autoresearch_init, autoresearch_run and autoresearch_log. Session state lives in .auto/:",
+  "Use autoresearch_init, autoresearch_run and autoresearch_log (in Code Mode:",
+  "tools.autoresearch.init / .run / .log). Session state lives in .auto/:",
   "prompt.md (goal and rules), log.jsonl (every run), ideas.md (backlog).",
   "Don't ask whether to continue; keep running experiments until the user stops the loop.",
+  "If a tool fails with \"Permission denied\", a permission rule in opencode.json blocks that",
+  "command: tell the user which command, and stop instead of retrying.",
 ].join(" ")
 
 // Must start with PLUGIN_PROMPT_PREFIX so the compaction summary can tell it apart from the user's messages.
@@ -592,7 +599,7 @@ export default Plugin.define({
 
       const improved = baseline !== null && best !== null && isBetter(best, baseline, config.direction)
       const delta =
-        improved && baseline ? ` (${(((best! - baseline) / Math.abs(baseline)) * 100).toFixed(1)}% vs baseline)` : ""
+        improved && baseline ? ` (${pctText(((best! - baseline) / Math.abs(baseline)) * 100)} vs baseline)` : ""
       const conf =
         confidence === null
           ? improved

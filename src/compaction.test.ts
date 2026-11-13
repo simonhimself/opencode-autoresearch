@@ -85,3 +85,18 @@ describe("QA round 3: size and injection", () => {
     expect(s).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/)
   })
 })
+
+describe("QA round 3 follow-ups", () => {
+  test("shows the total across segments and labels runs by segment when there are several", async () => {
+    const config2 = { ...config, segment: 2 }
+    const run2 = (n: number, metric: number) => ({ ...run(n, "keep", metric, `seg2 run ${n}`), segment: 2 })
+    const s = await buildCompactionSummary(
+      project({ "log.jsonl": jsonl(config, run(1, "keep", 40, "a"), run(2, "keep", 39, "b"), config2, run2(1, 30)) }),
+      [],
+    )
+    expect(s).toContain("Total runs, all segments (what maxIterations counts): 3")
+    expect(s).toContain("Runs in segment 2: 1")
+    expect(s).toContain("s1#1 keep")
+    expect(s).toContain("s2#1 keep")
+  })
+})

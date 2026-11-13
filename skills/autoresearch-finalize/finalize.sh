@@ -16,33 +16,44 @@ set -euo pipefail
 #   - the ideas backlog is captured before stashing, so the summary always shows it
 #   - deleted and renamed files are handled: group files are listed with --no-renames, and a
 #     file missing from a group's last commit is `git rm`ed instead of checked out
-#   - session files are only `.auto/` (any depth) and pi's legacy flat files at the session
-#     root, so user files such as `lib/autoresearch.utils.js` are no longer dropped
-#   - works from any folder inside the repo (e.g. a monorepo package): the session dir is
-#     found by walking up to the nearest `.auto/`, then all git work runs from the toplevel
+#   - OpenCode only: session files are paths with a `.auto` component (any depth), nothing
+#     else, so user files such as `lib/autoresearch.utils.js` are kept; pi's flat
+#     `autoresearch.*` files are not supported
+#   - works from any folder inside the repo: the session dir is the nearest `.auto/` at or
+#     above the cwd; if there is none, the repo is searched downward (one `.auto` is used,
+#     several are an error, none means branches only); all git work runs from the toplevel
 #   - every branch name is validated with `git check-ref-format` in preflight
 #   - the printed cleanup commands run in a working order (remove session files, switch to
 #     trunk, then delete the experiment branch)
+#   - the end state is always the experiment branch's HEAD; a `final_tree` in groups.json is
+#     only compared with it (a stale hash used to let later commits slip past the union check)
+#   - each created branch is measured on its own in a temporary worktree, next to the
+#     merge-base, and the numbers are appended to the branch's commit message
 
-# autoresearch-finalize — creates independent branches from an autoresearch session
+# autoresearch-finalize: creates independent branches from an autoresearch session
 #
-# Usage: finalize.sh <groups.json>
+# Usage: finalize.sh [--no-measure] [--timeout <seconds>] <groups.json>
+#
+#   --no-measure        don't measure the branches (only create and verify them)
+#   --timeout <seconds> limit for one run of measure.sh or checks.sh (default 600)
 #
 # groups.json format:
 # {
 #   "base": "<full merge-base commit hash>",
 #   "trunk": "main",
-#   "final_tree": "<full HEAD hash of autoresearch branch>",
 #   "goal": "short-slug",
 #   "groups": [
 #     {
 #       "title": "Switch to forks pool",
-#       "body": "Use forks instead of threads...\n\nExperiments: #3, #5\nMetric: 42.3s → 38.1s (-9.9%)",
+#       "body": "Use forks instead of threads, because...\n\nExperiments: #3, #5",
 #       "last_commit": "<full commit hash>",
 #       "slug": "forks-pool"
 #     }
 #   ]
 # }
+#
+# Don't put measured numbers in "body": the script measures each branch alone and appends
+# the result itself.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -59,30 +70,57 @@ GROUP_COUNT=""
 STASHED=false
 CREATED_BRANCHES=()
 declare -a GROUP_BRANCH
-# Session dir (absolute) and its path relative to the repo toplevel ("" or "pkg/app/").
+# Session dir (absolute; "" when the repo has no `.auto/`) and its path relative to the
+# repo toplevel ("" or "pkg/app/").
 SESSION_DIR=""
 SESSION_PREFIX=""
+SESSION_FOUND_BY=""
 REPO_ROOT=""
-LEGACY_FILES="autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md autoresearch.checks.sh autoresearch.config.json"
+GIVEN_FINAL_TREE=""
+# Measuring each branch alone.
+MEASURE=true
+MEASURE_SKIP_REASON=""
+MEASURED=false
+MEASURE_TIMEOUT=600
+METRIC_NAME=""
+DIRECTION="lower"
+REPEAT=5
+HAS_CHECKS=0
+WT_ROOT=""
 
 quote_arg() { printf '%q' "$1"; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
 info() { echo -e "${GREEN}$1${NC}"; }
 cleanup_data() { if [ -d "${DATA_DIR:-}" ]; then rm -rf "$DATA_DIR"; fi; }
-fail() { cleanup_data; echo -e "${RED}ERROR: $1${NC}" >&2; exit 1; }
+fail() { cleanup_worktrees; cleanup_data; echo -e "${RED}ERROR: $1${NC}" >&2; exit 1; }
+
+# Remove every temporary worktree and the temp dir that holds them. Runs on every
+# exit path (traps, fail), so each command is guarded. Only `git worktree remove`
+# deletes files; the holder dir is removed with rmdir, which can't take anything
+# else with it.
+cleanup_worktrees() {
+  [ -n "${WT_ROOT:-}" ] || return 0
+  local wt
+  if [ -d "$WT_ROOT" ]; then
+    for wt in "$WT_ROOT"/wt-*; do
+      [ -d "$wt" ] || continue
+      git -C "$REPO_ROOT" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    done
+    rmdir "$WT_ROOT" 2>/dev/null || true
+  fi
+  if [ -d "$WT_ROOT" ]; then
+    echo -e "${YELLOW}⚠ Could not remove the temporary folder $WT_ROOT. Check it and delete it by hand.${NC}"
+  fi
+  WT_ROOT=""
+}
 
 # Takes a repo-root-relative path. Session files are anything under a `.auto`
-# path component (any depth, so a session in a monorepo package is covered) and
-# pi's legacy flat files, but only at the session root. Nothing else: a user
-# file like `lib/autoresearch.utils.js` is real code and must be kept.
+# path component (any depth, so a session in a monorepo package is covered).
+# Nothing else: a user file like `lib/autoresearch.utils.js` is real code.
 is_session_file() {
   case "/$1/" in
     */.auto/*) return 0;;
   esac
-  local legacy
-  for legacy in $LEGACY_FILES; do
-    [ "$1" = "${SESSION_PREFIX}${legacy}" ] && return 0
-  done
   return 1
 }
 
@@ -98,24 +136,43 @@ apply_file() {
   fi
 }
 
-# Find the session dir: the nearest folder from the cwd up to the repo toplevel
-# that holds `.auto/` (or legacy `autoresearch.jsonl`); the cwd if none does.
+# Find the session dir (the folder that holds `.auto/`):
+#   1. the nearest one from the cwd up to the repo toplevel;
+#   2. otherwise search the repo downward (not into .git or node_modules):
+#      one `.auto` is used, several are listed and rejected in preflight,
+#      none leaves SESSION_DIR empty (branches still work; no ideas, no measuring).
 locate_session() {
   REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "Not inside a git repository."
   REPO_ROOT=$(cd "$REPO_ROOT" && pwd -P)
   local dir
   dir=$(pwd -P)
-  SESSION_DIR="$dir"
   while :; do
-    if [ -d "$dir/.auto" ] || [ -f "$dir/autoresearch.jsonl" ]; then
+    if [ -d "$dir/.auto" ]; then
       SESSION_DIR="$dir"
+      SESSION_FOUND_BY="up"
       break
     fi
     [ "$dir" = "$REPO_ROOT" ] && break
     case "$dir" in "$REPO_ROOT"/*) ;; *) break;; esac
     dir=$(dirname "$dir")
   done
-  SESSION_PREFIX=$(cd "$SESSION_DIR" && git rev-parse --show-prefix)
+
+  if [ -z "$SESSION_DIR" ]; then
+    find "$REPO_ROOT" \( -name .git -o -name node_modules \) -prune -o -type d -name .auto -print -prune \
+      2>/dev/null | LC_ALL=C sort > "$DATA_DIR/session_candidates" || true
+    local found
+    found=$(grep -c . "$DATA_DIR/session_candidates" || true)
+    if [ "$found" = "1" ]; then
+      SESSION_DIR=$(dirname "$(head -n 1 "$DATA_DIR/session_candidates")")
+      SESSION_FOUND_BY="down"
+    elif [ "$found" != "0" ]; then
+      SESSION_FOUND_BY="several"
+    fi
+  fi
+
+  if [ -n "$SESSION_DIR" ]; then
+    SESSION_PREFIX=$(cd "$SESSION_DIR" && git rev-parse --show-prefix)
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -135,7 +192,7 @@ const config = JSON.parse(fs.readFileSync(process.argv[1], 'utf-8'));
 const outDir = process.argv[2];
 fs.writeFileSync(outDir + '/base', config.base);
 fs.writeFileSync(outDir + '/trunk', config.trunk || 'main');
-fs.writeFileSync(outDir + '/final_tree', config.final_tree);
+fs.writeFileSync(outDir + '/final_tree', config.final_tree || '');
 fs.writeFileSync(outDir + '/goal', config.goal);
 fs.writeFileSync(outDir + '/count', String(config.groups.length));
 config.groups.forEach((group, idx) => {
@@ -148,7 +205,7 @@ config.groups.forEach((group, idx) => {
 
   BASE=$(cat "$DATA_DIR/base")
   TRUNK=$(cat "$DATA_DIR/trunk")
-  FINAL_TREE=$(cat "$DATA_DIR/final_tree")
+  GIVEN_FINAL_TREE=$(cat "$DATA_DIR/final_tree")
   GOAL=$(cat "$DATA_DIR/goal")
   GROUP_COUNT=$(cat "$DATA_DIR/count")
   [ "$GROUP_COUNT" -gt 0 ] || fail "$groups_file has no groups."
@@ -165,8 +222,44 @@ assert_on_feature_branch() {
 }
 
 assert_commits_exist() {
-  git rev-parse "$BASE" >/dev/null 2>&1 || fail "Base commit $BASE not found."
-  git rev-parse "$FINAL_TREE" >/dev/null 2>&1 || fail "Final tree commit $FINAL_TREE not found."
+  git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null 2>&1 || fail "Base commit $BASE not found."
+}
+
+# The end state the groups must add up to is always the experiment branch as it
+# is now. A hash typed into groups.json can be stale: commits made after it
+# would be left out while the union check still passed.
+resolve_final_tree() {
+  FINAL_TREE=$(git rev-parse --verify HEAD 2>/dev/null) || fail "The branch has no commits."
+  [ -n "$GIVEN_FINAL_TREE" ] || return 0
+  local given
+  given=$(git rev-parse --verify --quiet "${GIVEN_FINAL_TREE}^{commit}" 2>/dev/null || true)
+  if [ "$given" != "$FINAL_TREE" ]; then
+    warn "groups.json has final_tree ${GIVEN_FINAL_TREE:0:12}, but '$ORIG_BRANCH' is at ${FINAL_TREE:0:12}. Using the branch's HEAD (final_tree is not needed)."
+  fi
+}
+
+assert_one_session() {
+  [ "$SESSION_FOUND_BY" = "several" ] || return 0
+  echo -e "${RED}Found more than one .auto session folder in this repo:${NC}" >&2
+  local candidate
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    echo "  $(dirname "$candidate")" >&2
+  done < "$DATA_DIR/session_candidates"
+  fail "cd into the folder of the session you want to finalize and run the script again."
+}
+
+# Decide whether the branches get measured, and say why not.
+plan_measuring() {
+  if [ "$MEASURE" != true ]; then
+    MEASURE_SKIP_REASON="--no-measure was given"
+  elif [ -z "$SESSION_DIR" ]; then
+    MEASURE=false; MEASURE_SKIP_REASON="no .auto session folder was found"
+  elif [ ! -f "$DATA_DIR/measure.sh" ]; then
+    MEASURE=false; MEASURE_SKIP_REASON="${SESSION_PREFIX}.auto/measure.sh doesn't exist"
+  elif [ -z "$METRIC_NAME" ]; then
+    MEASURE=false; MEASURE_SKIP_REASON="${SESSION_PREFIX}.auto/log.jsonl has no usable config entry (metric_name)"
+  fi
 }
 
 collect_group_files() {
@@ -217,8 +310,11 @@ preflight() {
   info "═══ Preflight ═══"
   echo ""
 
+  assert_one_session
   assert_on_feature_branch
   assert_commits_exist
+  resolve_final_tree
+  plan_measuring
 
   # Validate every name we'll create before touching anything (nothing stashed yet).
   local j
@@ -255,8 +351,21 @@ preflight() {
 
   info "Preflight passed."
   echo "  Branch:     $ORIG_BRANCH"
+  echo "  Head:       ${FINAL_TREE:0:12}"
   echo "  Base:       ${BASE:0:12}"
   echo "  Groups:     $GROUP_COUNT"
+  if [ -z "$SESSION_DIR" ]; then
+    echo "  Session:    none (no .auto folder in this repo)"
+  elif [ "$SESSION_FOUND_BY" = "down" ]; then
+    echo "  Session:    $SESSION_DIR (found by searching the repo)"
+  else
+    echo "  Session:    $SESSION_DIR"
+  fi
+  if [ "$MEASURE" = true ]; then
+    echo "  Measuring:  each branch alone, $REPEAT run(s) of ${SESSION_PREFIX}.auto/measure.sh, ${MEASURE_TIMEOUT}s limit per run"
+  else
+    echo "  Measuring:  skipped ($MEASURE_SKIP_REASON)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -268,7 +377,8 @@ rollback_on_failure() {
   if [ $exit_code -eq 0 ]; then return; fi
 
   echo ""
-  echo -e "${RED}FAILED — rolling back...${NC}"
+  echo -e "${RED}FAILED: rolling back...${NC}"
+  cleanup_worktrees
   # Leave the half-built branch first (git won't delete the branch you're on).
   # -f is safe here: the user's own uncommitted work was stashed before we
   # started, so the only changes in the tree are files this script copied in.
@@ -315,21 +425,57 @@ restore_workspace() {
 }
 
 on_exit_restore() {
+  cleanup_worktrees
   restore_workspace || true
   cleanup_data
 }
 
-# Copy the ideas backlog now, before stashing hides it, so the summary can show it.
-capture_ideas() {
-  local ideas_file=""
-  if [ -f "$SESSION_DIR/.auto/ideas.md" ]; then
-    ideas_file=".auto/ideas.md"
-  elif [ -f "$SESSION_DIR/autoresearch.ideas.md" ]; then
-    ideas_file="autoresearch.ideas.md"
+on_early_exit() {
+  cleanup_worktrees
+  cleanup_data
+}
+
+# Copy what we need from the session now, before stashing hides it: the ideas
+# backlog (for the summary), the current measure.sh and checks.sh (every branch
+# is measured with the same, current benchmark) and the last config entry.
+capture_session() {
+  [ -n "$SESSION_DIR" ] || return 0
+  local auto="$SESSION_DIR/.auto"
+  if [ -f "$auto/ideas.md" ]; then
+    cp "$auto/ideas.md" "$DATA_DIR/ideas" 2>/dev/null || true
   fi
-  if [ -n "$ideas_file" ]; then
-    cp "$SESSION_DIR/$ideas_file" "$DATA_DIR/ideas" 2>/dev/null || true
-    echo "${SESSION_PREFIX}${ideas_file}" > "$DATA_DIR/ideas_name"
+  if [ -f "$auto/measure.sh" ]; then
+    cp -p "$auto/measure.sh" "$DATA_DIR/measure.sh" 2>/dev/null || true
+  fi
+  if [ -f "$auto/checks.sh" ]; then
+    if cp -p "$auto/checks.sh" "$DATA_DIR/checks.sh" 2>/dev/null; then HAS_CHECKS=1; fi
+  fi
+  [ -f "$auto/log.jsonl" ] || return 0
+
+  cat > "$DATA_DIR/config.js" <<'CONFIG_JS'
+// Reads the last {"type":"config"} line of .auto/log.jsonl.
+const fs = require('fs');
+const [logFile, outDir] = process.argv.slice(2);
+let config = null;
+for (const line of fs.readFileSync(logFile, 'utf-8').split('\n')) {
+  if (!line.trim()) continue;
+  try {
+    const entry = JSON.parse(line);
+    if (entry && entry.type === 'config') config = entry;
+  } catch (e) { /* a damaged line is not a reason to stop */ }
+}
+if (config && typeof config.metric_name === 'string' && /^[\w.\-]+$/.test(config.metric_name)) {
+  const repeat = Number.isInteger(config.repeat) && config.repeat >= 1 && config.repeat <= 50 ? config.repeat : 5;
+  fs.writeFileSync(outDir + '/metric_name', config.metric_name);
+  fs.writeFileSync(outDir + '/direction', config.direction === 'higher' ? 'higher' : 'lower');
+  fs.writeFileSync(outDir + '/repeat', String(repeat));
+}
+CONFIG_JS
+  node "$DATA_DIR/config.js" "$auto/log.jsonl" "$DATA_DIR" 2>/dev/null || true
+  if [ -s "$DATA_DIR/metric_name" ]; then
+    METRIC_NAME=$(cat "$DATA_DIR/metric_name")
+    DIRECTION=$(cat "$DATA_DIR/direction")
+    REPEAT=$(cat "$DATA_DIR/repeat")
   fi
 }
 
@@ -487,17 +633,6 @@ verify_no_empty_commits() {
   return $errors
 }
 
-warn_missing_metric_data() {
-  for branch in ${CREATED_BRANCHES[@]+"${CREATED_BRANCHES[@]}"}; do
-    local msg short
-    msg=$(git log -1 --format="%B" "$branch" 2>/dev/null || echo "")
-    if ! echo "$msg" | grep -qiE '(metric|→|->|%\))'; then
-      short=$(git log -1 --oneline "$branch" 2>/dev/null | head -c 80)
-      warn "Commit $short — no metric data in message"
-    fi
-  done
-}
-
 verify_branches() {
   echo ""
   info "═══ Verifying ═══"
@@ -508,19 +643,439 @@ verify_branches() {
   verify_union_matches_original || errors=$((errors + 1))
   verify_no_session_artifacts || errors=$((errors + 1))
   verify_no_empty_commits || errors=$((errors + $?))
-  warn_missing_metric_data
 
   echo ""
   if [ $errors -gt 0 ]; then
     restore_workspace || true
     echo -e "${RED}Verification failed with $errors error(s).${NC}"
-    echo -e "${RED}Branches are intact — inspect and fix manually, or delete and retry.${NC}"
+    echo -e "${RED}Branches are intact: inspect and fix manually, or delete and retry.${NC}"
     echo "  Branches: ${CREATED_BRANCHES[*]:-}"
     echo "  You are on: $(git branch --show-current 2>/dev/null || echo 'detached')"
     cleanup_data
     exit 1
   fi
   info "✓ All checks passed."
+}
+
+# ---------------------------------------------------------------------------
+# Measure each branch on its own
+# ---------------------------------------------------------------------------
+
+# The runner: runs .auto/measure.sh `repeat` times in one checkout, takes the
+# median of `METRIC <name>=<number>` (same parsing as the plugin), then runs
+# .auto/checks.sh. Each run is its own process group, so a timeout (or Ctrl-C)
+# kills the script and everything it started. macOS has no `timeout` command.
+write_measure_runner() {
+  cat > "$DATA_DIR/measure.js" <<'MEASURE_JS'
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const [cwd, metric, repeatArg, timeoutArg, outDir, hasChecks, baseArg, direction] = process.argv.slice(2);
+const repeat = Number(repeatArg);
+const timeoutMs = Number(timeoutArg) * 1000;
+const put = (name, value) => fs.writeFileSync(path.join(outDir, name), String(value));
+
+let group = null; // pid of the running script = id of its process group
+const killGroup = (signal) => {
+  if (!group) return;
+  try { process.kill(-group, signal); } catch (e) { /* already gone */ }
+};
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => { killGroup('SIGKILL'); process.exit(130); });
+}
+
+// Last 1 MB of a run's output.
+function readTail(file) {
+  try {
+    const size = fs.statSync(file).size;
+    const length = Math.min(size, 1024 * 1024);
+    const buffer = Buffer.alloc(length);
+    const fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buffer, 0, length, size - length);
+    fs.closeSync(fd);
+    return buffer.toString('utf-8');
+  } catch (e) { return ''; }
+}
+
+// Output goes straight to a file, and we wait for the script's exit, not for
+// its pipes to close: a background process it leaves behind can't hang us.
+function run(script) {
+  return new Promise((resolve) => {
+    const logFile = path.join(outDir, 'output.log');
+    const relative = './.auto/' + script;
+    let command = relative, args = [];
+    try { fs.accessSync(path.join(cwd, relative), fs.constants.X_OK); } catch (e) { command = 'bash'; args = [relative]; }
+    const fd = fs.openSync(logFile, 'w');
+    let timedOut = false, done = false, timer = null, killer = null;
+    const finish = (code, signal) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(killer);
+      killGroup('SIGKILL'); // leftovers would keep files open in the worktree
+      group = null;
+      try { fs.closeSync(fd); } catch (e) { /* ignore */ }
+      resolve({ timedOut, code, signal, output: readTail(logFile) });
+    };
+    let child;
+    try {
+      child = spawn(command, args, { cwd, detached: true, stdio: ['ignore', fd, fd] });
+    } catch (e) {
+      fs.appendFileSync(logFile, String(e && e.message) + '\n');
+      return finish(127, null);
+    }
+    child.on('error', (e) => { fs.appendFileSync(logFile, String(e && e.message) + '\n'); finish(127, null); });
+    child.on('exit', finish);
+    group = child.pid || null;
+    timer = setTimeout(() => {
+      timedOut = true;
+      killGroup('SIGTERM');
+      killer = setTimeout(() => killGroup('SIGKILL'), 5000);
+    }, timeoutMs);
+  });
+}
+
+// Same rules as parseMetrics() and median() in src/state.ts.
+function parseMetrics(output) {
+  const metrics = {};
+  const re = /^METRIC\s+([\w.\-]+)=(\S+)\s*$/gm;
+  let m;
+  while ((m = re.exec(output)) !== null) {
+    const value = Number(m[2]);
+    if (Number.isFinite(value)) metrics[m[1]] = value;
+  }
+  return metrics;
+}
+function median(values) {
+  const s = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+function format(x) {
+  if (Number.isInteger(x)) return String(x);
+  if (Math.abs(x) >= 1000) return String(Number(x.toFixed(1)));
+  return String(Number(x.toPrecision(4)));
+}
+const lastLines = (text) => text.split('\n').filter((l) => l.trim()).slice(-12).join('\n');
+const why = (r) => (r.signal ? 'killed by ' + r.signal : 'exit ' + r.code);
+
+(async () => {
+  const samples = [];
+  for (let i = 0; i < repeat; i++) {
+    const r = await run('measure.sh');
+    let status = null;
+    if (r.timedOut) status = 'timeout';
+    else if (r.code !== 0) status = 'failed';
+    else if (parseMetrics(r.output)[metric] === undefined) status = 'no_metric';
+    if (status) {
+      put('detail', why(r));
+      put('tail', lastLines(r.output));
+      put('status', status);
+      return;
+    }
+    samples.push(parseMetrics(r.output)[metric]);
+  }
+  const value = median(samples);
+  put('raw', value);
+  put('median', format(value));
+  if (baseArg !== '') {
+    const base = Number(baseArg);
+    if (base !== 0) {
+      let pct = (((value - base) / Math.abs(base)) * 100).toFixed(1);
+      if (Number(pct) === 0) pct = '0.0';
+      else if (Number(pct) > 0) pct = '+' + pct;
+      put('pct', pct + '%');
+    }
+    const better = direction === 'lower' ? value < base : value > base;
+    put('verdict', value === base ? 'same' : better ? 'better' : 'worse');
+  }
+  if (hasChecks === '1') {
+    const r = await run('checks.sh');
+    put('checks', r.timedOut ? 'timeout' : r.code === 0 ? 'passed' : 'failed');
+    put('checks_detail', why(r));
+    if (r.timedOut || r.code !== 0) put('checks_tail', lastLines(r.output));
+  }
+  put('status', 'ok');
+})().catch((e) => {
+  put('detail', String(e && e.message));
+  put('status', 'error');
+});
+MEASURE_JS
+}
+
+result() { cat "$DATA_DIR/$1/$2" 2>/dev/null || true; }
+
+# "exit 1", "timed out after 600 s", ... for a result dir whose status isn't ok.
+failure_reason() {
+  case "$(result "$1" status)" in
+    failed)    result "$1" detail;;
+    timeout)   echo "timed out after ${MEASURE_TIMEOUT} s";;
+    no_metric) echo "no METRIC ${METRIC_NAME}=<number> line in the output";;
+    worktree)  echo "git could not create a temporary worktree";;
+    *)         echo "the measuring step broke: $(result "$1" detail)";;
+  esac
+}
+
+runs_label() {
+  if [ "$REPEAT" = "1" ]; then echo "1 run"; else echo "median of $REPEAT"; fi
+}
+
+# Check <ref> out into the temporary worktree <wt>, detached. The user's own
+# checkout is never switched for measuring.
+add_worktree() {
+  local wt="$1" ref="$2" out="$3"
+  mkdir -p "$DATA_DIR/$out"
+  if git worktree add --detach "$wt" "$ref" > "$DATA_DIR/$out/worktree.log" 2>&1; then
+    return 0
+  fi
+  echo "worktree" > "$DATA_DIR/$out/status"
+  return 1
+}
+
+remove_worktree() {
+  git worktree remove --force "$1" >/dev/null 2>&1 || true
+}
+
+# Put the session's current measure.sh / checks.sh at the same relative path
+# inside the worktree and run them from the session path. Never fails: the
+# outcome is in $DATA_DIR/<out>/status.
+run_measure() {
+  local wt="$1" out="$2" base_raw="$3"
+  local session_path="$wt/${SESSION_PREFIX}"
+  if mkdir -p "$session_path.auto" \
+    && cp -p "$DATA_DIR/measure.sh" "$session_path.auto/measure.sh" \
+    && { [ "$HAS_CHECKS" != "1" ] || cp -p "$DATA_DIR/checks.sh" "$session_path.auto/checks.sh"; }; then
+    node "$DATA_DIR/measure.js" "$session_path" "$METRIC_NAME" "$REPEAT" "$MEASURE_TIMEOUT" \
+      "$DATA_DIR/$out" "$HAS_CHECKS" "$base_raw" "$DIRECTION" || true
+  else
+    echo "could not copy measure.sh into the worktree" > "$DATA_DIR/$out/detail"
+  fi
+  [ -s "$DATA_DIR/$out/status" ] || echo "error" > "$DATA_DIR/$out/status"
+}
+
+# Write the lines that go under a branch's commit message to <out>/trailer.
+write_trailer() {
+  local out="$1" status base_status
+  status=$(result "$out" status)
+  base_status=$(result m.base status)
+  local file="$DATA_DIR/$out/trailer"
+
+  if [ "$base_status" = "timeout" ]; then
+    echo "Measured alone: could not be measured (measure.sh timed out after ${MEASURE_TIMEOUT} s on the $TRUNK merge-base)" > "$file"
+    return 0
+  fi
+  if [ "$base_status" != "ok" ]; then
+    echo "Measured alone: could not be measured in a clean checkout (e.g. missing untracked dependencies)" > "$file"
+    return 0
+  fi
+  if [ "$status" = "timeout" ]; then
+    echo "Measured alone: FAILED ($(failure_reason "$out")) — this branch may depend on another one, or needs a longer --timeout" > "$file"
+    return 0
+  fi
+  # Our own tooling broke, which says nothing about the branch.
+  case "$status" in
+    failed|no_metric|ok) ;;
+    *) echo "Measured alone: could not be measured ($(failure_reason "$out"))" > "$file"; return 0;;
+  esac
+  if [ "$status" != "ok" ]; then
+    echo "Measured alone: FAILED ($(failure_reason "$out")) — this branch may depend on another one" > "$file"
+    return 0
+  fi
+
+  local pct line
+  pct=$(result "$out" pct)
+  line="Measured alone ($(runs_label)): $METRIC_NAME $(result "$out" median) vs $(result m.base median) on $TRUNK merge-base"
+  [ -z "$pct" ] || line="$line ($pct)"
+  echo "$line" > "$file"
+
+  case "$(result "$out" checks)" in
+    passed) echo "Checks: passed" >> "$file";;
+    "") ;;
+    *)
+      local reason
+      if [ "$(result "$out" checks)" = "timeout" ]; then
+        reason="timed out after ${MEASURE_TIMEOUT} s"
+      else
+        reason=$(result "$out" checks_detail)
+      fi
+      if [ "$(result m.base checks)" = "passed" ]; then
+        echo "Checks: FAILED ($reason) — this branch may depend on another one" >> "$file"
+      else
+        echo "Checks: FAILED ($reason; they fail on the $TRUNK merge-base too)" >> "$file"
+      fi;;
+  esac
+}
+
+# Append the trailer to the branch's commit message. The branch isn't checked
+# out anywhere, so: amend the detached HEAD of its worktree, then move the
+# branch to the new commit. Only the message may change, so the tree is
+# compared first (the union check ran on the old commit). --no-verify: the
+# content already passed the user's hooks when the commit was made, and hooks
+# tend to fail in a worktree without installed dependencies.
+amend_branch() {
+  local wt="$1" branch="$2" out="$3"
+  local old new message="$DATA_DIR/$out/message"
+  old=$(git rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null || true)
+  [ -n "$old" ] || return 1
+  [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)" = "$old" ] || return 1
+  { git log -1 --format=%B "$old"; echo ""; cat "$DATA_DIR/$out/trailer"; } > "$message" 2>/dev/null || return 1
+  git -C "$wt" commit --amend --quiet --no-verify --allow-empty -F "$message" \
+    > "$DATA_DIR/$out/amend.log" 2>&1 || return 1
+  new=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)
+  [ -n "$new" ] || return 1
+  [ "$(git rev-parse "$new^{tree}" 2>/dev/null)" = "$(git rev-parse "$old^{tree}" 2>/dev/null)" ] || return 1
+  git update-ref "refs/heads/$branch" "$new" "$old" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# Runs after the branches exist, the union check passed and the user's
+# workspace is back. Nothing in here fails the script: a branch that doesn't
+# work alone is a result to report.
+measure_branches() {
+  [ "$MEASURE" = true ] || return 0
+  [ "${#CREATED_BRANCHES[@]}" -gt 0 ] || return 0
+
+  echo ""
+  info "═══ Measuring each branch on its own ═══"
+  echo ""
+  echo "  ${SESSION_PREFIX}.auto/measure.sh, $REPEAT run(s) per checkout, ${MEASURE_TIMEOUT}s limit per run."
+  echo "  Each checkout is a clean temporary worktree: only committed files are there."
+  echo ""
+
+  WT_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/autoresearch-finalize.XXXXXX") || { WT_ROOT=""; }
+  if [ -z "$WT_ROOT" ]; then
+    MEASURE=false; MEASURE_SKIP_REASON="could not create a temporary folder"
+    warn "Not measuring: $MEASURE_SKIP_REASON."
+    return 0
+  fi
+  WT_ROOT=$(cd "$WT_ROOT" && pwd -P)
+  write_measure_runner
+  MEASURED=true
+
+  local wt="$WT_ROOT/wt-base"
+  echo "  merge-base ($TRUNK) ..."
+  if add_worktree "$wt" "$BASE" m.base; then
+    run_measure "$wt" m.base ""
+  fi
+  remove_worktree "$wt"
+  if [ "$(result m.base status)" = "ok" ]; then
+    echo "    $METRIC_NAME $(result m.base median)"
+  else
+    warn "  The merge-base could not be measured ($(failure_reason m.base)), so the branches aren't measured either."
+  fi
+
+  local i branch out
+  for i in $(seq 0 $((GROUP_COUNT - 1))); do
+    branch="${GROUP_BRANCH[$i]:-skipped}"
+    [ "$branch" != "skipped" ] && [ -n "$branch" ] || continue
+    out="m.$i"
+    wt="$WT_ROOT/wt-$i"
+    echo "  $branch ..."
+    if add_worktree "$wt" "$branch" "$out"; then
+      if [ "$(result m.base status)" = "ok" ]; then
+        run_measure "$wt" "$out" "$(result m.base raw)"
+      else
+        echo "base" > "$DATA_DIR/$out/status"
+      fi
+      write_trailer "$out"
+      sed 's/^/    /' "$DATA_DIR/$out/trailer"
+      if ! amend_branch "$wt" "$branch" "$out"; then
+        echo "failed" > "$DATA_DIR/$out/amend"
+        warn "  Could not add the result to the commit message of $branch (the branch is unchanged)."
+      fi
+    else
+      warn "  Could not create a temporary worktree for $branch: not measured."
+    fi
+    remove_worktree "$wt"
+  done
+
+  cleanup_worktrees
+}
+
+# The table in the summary.
+print_measurements() {
+  echo ""
+  if [ "$MEASURED" != true ]; then
+    if [ "${#CREATED_BRANCHES[@]}" -gt 0 ]; then
+      echo "Measured alone: skipped ($MEASURE_SKIP_REASON)."
+    fi
+    return 0
+  fi
+
+  echo "Measured alone ($METRIC_NAME, $(runs_label), $DIRECTION is better; clean checkout of each branch):"
+  echo ""
+  local base_status
+  base_status=$(result m.base status)
+  if [ "$base_status" = "ok" ]; then
+    printf '  %-44s %-12s %-9s %-7s %s\n' "$TRUNK merge-base" "$(result m.base median)" "" "" \
+      "$(checks_cell m.base)"
+  else
+    printf '  %-44s %s\n' "$TRUNK merge-base" "FAILED ($(failure_reason m.base))"
+  fi
+
+  local i branch out status alone=""
+  for i in $(seq 0 $((GROUP_COUNT - 1))); do
+    branch="${GROUP_BRANCH[$i]:-skipped}"
+    [ "$branch" != "skipped" ] && [ -n "$branch" ] || continue
+    out="m.$i"
+    status=$(result "$out" status)
+    if [ "$base_status" != "ok" ]; then
+      printf '  %-44s %s\n' "${branch#autoresearch/${GOAL}/}" "not measured"
+    elif [ "$status" = "ok" ]; then
+      printf '  %-44s %-12s %-9s %-7s %s\n' "${branch#autoresearch/${GOAL}/}" "$(result "$out" median)" \
+        "$(result "$out" pct)" "$(result "$out" verdict)" "$(checks_cell "$out")"
+      case "$(result "$out" checks)" in passed|"") ;; *) [ "$(result m.base checks)" != "passed" ] || alone="$alone $out";; esac
+    elif [ "$status" = "failed" ] || [ "$status" = "timeout" ] || [ "$status" = "no_metric" ]; then
+      printf '  %-44s %s\n' "${branch#autoresearch/${GOAL}/}" "DOESN'T WORK ON ITS OWN ($(failure_reason "$out"))"
+      alone="$alone $out"
+    else
+      printf '  %-44s %s\n' "${branch#autoresearch/${GOAL}/}" "not measured ($(failure_reason "$out"))"
+    fi
+    if [ "$(result "$out" amend)" = "failed" ]; then
+      printf '  %-44s %s\n' "" "(result not written into the commit message)"
+    fi
+  done
+
+  if [ "$base_status" != "ok" ]; then
+    echo ""
+    echo "  The $TRUNK merge-base itself can't be measured in a clean checkout, so nothing was compared."
+    if [ "$base_status" = "timeout" ]; then
+      echo "  measure.sh ran into the ${MEASURE_TIMEOUT} s limit: pass a longer --timeout <seconds>. Last output:"
+    else
+      echo "  Usual cause: measure.sh needs files that aren't committed (installed dependencies,"
+      echo "  build output, data files). Last output:"
+    fi
+    echo ""
+    result m.base tail | sed 's/^/    | /'
+    echo ""
+  fi
+
+  if [ -n "$alone" ]; then
+    echo ""
+    echo "  Branches that don't work on their own most likely need a change from another branch."
+    echo "  Merge those groups into one and run again, or have them reviewed as a stack. Last output:"
+    for out in $alone; do
+      i="${out#m.}"
+      echo ""
+      echo "    ${GROUP_BRANCH[$i]}:"
+      if [ "$(result "$out" status)" = "ok" ]; then
+        result "$out" checks_tail | sed 's/^/    | /'
+      else
+        result "$out" tail | sed 's/^/    | /'
+      fi
+      echo ""
+    done
+  fi
+}
+
+checks_cell() {
+  case "$(result "$1" checks)" in
+    "")      echo "";;
+    passed)  echo "checks passed";;
+    timeout) echo "checks FAILED (timed out after ${MEASURE_TIMEOUT} s)";;
+    *)       echo "checks FAILED ($(result "$1" checks_detail))";;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -552,32 +1107,33 @@ print_summary() {
     echo "$body" | sed 's/^/     /'
   done
 
+  print_measurements
+
   # Order matters: the session files go first (tracked, modified .auto/ files
   # would block the checkout), then leave the experiment branch (git won't
   # delete the branch you're on), then delete it.
-  local cleanup="" legacy legacy_present=""
-  if [ -e "$SESSION_DIR/.auto" ]; then
+  local cleanup=""
+  if [ -n "$SESSION_DIR" ] && [ -e "$SESSION_DIR/.auto" ]; then
     cleanup="rm -r .auto && "
-  fi
-  for legacy in $LEGACY_FILES; do
-    if [ -e "$SESSION_DIR/$legacy" ]; then legacy_present="$legacy_present $legacy"; fi
-  done
-  if [ -n "$legacy_present" ]; then
-    cleanup="${cleanup}rm -f${legacy_present} && "
   fi
   cleanup="${cleanup}git checkout $(quote_arg "$TRUNK") && git branch -D $(quote_arg "$ORIG_BRANCH")"
 
   echo ""
-  echo "Cleanup — after merging, delete the session files and the autoresearch branch"
-  echo "(this discards the experiment log and ideas, so copy anything you want to keep first):"
-  echo ""
-  echo "  cd $(quote_arg "$SESSION_DIR")"
+  if [ -n "$cleanup" ] && [ -n "$SESSION_DIR" ]; then
+    echo "Cleanup: after merging, delete the session files and the autoresearch branch"
+    echo "(this discards the experiment log and ideas, so copy anything you want to keep first):"
+    echo ""
+    echo "  cd $(quote_arg "$SESSION_DIR")"
+  else
+    echo "Cleanup: after merging, delete the autoresearch branch:"
+    echo ""
+  fi
   echo "  $cleanup"
 
   # Read from the copy taken before stashing, not the working tree.
   if [ -f "$DATA_DIR/ideas" ]; then
     echo ""
-    echo "Ideas backlog (from $(cat "$DATA_DIR/ideas_name")):"
+    echo "Ideas backlog (from ${SESSION_PREFIX}.auto/ideas.md):"
     echo ""
     sed 's/^/  /' "$DATA_DIR/ideas"
   fi
@@ -589,25 +1145,54 @@ print_summary() {
 # Main
 # ---------------------------------------------------------------------------
 
+usage() {
+  echo "Usage: $0 [--no-measure] [--timeout <seconds>] <groups.json>"
+  exit 1
+}
+
 main() {
-  if [ $# -lt 1 ]; then
-    echo "Usage: $0 <groups.json>"
-    exit 1
-  fi
+  local groups_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-measure) MEASURE=false;;
+      --timeout)
+        [ $# -ge 2 ] || usage
+        MEASURE_TIMEOUT="$2"; shift;;
+      --timeout=*) MEASURE_TIMEOUT="${1#--timeout=}";;
+      -h|--help) usage;;
+      -*) echo "Unknown option: $1" >&2; usage;;
+      *)
+        [ -z "$groups_file" ] || usage
+        groups_file="$1";;
+    esac
+    shift
+  done
+  [ -n "$groups_file" ] || usage
+  case "$MEASURE_TIMEOUT" in
+    ""|*[!0-9]*|0*) echo "--timeout needs a whole number of seconds, 1 or more." >&2; exit 1;;
+  esac
+
+  # Ctrl-C and kill go through the EXIT trap, so temp worktrees are removed and
+  # the workspace is restored there too.
+  trap 'exit 130' INT TERM HUP
+  trap on_early_exit EXIT
 
   # Parse first (the groups.json path may be relative to the cwd), find the
-  # session dir and grab the ideas from it, then do all git work from the
+  # session dir and copy what we need from it, then do all git work from the
   # toplevel: `git diff --name-only` paths are relative to it, not to the cwd.
-  parse_groups "$1"
+  parse_groups "$groups_file"
   locate_session
-  capture_ideas
+  capture_session
   cd "$REPO_ROOT" || fail "Cannot cd to repo root $REPO_ROOT."
   preflight
   create_branches
   verify_branches
+  # Give the user's uncommitted work back before the (possibly long) measuring.
   restore_workspace
+  measure_branches
   print_summary
   trap - EXIT
+  cleanup_worktrees
   cleanup_data
 }
 

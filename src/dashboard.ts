@@ -1,14 +1,14 @@
 // Live browser dashboard: one small local HTTP server per project directory.
 //
 //   GET /           → dashboard.html (read on every request, so edits show on reload)
-//   GET /log.jsonl  → the raw .auto/log.jsonl (404 until the first init_experiment)
+//   GET /log.jsonl  → the raw .auto/log.jsonl (404 until the first autoresearch_init)
 //   GET /events     → Server-Sent Events:
 //                       event "log"    → the log changed, re-fetch /log.jsonl
 //                       event "status" → {running, command?, startedAt?}, sent on connect + on change
 //
 // Only listens on 127.0.0.1 and rejects any Host header other than
 // 127.0.0.1:<port> / localhost:<port> (DNS-rebinding guard). Log changes are picked up by polling the file
-// (fs.watchFile), so edits made outside this plugin (e.g. by pi) show up too.
+// (fs.watchFile), so edits made outside this plugin show up too.
 
 import { spawn } from "node:child_process"
 import { readFile, stat } from "node:fs/promises"

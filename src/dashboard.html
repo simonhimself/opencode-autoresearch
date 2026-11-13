@@ -35,7 +35,12 @@
   .pill.running code { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; max-width: 38ch; }
   .spin { width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; flex: none; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .note { font-size: 12px; color: var(--muted); margin: -6px 0 12px; }
+  .note { font-size: 12px; color: var(--muted); margin: -6px 0 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .segs { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+  .segs button { font: inherit; font-size: 12px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+  .segs button code { font-family: var(--mono); font-size: 11px; }
+  .segs button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); background: var(--soft); }
+  .mono { font-family: var(--mono); font-size: 12px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
   .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; min-width: 0; }
   .stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
@@ -48,10 +53,11 @@
   #chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); padding: 0 8px 8px; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend svg { flex: none; }
   #tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 12px; padding: 6px 8px; border-radius: 6px; max-width: 280px; display: none; z-index: 2; }
   #tip b { font-variant-numeric: tabular-nums; }
   .tablewrap { overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; min-width: 900px; font-size: 13px; }
   th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th.num, td.num { text-align: right; white-space: nowrap; }
@@ -61,7 +67,10 @@
   .tog { color: var(--muted); display: inline-block; width: 12px; transition: transform .12s; }
   tr.open .tog { transform: rotate(90deg); }
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 4px; white-space: nowrap; border: 1px solid currentColor; }
-  .s-keep { color: var(--keep); } .s-discard { color: var(--discard); } .s-crash { color: var(--crash); } .s-checks_failed { color: var(--checks); }
+  .s-keep, .s-neutral { color: var(--keep); } .s-baseline { color: var(--accent); } .s-discard, .s-unconfirmed { color: var(--muted); }
+  .s-crash { color: var(--crash); } .s-checks_failed { color: var(--checks); }
+  .s-neutral, .s-unconfirmed { border-style: dashed; }
+  .rownote { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .commit { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   .desc { min-width: 220px; word-break: break-word; }
   dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; font-size: 12.5px; }
@@ -90,8 +99,10 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const STATUS_LABEL = { keep: "kept", discard: "discarded", crash: "crash", checks_failed: "checks failed" };
-const STATUS_VAR = { keep: "--keep", discard: "--discard", crash: "--crash", checks_failed: "--checks" };
+// A run's "kind" refines its logged status: the baseline and neutral keeps are keeps, an
+// unconfirmed keep is a discard that carries a note (the plugin re-measured and reverted it).
+const KIND_LABEL = { baseline: "baseline", keep: "kept", neutral: "kept (neutral)", discard: "discarded", unconfirmed: "not confirmed", crash: "crash", checks_failed: "checks failed" };
+const KIND_VAR = { baseline: "--accent", keep: "--keep", neutral: "--keep", discard: "--discard", unconfirmed: "--discard", crash: "--crash", checks_failed: "--checks" };
 
 // ---------- helpers ----------
 function h(tag, attrs, ...kids) {
@@ -110,22 +121,33 @@ function svg(tag, attrs) {
   return el;
 }
 const isNum = (x) => typeof x === "number" && Number.isFinite(x);
+// Integers and short decimals are shown exactly; anything longer is cut to 6 significant digits.
 function fmt(x) {
   if (!isNum(x)) return "—";
-  return String(Number(x.toPrecision(5)));
+  if (Number.isInteger(x)) return String(x);
+  if (Math.abs(x) >= 1e6) return String(Math.round(x));
+  return String(Number(x.toPrecision(6)));
 }
-const better = (a, b, dir) => (dir === "higher" ? a > b : a < b);
 function pct(v, base) {
   if (!isNum(v) || !isNum(base) || base === 0) return null;
   return ((v - base) / Math.abs(base)) * 100;
 }
+// Below this a change counts as zero: no sign, no colour.
+const pctZero = (p) => p == null || Math.abs(p) < 0.00005;
 function fmtPct(p) {
   if (p == null) return "—";
-  const s = Math.abs(p) >= 100 ? p.toFixed(0) : Math.abs(p) >= 10 ? p.toFixed(1) : p.toFixed(2);
-  return (p > 0 ? "+" : "") + s + "%";
+  if (pctZero(p)) return "0%";
+  // Add decimals until the rounded text is no longer zero, so a small change never reads "-0.0%".
+  let d = Math.abs(p) >= 100 ? 0 : Math.abs(p) >= 10 ? 1 : 2;
+  while (Number(p.toFixed(d)) === 0 && d < 4) d++;
+  return (p > 0 ? "+" : "") + p.toFixed(d) + "%";
 }
 // A change is "good" when it moves in the configured direction.
-const pctClass = (p, dir) => (p == null || p === 0 ? "" : (dir === "higher" ? p > 0 : p < 0) ? "good" : "bad");
+const pctClass = (p, dir) => (pctZero(p) ? "" : (dir === "higher" ? p > 0 : p < 0) ? "good" : "bad");
+function fmtX(c) {
+  const t = Math.abs(c) >= 100 ? c.toFixed(0) : c.toFixed(1);
+  return (Number(t) === 0 ? "0.0" : t) + "×"; // never "-0.0×"
+}
 // Free-form note values are shown as written; only figures (metrics) get rounded.
 function valText(v, round) {
   if (v == null) return "null";
@@ -139,28 +161,33 @@ function mmss(ms) {
   const p = (n) => String(n).padStart(2, "0");
   return (hh ? hh + ":" + p(mm) : p(mm)) + ":" + p(ss);
 }
+const shortHash = (x) => (typeof x === "string" && x ? x.slice(0, 7) : null);
+const numSamples = (r) => (Array.isArray(r.samples) ? r.samples.filter(isNum) : []);
 
 // ---------- state ----------
-let model = null;            // { config, runs, hiddenSegments }
-const expanded = new Set();  // run numbers whose detail row is open (survives re-renders)
+let model = null;            // { segments: [{ config, runs }] } in log order; the last one is the live segment
+let selectedSeg = null;      // segment id the user picked; null = follow the latest segment
+const expanded = new Set();  // "segment:run" keys whose detail row is open (survives re-renders)
 let fetchSeq = 0;
 
 function parseLog(text) {
-  const entries = [];
+  const segments = [], byId = new Map();
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
-    try {
-      const e = JSON.parse(line);
-      if (e && (e.type === "config" || e.type === "run")) entries.push(e);
-    } catch { /* skip unparsable lines */ }
+    let e;
+    try { e = JSON.parse(line); } catch { continue; } // skip unparsable lines
+    if (!e || typeof e !== "object") continue;
+    if (e.type === "config") {
+      // Each config entry starts a segment (a fixed benchmark + repeat); runs join the segment they name.
+      const seg = { config: e, runs: [] };
+      if (byId.has(e.segment)) segments.splice(segments.indexOf(byId.get(e.segment)), 1);
+      byId.set(e.segment, seg);
+      segments.push(seg);
+    } else if (e.type === "run" && byId.has(e.segment)) {
+      byId.get(e.segment).runs.push(e);
+    }
   }
-  // Mirror currentSegment() in state.ts: last config wins; only its runs count.
-  const configs = entries.filter((e) => e.type === "config");
-  const config = configs[configs.length - 1] || null;
-  const runs = config ? entries.filter((e) => e.type === "run" && e.segment === config.segment) : [];
-  const segs = new Set(entries.map((e) => e.segment));
-  const hiddenSegments = config ? [...segs].filter((s) => s !== config.segment).length : 0;
-  return { config, runs, hiddenSegments };
+  return { segments };
 }
 
 async function loadLog() {
@@ -172,80 +199,170 @@ async function loadLog() {
     model = parseLog(text);
   } catch {
     if (seq !== fetchSeq) return;
-    if (!model) model = { config: null, runs: [], hiddenSegments: 0 };
+    if (!model) model = { segments: [] };
   }
   render();
 }
 
+// Everything the views need to know about one segment's runs.
+//   baseline = the run flagged baseline (old logs: the first keep with a metric)
+//   current  = the last keep (it describes HEAD); NOT the best value: a neutral keep may be slightly worse
+//   kind     = refined status per run; prev = metric of the state a keep was compared with
+function analyze(seg) {
+  const { config, runs } = seg;
+  const keeps = runs.filter((r) => r.status === "keep" && isNum(r.metric));
+  const baseRun = keeps.find((r) => r.baseline === true) || keeps[0] || null;
+  const curRun = keeps.length ? keeps[keeps.length - 1] : null;
+  const kind = new Map(), prev = new Map();
+  let state = null; // metric of the last keep seen so far
+  for (const r of runs) {
+    let k = String(r.status);
+    if (r === baseRun) k = "baseline";
+    else if (r.status === "keep" && r.neutral === true) k = "neutral";
+    else if (r.status === "discard" && r.note) k = "unconfirmed";
+    kind.set(r, k);
+    prev.set(r, isNum(r.vs) ? r.vs : state);
+    if (r.status === "keep" && isNum(r.metric)) state = r.metric;
+  }
+  return { config, runs, baseRun, curRun, kind, prev, dir: config.direction === "higher" ? "higher" : "lower" };
+}
+
+// Confidence of ONE keep against the state before it (never cumulative). null = not applicable.
+// Logs written before v0.2 stored a cumulative figure in `confidence`; that one is not shown.
+function confInfo(r, a) {
+  const k = a.kind.get(r);
+  if (k !== "keep" && k !== "neutral") return null;
+  // (v0.1 runs had `samples` as a count, never a list, and no `vs` / `first_metric`.)
+  const isNew = Array.isArray(r.samples) || isNum(r.vs) || isNum(r.first_metric);
+  if (!isNew) return { text: "—", cls: "" };
+  const tail = k === "neutral" ? " · neutral" : "";
+  if (isNum(r.confidence)) {
+    if (k === "neutral") return { text: fmtX(r.confidence) + tail, cls: "" }; // only has to be "not worse"
+    return r.confidence >= 2 ? { text: fmtX(r.confidence) + " confirmed", cls: "good" } : { text: fmtX(r.confidence), cls: "warn" };
+  }
+  const sm = numSamples(r), n = sm.length || (isNum(a.config.repeat) ? a.config.repeat : 0);
+  if (n < 3) return { text: "no noise estimate" + tail, cls: "" };
+  if (r.noise === 0 || (sm.length >= 3 && sm.every((v) => v === sm[0]))) return { text: "exact" + tail, cls: k === "neutral" ? "" : "good" };
+  return { text: "—", cls: "" };
+}
+
 // ---------- rendering ----------
 function render() {
-  const { config, runs, hiddenSegments } = model;
+  const segments = model.segments;
   const content = $("content");
   content.replaceChildren();
-  const segnote = $("segnote");
-  segnote.hidden = !hiddenSegments;
-  segnote.textContent = hiddenSegments ? `${hiddenSegments} earlier segment${hiddenSegments > 1 ? "s" : ""} hidden` : "";
+  const latest = segments[segments.length - 1] || null;
+  if (selectedSeg != null && !segments.some((s) => s.config.segment === selectedSeg)) selectedSeg = null;
+  const seg = selectedSeg == null ? latest : segments.find((s) => s.config.segment === selectedSeg);
+  renderSegNote(segments, seg, latest);
 
-  if (!config) {
+  if (!seg) {
     $("name").textContent = "autoresearch";
     $("metricinfo").textContent = "";
     document.title = "autoresearch";
     content.append(h("div", { class: "card empty" }, "No experiments yet"));
     return;
   }
-  const dir = config.direction === "higher" ? "higher" : "lower";
+  const a = analyze(seg), config = seg.config;
+  a.isLatest = seg === latest;
   $("name").textContent = config.name || "autoresearch";
   document.title = (config.name || "autoresearch") + " · autoresearch";
-  $("metricinfo").textContent = `${config.metric_name || "metric"}${config.metric_unit ? " (" + config.metric_unit + ")" : ""} · ${dir} is better`;
+  const info = [`${config.metric_name || "metric"}${config.metric_unit ? " (" + config.metric_unit + ")" : ""}`, `${a.dir} is better`];
+  if (isNum(config.repeat)) info.push("repeat " + config.repeat);
+  const bench = shortHash(config.measure_hash);
+  const mi = $("metricinfo");
+  mi.replaceChildren(info.join(" · "));
+  if (bench) mi.append(" · benchmark ", h("span", { class: "mono", id: "bench", title: "first 7 characters of the hash of .auto/measure.sh" }, bench));
 
-  if (!runs.length) {
+  if (!seg.runs.length) {
     content.append(h("div", { class: "card empty" }, "No experiments yet"));
     return;
   }
-  // Mirror summarize() in state.ts: baseline = first kept run (a crashed first run's placeholder
-  // metric must not become the baseline); best = best kept run (baseline counts as kept).
-  // Until a run is kept there is no baseline, best or improvement.
-  const baseRun = runs.find((r) => r.status === "keep" && isNum(r.metric)) || null;
-  const baseline = baseRun ? baseRun.metric : null;
-  let best = baseline;
-  for (const r of runs) if (r.status === "keep" && isNum(r.metric) && (best == null || better(r.metric, best, dir))) best = r.metric;
+  content.append(renderStats(a), renderChartCard(a), renderTable(a));
+  drawChart(a);
+}
 
-  content.append(renderStats(runs, baseRun, baseline, best, dir, config), renderChartCard(), renderTable(runs, baseRun, baseline, dir));
-  drawChart(runs, baseRun, dir, config);
+// "N earlier segments hidden" plus buttons to look at them. Segments are numbered by position in the log.
+function renderSegNote(segments, seg, latest) {
+  const el = $("segnote");
+  el.replaceChildren();
+  el.hidden = segments.length < 2;
+  if (el.hidden) return;
+  const n = segments.length - 1, idx = segments.indexOf(seg);
+  let text = `${n} earlier segment${n > 1 ? "s" : ""} hidden`;
+  if (seg !== latest) {
+    text = `Viewing earlier segment ${idx + 1} of ${segments.length} (not the current one)`;
+    const a = seg.config.measure_hash, b = latest.config.measure_hash;
+    if (a && b && a !== b) text += " · different benchmark, not comparable with the current segment";
+  }
+  const buttons = segments.map((s, i) => {
+    const hash = shortHash(s.config.measure_hash);
+    return h("button", {
+      type: "button", "aria-pressed": String(s === seg), "data-seg": String(i + 1),
+      onclick: () => { selectedSeg = s === latest ? null : s.config.segment; render(); },
+    }, `Segment ${i + 1}` + (s === latest ? " (current)" : ""), hash ? " · " : null, hash ? h("code", {}, hash) : null);
+  });
+  el.append(h("span", { id: "segtext" }, text), h("span", { class: "segs" }, buttons));
 }
 
 function stat(k, v, d, cls) {
-  return h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v " + (cls || "") }, v), h("div", { class: "d" }, d || " "));
+  return h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v " + (cls || "") }, v), h("div", { class: "d" }, d || " "));
 }
 
-function renderStats(runs, baseRun, baseline, best, dir, config) {
+function renderStats(a) {
+  const { runs, baseRun, curRun, dir, config, kind } = a;
   const unit = config.metric_unit ? " " + config.metric_unit : "";
-  const imp = pct(best, baseline);
-  const count = (s) => runs.filter((r) => r.status === s).length;
-  const breakdown = `${count("keep")} kept · ${count("discard")} discarded · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
-  let conf = null;
-  for (let i = runs.length - 1; i >= 0; i--) if (isNum(runs[i].confidence)) { conf = runs[i].confidence; break; }
-  let confLabel = "not enough data", confCls = "";
-  if (conf != null) {
-    if (conf >= 2) { confLabel = "likely real"; confCls = "good"; }
-    else if (conf >= 1) { confLabel = "marginal"; confCls = "warn"; }
-    else { confLabel = "within noise"; confCls = "bad"; }
+  const baseline = baseRun ? baseRun.metric : null, current = curRun ? curRun.metric : null;
+  const imp = pct(current, baseline);
+  const count = (k) => runs.filter((r) => kind.get(r) === k).length;
+  const kept = count("baseline") + count("keep") + count("neutral"), neutral = count("neutral");
+  const unconf = count("unconfirmed"), disc = count("discard") + unconf;
+  const breakdown = `${kept} kept${neutral ? ` (${neutral} neutral)` : ""} · ${disc} discarded${unconf ? ` (${unconf} not confirmed)` : ""} · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
+
+  // Last keep: that keep's own gain over the state before it, with its own confidence.
+  const last = curRun && curRun !== baseRun ? curRun : null;
+  let lastCard;
+  if (last) {
+    const g = pct(last.metric, a.prev.get(last)), c = confInfo(last, a);
+    lastCard = stat("Last keep", fmtPct(g), `run #${last.run} vs previous state · ${c ? c.text : "—"}`, last.neutral === true ? "" : pctClass(g, dir));
+  } else {
+    lastCard = stat("Last keep", "—", baseRun ? "no keep since the baseline" : "no kept run yet");
   }
   return h("div", { class: "stats" },
     stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), baseRun ? "run #" + baseRun.run : "no kept run yet"),
-    stat("Best", fmt(best) + (best != null ? unit : ""), best == null ? " " : best !== baseline ? "kept" : "baseline"),
-    stat("Improvement", fmtPct(imp), "vs baseline", pctClass(imp, dir)),
+    stat("Current", fmt(current) + (current != null ? unit : ""), !curRun ? " " : (curRun === baseRun ? "baseline" : "run #" + curRun.run) + (a.isLatest ? " · HEAD" : " · end of segment")),
+    stat("Improvement", fmtPct(imp), "current vs baseline", pctClass(imp, dir)),
     stat("Runs", String(runs.length), breakdown),
-    stat("Confidence", conf == null ? "—" : fmt(conf) + "×", confLabel, confCls),
+    lastCard,
   );
 }
 
-function renderChartCard() {
+// One marker shape per kind, shared by the chart and its legend.
+function marker(kind, cx, cy) {
+  const c = `var(${KIND_VAR[kind] || "--discard"})`, panel = "var(--panel)";
+  switch (kind) {
+    case "baseline": return svg("path", { d: `M${cx},${cy - 6}L${cx + 6},${cy}L${cx},${cy + 6}L${cx - 6},${cy}Z`, fill: c, stroke: panel, "stroke-width": 1 });
+    case "keep": return svg("circle", { cx, cy, r: 4.5, fill: c, stroke: panel, "stroke-width": 1 });
+    case "neutral": return svg("circle", { cx, cy, r: 4, fill: panel, stroke: c, "stroke-width": 2 });
+    case "unconfirmed": return svg("path", { d: `M${cx},${cy - 5}L${cx + 5},${cy + 4}L${cx - 5},${cy + 4}Z`, fill: panel, stroke: c, "stroke-width": 1.8, "stroke-linejoin": "round" });
+    case "crash": return svg("path", { d: `M${cx - 4},${cy - 4}L${cx + 4},${cy + 4}M${cx + 4},${cy - 4}L${cx - 4},${cy + 4}`, stroke: c, "stroke-width": 2.2, fill: "none" });
+    case "checks_failed": return svg("rect", { x: cx - 3.5, y: cy - 3.5, width: 7, height: 7, fill: c, stroke: panel, "stroke-width": 1 });
+    default: return svg("circle", { cx, cy, r: 3.5, fill: c, stroke: panel, "stroke-width": 1 });
+  }
+}
+
+function renderChartCard(a) {
+  const item = (kind) => {
+    const s = svg("svg", { width: 14, height: 14, viewBox: "0 0 14 14", "aria-hidden": "true" });
+    s.append(marker(kind, 7, 7));
+    return h("span", {}, s, KIND_LABEL[kind]);
+  };
+  const line = (style, label) => h("span", {}, h("span", { style: "display:inline-block;" + style }), label);
   const legend = h("div", { class: "legend" },
-    ...["keep", "discard", "crash", "checks_failed"].map((s) =>
-      h("span", {}, h("span", { class: "dot", style: `background:var(${STATUS_VAR[s]})` }), STATUS_LABEL[s])),
-    h("span", {}, h("span", { style: "display:inline-block;width:14px;border-top:2px solid var(--keep)" }), "best so far"),
-    h("span", {}, h("span", { style: "display:inline-block;width:14px;border-top:1px dashed var(--muted)" }), "baseline"));
+    ...["baseline", "keep", "neutral", "unconfirmed", "discard", "crash", "checks_failed"].map(item),
+    line("width:14px;border-top:2px solid var(--keep)", "current"),
+    line("width:14px;border-top:1px dashed var(--muted)", "baseline level"),
+    a.runs.some((r) => numSamples(r).length > 1) ? line("height:12px;border-left:2px solid var(--muted)", "sample range (min–max)") : null);
   return h("div", { class: "card" }, h("div", { id: "chart" }, h("div", { id: "tip" })), legend);
 }
 
@@ -259,34 +376,51 @@ function ticks(min, max, n) {
   return out;
 }
 
-let chartArgs = null;
-function drawChart(...args) {
-  chartArgs = args;
-  const [runs, baseRun, dir, config] = args;
+let chartArg = null;
+function drawChart(a) {
+  chartArg = a;
+  const { baseRun, dir, config, kind } = a;
+  const runs = a.runs.filter((r) => isNum(r.run));
   const baseline = baseRun ? baseRun.metric : null;
   const box = $("chart");
-  if (!box) return;
+  if (!box || !runs.length) return;
   box.querySelector("svg")?.remove();
   const W = Math.max(280, box.clientWidth - 16), H = W < 500 ? 200 : 260;
-  const m = { l: 52, r: 12, t: 10, b: 26 };
+  const m = { l: 56, r: 12, t: 10, b: 26 };
   const pw = W - m.l - m.r, ph = H - m.t - m.b;
 
-  // Crash runs often carry a placeholder metric (e.g. 0), so they don't shape the Y range; they're pinned to the bottom edge.
-  const scaled = runs.filter((r) => r.status !== "crash" && isNum(r.metric)).map((r) => r.metric);
+  // Crashes carry no usable metric (or a placeholder), and so does any run without a number
+  // (e.g. checks_failed with metric null): they sit on the bottom edge and don't shape the Y range.
+  const pinned = (r) => r.status === "crash" || !isNum(r.metric);
+  const spread = (r) => {
+    const sm = numSamples(r);
+    if (pinned(r) || sm.length < 2) return null;
+    const lo = Math.min(...sm), hi = Math.max(...sm);
+    return hi > lo ? [lo, hi] : null;
+  };
+  const scaled = runs.filter((r) => !pinned(r)).map((r) => r.metric);
   if (!scaled.length && isNum(baseline)) scaled.push(baseline);
   let lo = scaled.length ? Math.min(...scaled) : 0, hi = scaled.length ? Math.max(...scaled) : 1;
+  // Sample ranges widen the Y range, but by at most one metric span per side, so one wild
+  // sample can't flatten the whole chart; longer whiskers are cut at the plot edge.
+  const mlo = lo, mhi = hi, span = hi - lo;
+  for (const r of runs) {
+    const sp = spread(r);
+    if (sp) { lo = Math.min(lo, sp[0]); hi = Math.max(hi, sp[1]); }
+  }
+  if (span > 0) { lo = Math.max(lo, mlo - span); hi = Math.min(hi, mhi + span); }
   if (hi === lo) { const pad = Math.abs(lo) * 0.05 || 1; lo -= pad; hi += pad; }
   const padY = (hi - lo) * 0.08; lo -= padY; hi += padY;
-  const nums = runs.map((r) => r.run).filter(isNum);
+  const nums = runs.map((r) => r.run);
   let xlo = Math.min(...nums), xhi = Math.max(...nums);
   if (xhi === xlo) { xlo -= 1; xhi += 1; }
   const X = (v) => m.l + ((v - xlo) / (xhi - xlo)) * pw;
   const Y = (v) => m.t + (1 - (v - lo) / (hi - lo)) * ph;
+  const clampY = (y) => Math.min(m.t + ph, Math.max(m.t, y));
 
   const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "metric per run" });
-  const gridColor = "var(--line)";
   for (const t of ticks(lo, hi, H < 220 ? 4 : 5)) {
-    s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: gridColor }));
+    s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: "var(--line)" }));
     const tx = svg("text", { x: m.l - 6, y: Y(t) + 4, "text-anchor": "end" }); tx.textContent = fmt(t); s.append(tx);
   }
   const xt = ticks(xlo, xhi, Math.max(2, Math.floor(pw / 60))).filter((v) => Number.isInteger(v));
@@ -296,32 +430,45 @@ function drawChart(...args) {
   s.append(svg("line", { x1: m.l, x2: W - m.r, y1: m.t + ph, y2: m.t + ph, stroke: "var(--muted)", "stroke-opacity": ".4" }));
   if (isNum(baseline)) s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(baseline), y2: Y(baseline), stroke: "var(--muted)", "stroke-dasharray": "4 4" }));
 
-  // Best-so-far step line: starts at the baseline run (first kept run), only later kept runs can move it.
-  if (isNum(baseline)) {
-    let best = baseline, d = `M${X(baseRun.run)},${Y(best)}`;
+  // Step line = current: starts at the baseline and moves at EVERY later keep, also when a
+  // neutral keep is slightly worse (current is the last keep, not the best value).
+  if (baseRun && isNum(baseRun.run)) {
+    let d = `M${X(baseRun.run)},${Y(baseline)}`;
     for (const r of runs.slice(runs.indexOf(baseRun) + 1)) {
-      if (r.status === "keep" && isNum(r.metric) && better(r.metric, best, dir)) { d += `H${X(r.run)}V${Y(r.metric)}`; best = r.metric; }
+      if (r.status === "keep" && isNum(r.metric)) d += `H${X(r.run)}V${Y(r.metric)}`;
     }
     d += `H${X(runs[runs.length - 1].run)}`;
-    s.append(svg("path", { d, fill: "none", stroke: "var(--keep)", "stroke-width": 2, "stroke-opacity": ".75" }));
+    s.append(svg("path", { id: "curline", d, fill: "none", stroke: "var(--keep)", "stroke-width": 2, "stroke-opacity": ".75" }));
+  }
+
+  // Whiskers (min–max of the samples) go under the markers.
+  for (const r of runs) {
+    const sp = spread(r);
+    if (!sp) continue;
+    const cx = X(r.run), t1 = Y(sp[1]), t2 = Y(sp[0]), y1 = clampY(t1), y2 = clampY(t2);
+    const color = `var(${KIND_VAR[kind.get(r)] || "--discard"})`;
+    // An end cut at the plot edge gets no cap, so it doesn't read as the real min/max.
+    const d = `M${cx},${y1}V${y2}` + (y1 === t1 ? `M${cx - 3},${y1}h6` : "") + (y2 === t2 ? `M${cx - 3},${y2}h6` : "");
+    s.append(svg("path", { class: "whisker", d, stroke: color, "stroke-width": 1.2, "stroke-opacity": ".8", fill: "none" }));
   }
 
   const tip = $("tip");
+  const unit = config.metric_unit ? " " + config.metric_unit : "";
   for (const r of runs) {
-    const pinned = r.status === "crash" || !isNum(r.metric);
-    const cx = X(r.run), cy = pinned ? m.t + ph : Y(r.metric);
-    const color = `var(${STATUS_VAR[r.status] || "--discard"})`;
-    let dot;
-    if (r.status === "crash") {
-      dot = svg("path", { d: `M${cx - 4},${cy - 4}L${cx + 4},${cy + 4}M${cx + 4},${cy - 4}L${cx - 4},${cy + 4}`, stroke: color, "stroke-width": 2.2 });
-    } else {
-      dot = svg("circle", { cx, cy, r: r.status === "keep" ? 4.5 : 3.5, fill: color, stroke: "var(--panel)", "stroke-width": 1 });
-    }
-    const hit = svg("circle", { cx, cy, r: 9, fill: "transparent", style: "cursor:pointer" });
+    const k = kind.get(r), pin = pinned(r);
+    const cx = X(r.run), cy = pin ? m.t + ph : Y(r.metric);
+    const dot = marker(k, cx, cy);
+    dot.setAttribute("data-kind", k);
+    const hit = svg("circle", { class: "hit", cx, cy, r: 9, fill: "transparent", style: "cursor:pointer" });
     const show = () => {
-      tip.replaceChildren(
-        h("div", {}, h("b", {}, "#" + r.run), " · ", STATUS_LABEL[r.status] || String(r.status), " · ", h("b", {}, fmt(r.metric) + (config.metric_unit ? " " + config.metric_unit : ""))),
-        h("div", {}, String(r.description ?? "")));
+      const sp = spread(r), c = confInfo(r, a);
+      // filter: replaceChildren() would print a null as the text "null"
+      tip.replaceChildren(...[
+        h("div", {}, h("b", {}, "#" + r.run), " · ", KIND_LABEL[k] || k, pin ? null : " · ", pin ? null : h("b", {}, fmt(r.metric) + unit)),
+        sp ? h("div", {}, `samples ${fmt(sp[0])} – ${fmt(sp[1])} (${numSamples(r).length})`) : null,
+        c && c.text !== "—" ? h("div", {}, "confidence: " + c.text) : null,
+        h("div", {}, String(r.description ?? "")),
+        r.note ? h("div", {}, String(r.note)) : null].filter(Boolean));
       tip.style.display = "block";
       const bw = box.clientWidth, tw = tip.offsetWidth, th = tip.offsetHeight;
       let left = cx + 8 + 12; if (left + tw > bw - 4) left = cx + 8 - tw - 12;
@@ -336,20 +483,28 @@ function drawChart(...args) {
   box.append(s);
 }
 
-function renderTable(runs, baseRun, baseline, dir) {
+function renderTable(a) {
+  const { runs, baseRun, dir, kind } = a;
+  const baseline = baseRun ? baseRun.metric : null;
   const tbody = h("tbody");
   for (const r of [...runs].reverse()) {
     const key = r.segment + ":" + r.run; // run numbers restart in each segment
     const open = expanded.has(key);
-    const p = r.status === "crash" ? null : pct(r.metric, baseline);
-    const row = h("tr", { class: "row" + (open ? " open" : "") },
+    const k = kind.get(r), isKeep = k === "keep" || k === "neutral";
+    const real = r.status !== "crash" && isNum(r.metric); // crashes may carry a placeholder metric
+    const pb = real && r !== baseRun ? pct(r.metric, baseline) : null;
+    const pp = isKeep ? pct(r.metric, a.prev.get(r)) : null; // this keep vs the state before it
+    const c = confInfo(r, a);
+    const row = h("tr", { class: "row" + (open ? " open" : ""), "data-run": String(r.run) },
       h("td", { class: "num" }, h("span", { class: "tog" }, "▸"), " ", String(r.run)),
-      h("td", {}, h("span", { class: "badge s-" + r.status }, STATUS_LABEL[r.status] || String(r.status))),
-      h("td", { class: "num" }, r.status === "crash" ? "—" : fmt(r.metric)), // crashes carry a placeholder metric
-      h("td", { class: "num " + pctClass(p, dir) }, r === baseRun ? "baseline" : fmtPct(p)),
-      h("td", { class: "desc" }, String(r.description ?? "")),
+      h("td", {}, h("span", { class: "badge s-" + k }, KIND_LABEL[k] || k)),
+      h("td", { class: "num" }, real ? fmt(r.metric) : "—"),
+      h("td", { class: "num " + (isKeep ? pctClass(pb, dir) : "") }, fmtPct(pb)), // only kept runs are wins or losses
+      h("td", { class: "num " + (k === "neutral" ? "" : pctClass(pp, dir)) }, fmtPct(pp)), // a neutral keep isn't judged on gain
+      h("td", { class: "num " + (c ? c.cls : "") }, c ? c.text : "—"),
+      h("td", { class: "desc" }, String(r.description ?? ""), k === "unconfirmed" ? h("div", { class: "rownote" }, String(r.note)) : null),
       h("td", { class: "commit" }, r.commit ? String(r.commit) : "—"));
-    const detail = h("tr", { class: "detail" }, h("td", { colspan: 6 }, renderDetail(r)));
+    const detail = h("tr", { class: "detail" }, h("td", { colspan: 8 }, renderDetail(r, a)));
     detail.hidden = !open;
     row.addEventListener("click", () => {
       if (expanded.has(key)) expanded.delete(key); else expanded.add(key);
@@ -360,7 +515,10 @@ function renderTable(runs, baseRun, baseline, dir) {
   }
   const head = h("thead", {}, h("tr", {},
     h("th", { class: "num" }, "#"), h("th", {}, "Status"), h("th", { class: "num" }, "Metric"),
-    h("th", { class: "num" }, "Δ base"), h("th", {}, "Description"), h("th", {}, "Commit")));
+    h("th", { class: "num", title: "change against the baseline" }, "Δ base"),
+    h("th", { class: "num", title: "kept runs: change against the state they were compared with" }, "Δ prev"),
+    h("th", { class: "num", title: "this keep's gain ÷ measurement noise; 2× or more is confirmed" }, "Confidence"),
+    h("th", {}, "Description"), h("th", {}, "Commit")));
   return h("div", { class: "card tablewrap" }, h("table", {}, head, tbody));
 }
 
@@ -369,16 +527,31 @@ function kvList(obj, round) {
   for (const [k, v] of Object.entries(obj)) dl.append(h("dt", {}, k), h("dd", {}, valText(v, round)));
   return dl;
 }
-function renderDetail(r) {
+function renderDetail(r, a) {
   const wrap = h("div");
+  const unit = a.config.metric_unit ? " " + a.config.metric_unit : "";
   const asi = r.asi && typeof r.asi === "object" ? r.asi : null;
   const metrics = r.metrics && typeof r.metrics === "object" ? r.metrics : null;
-  if (asi && Object.keys(asi).length) wrap.append(h("div", { class: "kvh" }, "Notes"), kvList(asi));
+  if (r.note) wrap.append(h("div", { class: "kvh" }, "Note"), h("div", { class: "notetext", style: "white-space:pre-wrap;word-break:break-word" }, String(r.note)));
+  // Measurement: what the plugin measured for this run.
+  const meas = {};
+  const sm = numSamples(r);
+  if (sm.length) meas.samples = sm.map(fmt).join(", ") + unit;
+  if (isNum(r.first_metric)) {
+    meas["first measurement"] = fmt(r.first_metric) + unit;
+    // For an unconfirmed keep (logged as discard) the second measurement did not confirm anything.
+    if (isNum(r.metric)) meas[r.status === "keep" ? "confirmed value" : "re-measured value"] = fmt(r.metric) + unit;
+  }
+  const prev = a.prev.get(r);
+  if (isNum(r.vs)) meas["compared with"] = fmt(r.vs) + unit + " (current at that time)";
+  else if (r.status === "keep" && r !== a.baseRun && isNum(prev)) meas["compared with"] = fmt(prev) + unit + " (previous keep)";
+  if (isNum(r.noise)) meas.noise = fmt(r.noise);
+  const c = confInfo(r, a);
+  if (c && c.text !== "—") meas.confidence = c.text;
+  if (Object.keys(meas).length) wrap.append(h("div", { class: "kvh" }, "Measurement"), kvList(meas));
   if (metrics && Object.keys(metrics).length) wrap.append(h("div", { class: "kvh" }, "Metrics"), kvList(metrics, true));
-  const extra = [];
-  if (isNum(r.confidence)) extra.push("confidence " + fmt(r.confidence) + "×");
-  if (r.timestamp) extra.push(String(r.timestamp));
-  if (extra.length) wrap.append(h("div", { class: "kvh" }, extra.join(" · ")));
+  if (asi && Object.keys(asi).length) wrap.append(h("div", { class: "kvh" }, "Notes"), kvList(asi));
+  if (r.timestamp) wrap.append(h("div", { class: "kvh" }, String(r.timestamp)));
   if (!wrap.childNodes.length) wrap.append(h("span", { class: "sub" }, "No notes"));
   return wrap;
 }
@@ -422,7 +595,7 @@ new ResizeObserver(([e]) => {
   const w = Math.round(e.contentRect.width);
   if (w === lastWidth) return;
   lastWidth = w;
-  if (chartArgs && $("chart")) drawChart(...chartArgs);
+  if (chartArg && $("chart")) drawChart(chartArg);
 }).observe(document.querySelector("main"));
 loadLog();
 connect();

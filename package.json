@@ -1,8 +1,8 @@
 {
   "name": "opencode-autoresearch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Autonomous experiment loop for OpenCode v2 (a minimal port of pi-autoresearch)",
+  "description": "Autonomous experiment loop for OpenCode v2: measure, confirm, keep or revert, repeat",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -11,6 +11,7 @@
     "src",
     "!src/**/*.test.ts",
     "skills",
+    "docs",
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {

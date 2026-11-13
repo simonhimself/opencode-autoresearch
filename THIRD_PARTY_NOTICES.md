@@ -2,7 +2,7 @@
 
 ## pi-autoresearch
 
-This project is a port of [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch). The skills in `skills/` are adapted from it, and `skills/autoresearch-finalize/finalize.sh` is copied from it with the bug fixes listed at the top of that file. It is used under the MIT License:
+This project started from [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch). The skills in `skills/` are adapted from it, and `skills/autoresearch-finalize/finalize.sh` is derived from its script (changes are listed at the top of that file). It is used under the MIT License:
 
 ```
 MIT License

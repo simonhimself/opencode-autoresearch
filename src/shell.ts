@@ -1,17 +1,26 @@
 // Process and git helpers for the experiment tools.
 //
-// Rules learned the hard way (QA round 1):
+// Rules learned the hard way (QA rounds and the adversarial review):
 //   - git is always run with an argument list, never through a shell. Descriptions are
 //     model-written and often contain backticks or $(...), which bash would execute.
 //   - A run ends when the main process exits, not when its output pipes close. A benchmark
 //     that starts a background process would otherwise hold the pipes open and hang the run.
 //   - "Revert" means: back to HEAD, staged changes included. `git checkout -- .` only
 //     restores from the index, so a staged change survived it.
+//   - git is stopped with SIGTERM, not SIGKILL: a killed git leaves .git/index.lock behind
+//     and every later keep and discard then fails on the lock.
+//   - Output is capped while it's captured. One benchmark printed a 3 MB line and all of
+//     it reached the model.
 
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
+import { copyFile, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { isAbsolute, join } from "node:path"
 
 export interface ShellResult {
   code: number | null
+  /** stdout+stderr, at most `MAX_OUTPUT_BYTES` (the tail is kept). */
   output: string
   durationMs: number
   timedOut: boolean
@@ -21,6 +30,14 @@ export interface ShellResult {
 const DRAIN_MS = 300
 /** setTimeout's maximum; larger values overflow to 1 ms and would kill the run at once. */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1
+/** Captured output per process. The tail is kept: METRIC lines and errors come last. */
+export const MAX_OUTPUT_BYTES = 1024 * 1024
+/** Lines longer than this are cut before output is shown to the model. */
+export const MAX_LINE_CHARS = 2000
+/** git gets this long; hooks are skipped and nothing prompts, so longer means something is stuck. */
+export const GIT_TIMEOUT_MS = 120_000
+/** After SIGTERM, how long git gets to remove its lock files before SIGKILL. */
+const GIT_TERM_GRACE_MS = 5_000
 
 /** A usable timeout: invalid, zero or negative values fall back, huge values are capped. */
 export function clampTimeout(ms: number, fallbackMs: number): number {
@@ -28,46 +45,100 @@ export function clampTimeout(ms: number, fallbackMs: number): number {
   return Math.min(Math.max(ms, 1_000), MAX_TIMEOUT_MS)
 }
 
+/** The last `maxLines` lines, each cut to `MAX_LINE_CHARS`, so a tool result stays small. */
+export function tailLines(text: string, maxLines: number): string {
+  return text
+    .trimEnd()
+    .split("\n")
+    .slice(-maxLines)
+    .map((line) =>
+      line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)} … (line cut, ${line.length} characters)` : line,
+    )
+    .join("\n")
+}
+
+export interface RunOptions {
+  cwd: string
+  timeoutMs: number
+  signal?: AbortSignal
+  input?: string
+  /** Extra environment variables. */
+  env?: Record<string, string>
+  /**
+   * On timeout send SIGTERM first and SIGKILL this many ms later. Without it the process
+   * group is killed at once (right for benchmarks, wrong for git; see the header).
+   */
+  termGraceMs?: number
+}
+
 /**
  * Run a program with arguments (no shell), merging stdout+stderr.
  * The process gets its own process group; on timeout, abort, or normal exit, the whole
  * group is killed, so stray background children don't outlive the run.
  */
-export function run(
-  file: string,
-  args: string[],
-  opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; input?: string },
-): Promise<ShellResult> {
+export function run(file: string, args: string[], opts: RunOptions): Promise<ShellResult> {
   return new Promise((resolve) => {
     const started = performance.now()
-    const child = spawn(file, args, { cwd: opts.cwd, detached: true, env: process.env })
-    let output = ""
+    const child = spawn(file, args, { cwd: opts.cwd, detached: true, env: { ...process.env, ...opts.env } })
+    // Output is kept as chunks and trimmed from the front once it passes twice the cap,
+    // so memory stays bounded however much the command prints.
+    let chunks: Buffer[] = []
+    let held = 0
+    let dropped = 0
+    const capture = (chunk: Buffer | string) => {
+      const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk
+      chunks.push(buf)
+      held += buf.length
+      if (held > MAX_OUTPUT_BYTES * 2) {
+        const all = Buffer.concat(chunks)
+        const kept = all.subarray(all.length - MAX_OUTPUT_BYTES)
+        dropped += all.length - kept.length
+        chunks = [kept]
+        held = kept.length
+      }
+    }
+    const collect = () => {
+      let all = Buffer.concat(chunks)
+      if (all.length > MAX_OUTPUT_BYTES) {
+        dropped += all.length - MAX_OUTPUT_BYTES
+        all = all.subarray(all.length - MAX_OUTPUT_BYTES)
+      }
+      return (dropped ? `[… ${dropped} bytes of earlier output dropped …]\n` : "") + all.toString("utf8")
+    }
+
     let timedOut = false
     let settled = false
-    child.stdout.on("data", (d) => (output += d))
-    child.stderr.on("data", (d) => (output += d))
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+    child.stdout.on("data", capture)
+    child.stderr.on("data", capture)
+    // A command that doesn't read stdin closes the pipe; that must not crash the plugin.
+    child.stdin.on("error", () => {})
     if (opts.input !== undefined) child.stdin.end(opts.input)
     else child.stdin.end()
 
-    const killGroup = () => {
+    const signalGroup = (signal: NodeJS.Signals) => {
       try {
-        process.kill(-child.pid!, "SIGKILL")
+        process.kill(-child.pid!, signal)
       } catch {}
     }
+    const killGroup = () => signalGroup("SIGKILL")
     const finish = (code: number | null) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearTimeout(graceTimer)
       opts.signal?.removeEventListener("abort", killGroup)
       child.stdout.destroy()
       child.stderr.destroy()
-      resolve({ code, output, durationMs: performance.now() - started, timedOut })
+      resolve({ code, output: collect(), durationMs: performance.now() - started, timedOut })
     }
 
     const timer = setTimeout(
       () => {
         timedOut = true
-        killGroup()
+        if (opts.termGraceMs === undefined) return killGroup()
+        signalGroup("SIGTERM")
+        graceTimer = setTimeout(killGroup, opts.termGraceMs)
       },
       clampTimeout(opts.timeoutMs, 60_000),
     )
@@ -85,18 +156,43 @@ export function run(
       })
     })
     child.on("error", (err) => {
-      output += String(err)
+      capture(String(err))
       finish(-1)
     })
   })
 }
 
-/** Run a user-supplied command line through bash (the benchmark command). */
+/** Run a command line through bash (the benchmark and the checks). */
 export const bash = (command: string, cwd: string, timeoutMs: number, signal?: AbortSignal) =>
   run("bash", ["-c", command], { cwd, timeoutMs, signal })
 
-export const git = (args: string[], cwd: string, input?: string) =>
-  run("git", args, { cwd, timeoutMs: 60_000, input })
+export interface GitOptions {
+  input?: string
+  env?: Record<string, string>
+  /** For tests; the default is GIT_TIMEOUT_MS. */
+  timeoutMs?: number
+}
+
+/**
+ * Run git with an argument list. On timeout it gets SIGTERM (so it removes its lock
+ * files), SIGKILL only if it ignores that, and the output says "timed out".
+ * GIT_TERMINAL_PROMPT=0: nobody is there to answer a credentials prompt.
+ */
+export async function git(args: string[], cwd: string, options: GitOptions = {}): Promise<ShellResult> {
+  const timeoutMs = options.timeoutMs ?? GIT_TIMEOUT_MS
+  const res = await run("git", args, {
+    cwd,
+    timeoutMs,
+    input: options.input,
+    env: { GIT_TERMINAL_PROMPT: "0", ...options.env },
+    termGraceMs: GIT_TERM_GRACE_MS,
+  })
+  if (res.timedOut) {
+    const what = args.find((a) => !a.startsWith("-") && !a.includes("=")) ?? "command"
+    res.output = `${res.output.trimEnd()}\ngit ${what} timed out after ${Math.round(timeoutMs / 1000)} s and was stopped.`.trim()
+  }
+  return res
+}
 
 /**
  * Everything in the session folder except session state: any `.auto` folder at any depth
@@ -105,8 +201,163 @@ export const git = (args: string[], cwd: string, input?: string) =>
  */
 export const SCOPE = ["--", ".", ":(exclude,glob)**/.auto/**", ":(exclude,glob)**/.auto"]
 
+// The git commands that change the repo, as argument lists. They're exported so the
+// permission check can show the user exactly what will run.
+export const GIT_ADD = ["add", "-A", ...SCOPE]
+/**
+ * Experiment commits skip hooks and signing: a hook that runs lint or tests, or a signing
+ * prompt with no terminal, hangs or fails an unattended loop. The user's hooks still apply
+ * to whatever they merge later.
+ * `--no-verify` only skips pre-commit and commit-msg; prepare-commit-msg and post-commit
+ * would still run (and a hanging post-commit fails the call after HEAD has moved), so the
+ * hooks folder is pointed at nothing as well.
+ */
+export const GIT_COMMIT = [
+  "-c",
+  "commit.gpgsign=false",
+  "-c",
+  "core.hooksPath=/dev/null",
+  "commit",
+  "--no-verify",
+  "-q",
+  "-F",
+  "-",
+  ...SCOPE,
+]
+export const GIT_RESTORE = ["restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE]
+export const GIT_CLEAN = ["clean", "-fd", ...SCOPE]
+
+/** A git argument list as the command line a person would type (for permission prompts). */
+export const gitCommandLine = (args: string[]) =>
+  ["git", ...args.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a}'`))].join(" ")
+
+// ── Read-only questions about the repo ────────────────────
+
+/** Full sha of HEAD, or null when the repo has no commits (or this isn't a repo). */
+export async function headSha(cwd: string): Promise<string | null> {
+  const res = await git(["rev-parse", "--verify", "-q", "HEAD"], cwd)
+  return res.code === 0 ? res.output.trim() : null
+}
+
+/** The checked-out branch, or null on a detached HEAD. */
+export async function currentBranch(cwd: string): Promise<string | null> {
+  const res = await git(["symbolic-ref", "-q", "--short", "HEAD"], cwd)
+  return res.code === 0 && res.output.trim() ? res.output.trim() : null
+}
+
+/**
+ * Is this branch the project's trunk? `main`, `master`, or whatever origin/HEAD points
+ * at. Experiments commit and revert freely, which must never happen there.
+ */
+export async function isTrunk(cwd: string, branch: string): Promise<boolean> {
+  if (branch === "main" || branch === "master") return true
+  const res = await git(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], cwd)
+  return res.code === 0 && res.output.trim().replace(/^origin\//, "") === branch
+}
+
+/**
+ * `git status --short` for the scope: "" when the scope has no uncommitted changes and
+ * no untracked files. Untracked files are listed one by one, so the `.auto` exclude works
+ * on them and the user sees exactly which files are in the way.
+ */
+export async function scopeStatus(cwd: string): Promise<{ ok: true; status: string } | { ok: false; error: string }> {
+  const res = await git(["status", "--short", "--untracked-files=all", ...SCOPE], cwd)
+  if (res.code !== 0) return { ok: false, error: res.output.trim() }
+  return { ok: true, status: res.output.trimEnd() }
+}
+
+/**
+ * Does git track anything in the scope? If not, the folder is an untracked project inside
+ * a bigger repo, and reverting an experiment (`git clean`) would delete all of it.
+ */
+export async function scopeHasTrackedFiles(cwd: string): Promise<boolean> {
+  const res = await git(["ls-files", ...SCOPE], cwd)
+  return res.code === 0 && res.output.trim() !== ""
+}
+
+/** The tree of the HEAD commit (whole repo). Equal to scopeTreeHash() exactly when the scope has no diff to HEAD. */
+export async function headTree(cwd: string): Promise<string | null> {
+  const res = await git(["rev-parse", "--verify", "-q", "HEAD^{tree}"], cwd)
+  return res.code === 0 ? res.output.trim() : null
+}
+
+/**
+ * The tree a keep would commit right now: HEAD with the scope replaced by what's in the
+ * working tree (untracked files included, ignored files and `.auto` not).
+ *
+ * This is the fingerprint that ties a measurement to code. It's computed in a temporary
+ * index, so the user's real index is never touched. The temporary index starts as a copy
+ * of the real one reset to HEAD: that keeps git's file-stat cache, so unchanged files
+ * aren't re-read (matters in big repos); anything staged is dropped from the copy, so the
+ * result doesn't depend on what happens to be staged.
+ */
+export async function scopeTreeHash(cwd: string): Promise<{ ok: true; tree: string } | { ok: false; error: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "autoresearch-index-"))
+  const env = { GIT_INDEX_FILE: join(dir, "index") }
+  try {
+    let seeded = false
+    const real = await git(["rev-parse", "--git-path", "index"], cwd)
+    if (real.code === 0) {
+      const path = real.output.trim()
+      const copied = await copyIndex(isAbsolute(path) ? path : join(cwd, path), env.GIT_INDEX_FILE)
+      // -m keeps stat data for entries that match HEAD. It fails on an index with
+      // conflicts; then start from an empty one below.
+      if (copied) seeded = (await git(["read-tree", "-m", "HEAD"], cwd, { env })).code === 0
+    }
+    if (!seeded) {
+      await rm(env.GIT_INDEX_FILE, { force: true })
+      const read = await git(["read-tree", "HEAD"], cwd, { env })
+      if (read.code !== 0) return { ok: false, error: `git read-tree failed: ${read.output.trim()}` }
+    }
+    const add = await git(GIT_ADD, cwd, { env })
+    if (add.code !== 0) return { ok: false, error: `git add (temporary index) failed: ${add.output.trim()}` }
+    const tree = await git(["write-tree"], cwd, { env })
+    if (tree.code !== 0) return { ok: false, error: `git write-tree failed: ${tree.output.trim()}` }
+    return { ok: true, tree: tree.output.trim() }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Copy an index file and give the copy an OLDER timestamp than the original.
+ *
+ * git decides "this file is unchanged" from cached size and mtime, and protects itself
+ * against edits made in the same second as the index was written by re-reading every file
+ * that is as new as the index file. A plain copy has a newer timestamp, which switches
+ * that protection off: a same-size edit right after a commit then hashed as unchanged
+ * (seen in testing). An older timestamp only makes git re-read a few more files.
+ */
+async function copyIndex(from: string, to: string): Promise<boolean> {
+  try {
+    const { atime, mtime } = await stat(from)
+    await copyFile(from, to)
+    await utimes(to, atime, new Date(mtime.getTime() - 2_000))
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Files that differ between two trees (for "the benchmark changed these files"). */
+export async function changedBetween(cwd: string, treeA: string, treeB: string): Promise<string[]> {
+  const res = await git(["diff", "--name-only", treeA, treeB], cwd)
+  return res.code === 0 ? res.output.split("\n").filter(Boolean) : []
+}
+
+/** sha256 of a file's content, or null when it doesn't exist. Used to freeze the benchmark per segment. */
+export async function fileHash(path: string): Promise<string | null> {
+  try {
+    return createHash("sha256").update(await readFile(path)).digest("hex")
+  } catch {
+    return null
+  }
+}
+
+// ── Commands that change the repo ─────────────────────────
+
 export type KeepResult =
-  | { ok: true; commit: string | null } // null = nothing to commit (no code change)
+  | { ok: true; commit: string | null; sha: string | null } // null = nothing to commit (no code change)
   | { ok: false; error: string }
 
 /**
@@ -116,20 +367,20 @@ export type KeepResult =
  * a later discard can revert them.
  */
 export async function commitKeep(cwd: string, message: string): Promise<KeepResult> {
-  const add = await git(["add", "-A", ...SCOPE], cwd)
+  const add = await git(GIT_ADD, cwd)
   if (add.code !== 0) return { ok: false, error: `git add failed:\n${add.output.trim()}` }
 
   const staged = await git(["diff", "--cached", "--quiet", ...SCOPE], cwd)
-  if (staged.code === 0) return { ok: true, commit: null }
+  if (staged.code === 0) return { ok: true, commit: null, sha: null }
 
   // Commit only this scope: anything staged elsewhere (other folders, .auto/) stays out.
-  const commit = await git(["commit", "-q", "-F", "-", ...SCOPE], cwd, message)
+  const commit = await git(GIT_COMMIT, cwd, { input: message })
   if (commit.code !== 0) {
     await git(["reset", "-q", ...SCOPE], cwd)
     return { ok: false, error: `git commit failed:\n${commit.output.trim()}` }
   }
-  const head = await git(["rev-parse", "--short", "HEAD"], cwd)
-  return { ok: true, commit: head.output.trim() }
+  const sha = await headSha(cwd)
+  return { ok: true, commit: sha?.slice(0, 7) ?? null, sha }
 }
 
 /**
@@ -137,20 +388,21 @@ export async function commitKeep(cwd: string, message: string): Promise<KeepResu
  * newly added files, and untracked files and folders. `.auto/` and gitignored files stay.
  */
 export async function revertToHead(cwd: string): Promise<{ ok: boolean; output: string }> {
-  const head = await git(["rev-parse", "--verify", "-q", "HEAD"], cwd)
-  if (head.code !== 0) {
+  if ((await headSha(cwd)) === null) {
     return { ok: false, output: "This repository has no commits yet. Make an initial commit, then try again." }
   }
-  // `git restore` fails with "pathspec did not match" when the folder has no tracked files yet.
-  const tracked = await git(["ls-files", ...SCOPE], cwd)
-  if (!tracked.output.trim()) {
-    const clean = await git(["clean", "-fd", ...SCOPE], cwd)
-    return { ok: clean.code === 0, output: clean.output.trim() }
+  // Nothing tracked here means the whole folder is untracked: `git clean` would delete the
+  // project. (It did, once.) autoresearch_init refuses such a folder; this is the backstop.
+  if (!(await scopeHasTrackedFiles(cwd))) {
+    return {
+      ok: false,
+      output: "git tracks no files in this folder, so reverting would delete everything in it. Commit the project first.",
+    }
   }
-  const restore = await git(["restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE], cwd)
+  const restore = await git(GIT_RESTORE, cwd)
   // If restoring failed, stop: deleting untracked files on top of a half-done revert would
   // lose work while the tool reports that nothing was logged.
   if (restore.code !== 0) return { ok: false, output: restore.output.trim() }
-  const clean = await git(["clean", "-fd", ...SCOPE], cwd)
+  const clean = await git(GIT_CLEAN, cwd)
   return { ok: clean.code === 0, output: [restore.output, clean.output].join("\n").trim() }
 }

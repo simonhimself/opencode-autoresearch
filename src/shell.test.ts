@@ -104,7 +104,76 @@ describe("revertToHead", () => {
   })
 })
 
+describe("QA round 3: scope edge cases", () => {
+  test("keep works when .auto is gitignored", async () => {
+    const dir = repo()
+    writeFileSync(join(dir, ".gitignore"), "ignored.txt\n.auto/\n")
+    g(dir, "commit", "-qam", "ignore .auto")
+    writeFileSync(join(dir, "code.txt"), "v2\n")
+    const res = await commitKeep(dir, "m")
+    expect(res.ok).toBe(true)
+    expect(revertToHead(dir)).resolves.toMatchObject({ ok: true })
+  })
+
+  test("a discard at the repo root leaves other packages' .auto folders alone", async () => {
+    const dir = repo()
+    mkdirSync(join(dir, "packages", "app", ".auto"), { recursive: true })
+    writeFileSync(join(dir, "packages", "app", ".auto", "prompt.md"), "app rules\n")
+    g(dir, "add", "-A")
+    g(dir, "commit", "-qm", "app session")
+    writeFileSync(join(dir, "packages", "app", ".auto", "prompt.md"), "app rules, edited\n")
+    writeFileSync(join(dir, "packages", "app", ".auto", "log.jsonl"), "{}\n")
+    writeFileSync(join(dir, "code.txt"), "v2\n")
+    expect((await revertToHead(dir)).ok).toBe(true)
+    expect(readFileSync(join(dir, "code.txt"), "utf8")).toBe("v1\n")
+    expect(readFileSync(join(dir, "packages", "app", ".auto", "prompt.md"), "utf8")).toBe("app rules, edited\n")
+    expect(existsSync(join(dir, "packages", "app", ".auto", "log.jsonl"))).toBe(true)
+  })
+
+  test("keep in a subfolder doesn't commit files staged elsewhere", async () => {
+    const dir = repo()
+    mkdirSync(join(dir, "pkg"))
+    writeFileSync(join(dir, "pkg", "p.js"), "1\n")
+    g(dir, "add", "-A")
+    g(dir, "commit", "-qm", "pkg")
+    writeFileSync(join(dir, "code.txt"), "staged at root\n")
+    g(dir, "add", "code.txt")
+    writeFileSync(join(dir, "pkg", "p.js"), "2\n")
+    const res = await commitKeep(join(dir, "pkg"), "m")
+    expect(res.ok).toBe(true)
+    expect(g(dir, "show", "--name-only", "--format=", "HEAD").trim()).toBe("pkg/p.js")
+    expect(g(dir, "diff", "--cached", "--name-only").trim()).toBe("code.txt")
+  })
+
+  test("discard in a folder with no tracked files yet", async () => {
+    const dir = repo()
+    mkdirSync(join(dir, "fresh"))
+    writeFileSync(join(dir, "fresh", "new.txt"), "n\n")
+    expect((await revertToHead(join(dir, "fresh"))).ok).toBe(true)
+    expect(existsSync(join(dir, "fresh", "new.txt"))).toBe(false)
+  })
+
+  test("discard in a repo with no commits gives a clear error", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ar-empty-"))
+    g(dir, "init", "-q", "-b", "main")
+    writeFileSync(join(dir, "a.txt"), "a\n")
+    const res = await revertToHead(dir)
+    expect(res.ok).toBe(false)
+    expect(res.output).toContain("no commits yet")
+    expect(existsSync(join(dir, "a.txt"))).toBe(true)
+  })
+})
+
 describe("bash runner", () => {
+  test("a huge or invalid timeout doesn't kill the run at once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ar-run-"))
+    for (const t of [3_000_000_000_000, -5, Number.NaN]) {
+      const res = await bash("echo METRIC x=1", dir, t)
+      expect(res.timedOut).toBe(false)
+      expect(res.output).toContain("METRIC x=1")
+    }
+  })
+
   test("returns as soon as the command exits, even if a background child holds the output open", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ar-run-"))
     const res = await bash("sleep 30 & echo METRIC x=1", dir, 10_000)

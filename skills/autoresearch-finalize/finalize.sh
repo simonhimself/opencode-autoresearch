@@ -1,5 +1,4 @@
-
-" "$groups_file" "$DATA_DIR" || fail "Failed to parse#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Adapted from pi-autoresearch (MIT, (c) 2026 Tobi Lutke, David Cortés):
@@ -15,6 +14,15 @@ set -euo pipefail
 #     in the stash until the user ran `git stash pop`); restore is guarded so the stash is
 #     never popped onto the wrong branch
 #   - the ideas backlog is captured before stashing, so the summary always shows it
+#   - deleted and renamed files are handled: group files are listed with --no-renames, and a
+#     file missing from a group's last commit is `git rm`ed instead of checked out
+#   - session files are only `.auto/` (any depth) and pi's legacy flat files at the session
+#     root, so user files such as `lib/autoresearch.utils.js` are no longer dropped
+#   - works from any folder inside the repo (e.g. a monorepo package): the session dir is
+#     found by walking up to the nearest `.auto/`, then all git work runs from the toplevel
+#   - every branch name is validated with `git check-ref-format` in preflight
+#   - the printed cleanup commands run in a working order (remove session files, switch to
+#     trunk, then delete the experiment branch)
 
 # autoresearch-finalize — creates independent branches from an autoresearch session
 #
@@ -51,18 +59,63 @@ GROUP_COUNT=""
 STASHED=false
 CREATED_BRANCHES=()
 declare -a GROUP_BRANCH
+# Session dir (absolute) and its path relative to the repo toplevel ("" or "pkg/app/").
+SESSION_DIR=""
+SESSION_PREFIX=""
+REPO_ROOT=""
+LEGACY_FILES="autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md autoresearch.checks.sh autoresearch.config.json"
 
+quote_arg() { printf '%q' "$1"; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
 info() { echo -e "${GREEN}$1${NC}"; }
 cleanup_data() { if [ -d "${DATA_DIR:-}" ]; then rm -rf "$DATA_DIR"; fi; }
 fail() { cleanup_data; echo -e "${RED}ERROR: $1${NC}" >&2; exit 1; }
 
+# Takes a repo-root-relative path. Session files are anything under a `.auto`
+# path component (any depth, so a session in a monorepo package is covered) and
+# pi's legacy flat files, but only at the session root. Nothing else: a user
+# file like `lib/autoresearch.utils.js` is real code and must be kept.
 is_session_file() {
   case "/$1/" in
     */.auto/*) return 0;;
-    */autoresearch.*/*) return 0;;
-    *) return 1;;
   esac
+  local legacy
+  for legacy in $LEGACY_FILES; do
+    [ "$1" = "${SESSION_PREFIX}${legacy}" ] && return 0
+  done
+  return 1
+}
+
+# Bring one repo-root-relative path to its state in <commit>: check it out if it
+# exists there, otherwise remove it (the group deleted or renamed it away).
+# :(literal) stops git from treating names with * or ? as globs.
+apply_file() {
+  local commit="$1" path="$2"
+  if git cat-file -e "${commit}:${path}" 2>/dev/null; then
+    git checkout "$commit" -- ":(literal)$path"
+  else
+    git rm -q --ignore-unmatch -- ":(literal)$path"
+  fi
+}
+
+# Find the session dir: the nearest folder from the cwd up to the repo toplevel
+# that holds `.auto/` (or legacy `autoresearch.jsonl`); the cwd if none does.
+locate_session() {
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "Not inside a git repository."
+  REPO_ROOT=$(cd "$REPO_ROOT" && pwd -P)
+  local dir
+  dir=$(pwd -P)
+  SESSION_DIR="$dir"
+  while :; do
+    if [ -d "$dir/.auto" ] || [ -f "$dir/autoresearch.jsonl" ]; then
+      SESSION_DIR="$dir"
+      break
+    fi
+    [ "$dir" = "$REPO_ROOT" ] && break
+    case "$dir" in "$REPO_ROOT"/*) ;; *) break;; esac
+    dir=$(dirname "$dir")
+  done
+  SESSION_PREFIX=$(cd "$SESSION_DIR" && git rev-parse --show-prefix)
 }
 
 # ---------------------------------------------------------------------------
@@ -98,6 +151,7 @@ config.groups.forEach((group, idx) => {
   FINAL_TREE=$(cat "$DATA_DIR/final_tree")
   GOAL=$(cat "$DATA_DIR/goal")
   GROUP_COUNT=$(cat "$DATA_DIR/count")
+  [ "$GROUP_COUNT" -gt 0 ] || fail "$groups_file has no groups."
 }
 
 # ---------------------------------------------------------------------------
@@ -130,7 +184,8 @@ collect_group_files() {
   while IFS= read -r -d '' changed_file; do
     [ -n "$changed_file" ] || continue
     is_session_file "$changed_file" || echo "$changed_file" >> "$DATA_DIR/$group_index.files"
-  done < <(git diff --name-only -z "$prev_commit" "$last_commit")
+  # --no-renames: a rename must list the old path too, so it gets removed.
+  done < <(git diff --name-only --no-renames -z "$prev_commit" "$last_commit")
 }
 
 assert_no_overlapping_files() {
@@ -143,6 +198,11 @@ assert_no_overlapping_files() {
       fail "File '$candidate' appears in multiple groups. Merge the overlapping groups and retry."
     fi
   done < "$new_files_path"
+}
+
+assert_valid_branch_name() {
+  git check-ref-format --branch "$1" >/dev/null 2>&1 \
+    || fail "'$1' is not a valid branch name. Use a goal and slugs without spaces, '..', '~', '^', ':' and the like."
 }
 
 assert_branch_available() {
@@ -159,6 +219,13 @@ preflight() {
 
   assert_on_feature_branch
   assert_commits_exist
+
+  # Validate every name we'll create before touching anything (nothing stashed yet).
+  local j
+  for j in $(seq 0 $((GROUP_COUNT - 1))); do
+    assert_valid_branch_name "autoresearch/${GOAL}/$(printf "%02d" $((j + 1)))-$(cat "$DATA_DIR/$j.slug")"
+  done
+  assert_valid_branch_name "autoresearch/${GOAL}/verify-tmp"
 
   local prev_commit="$BASE"
   local all_seen_path="$DATA_DIR/all_seen_files"
@@ -255,14 +322,14 @@ on_exit_restore() {
 # Copy the ideas backlog now, before stashing hides it, so the summary can show it.
 capture_ideas() {
   local ideas_file=""
-  if [ -f ".auto/ideas.md" ]; then
+  if [ -f "$SESSION_DIR/.auto/ideas.md" ]; then
     ideas_file=".auto/ideas.md"
-  elif [ -f "autoresearch.ideas.md" ]; then
+  elif [ -f "$SESSION_DIR/autoresearch.ideas.md" ]; then
     ideas_file="autoresearch.ideas.md"
   fi
   if [ -n "$ideas_file" ]; then
-    cp "$ideas_file" "$DATA_DIR/ideas" 2>/dev/null || true
-    echo "$ideas_file" > "$DATA_DIR/ideas_name"
+    cp "$SESSION_DIR/$ideas_file" "$DATA_DIR/ideas" 2>/dev/null || true
+    echo "${SESSION_PREFIX}${ideas_file}" > "$DATA_DIR/ideas_name"
   fi
 }
 
@@ -314,7 +381,7 @@ create_group_branch() {
 
   while IFS= read -r changed_file; do
     [ -n "$changed_file" ] || continue
-    git checkout "$last_commit" -- "$changed_file"
+    apply_file "$last_commit" "$changed_file"
   done < "$files_path"
   git commit -m "$title" -m "$body"
 
@@ -330,7 +397,6 @@ create_branches() {
   echo ""
 
   trap rollback_on_failure EXIT
-  capture_ideas
   stash_if_dirty
 
   for i in $(seq 0 $((GROUP_COUNT - 1))); do
@@ -361,17 +427,18 @@ verify_union_matches_original() {
     last_commit=$(cat "$DATA_DIR/$i.last_commit")
     while IFS= read -r changed_file; do
       [ -n "$changed_file" ] || continue
-      git checkout "$last_commit" -- "$changed_file"
+      apply_file "$last_commit" "$changed_file"
     done < "$DATA_DIR/$i.files"
   done
   # --allow-empty: when all groups cover all files, the checkout leaves
   # nothing staged — the diff against FINAL_TREE is what matters, not this commit.
   git commit --allow-empty -m "verify: union of all groups" --quiet
 
-  local non_session_diff=""
-  for changed_file in $(git diff --name-only HEAD "$FINAL_TREE" 2>/dev/null); do
+  local non_session_diff="" changed_file
+  while IFS= read -r -d '' changed_file; do
+    [ -n "$changed_file" ] || continue
     is_session_file "$changed_file" || non_session_diff="$non_session_diff $changed_file"
-  done
+  done < <(git diff --name-only --no-renames -z HEAD "$FINAL_TREE" 2>/dev/null)
 
   git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
   git branch -D "$verify_branch" 2>/dev/null || true
@@ -389,12 +456,14 @@ verify_union_matches_original() {
 verify_no_session_artifacts() {
   local clean=true
   for branch in ${CREATED_BRANCHES[@]+"${CREATED_BRANCHES[@]}"}; do
-    for changed_file in $(git diff-tree --no-commit-id --name-only -r "$(git rev-parse "$branch")" 2>/dev/null); do
+    local changed_file
+    while IFS= read -r -d '' changed_file; do
+      [ -n "$changed_file" ] || continue
       if is_session_file "$changed_file"; then
         echo -e "${RED}✗ Session artifact '$changed_file' in branch $branch!${NC}"
         clean=false
       fi
-    done
+    done < <(git diff-tree --no-commit-id --name-only --no-renames -z -r "$(git rev-parse "$branch")" 2>/dev/null)
   done
 
   if [ "$clean" = true ]; then
@@ -483,12 +552,27 @@ print_summary() {
     echo "$body" | sed 's/^/     /'
   done
 
+  # Order matters: the session files go first (tracked, modified .auto/ files
+  # would block the checkout), then leave the experiment branch (git won't
+  # delete the branch you're on), then delete it.
+  local cleanup="" legacy legacy_present=""
+  if [ -e "$SESSION_DIR/.auto" ]; then
+    cleanup="rm -r .auto && "
+  fi
+  for legacy in $LEGACY_FILES; do
+    if [ -e "$SESSION_DIR/$legacy" ]; then legacy_present="$legacy_present $legacy"; fi
+  done
+  if [ -n "$legacy_present" ]; then
+    cleanup="${cleanup}rm -f${legacy_present} && "
+  fi
+  cleanup="${cleanup}git checkout $(quote_arg "$TRUNK") && git branch -D $(quote_arg "$ORIG_BRANCH")"
+
   echo ""
-  echo "Cleanup — after merging, delete the autoresearch branch and session files:"
+  echo "Cleanup — after merging, delete the session files and the autoresearch branch"
+  echo "(this discards the experiment log and ideas, so copy anything you want to keep first):"
   echo ""
-  echo "  git branch -D $ORIG_BRANCH"
-  echo "  rm -r .auto    # session folder (current layout)"
-  echo "  rm -f autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md    # legacy flat files, if any"
+  echo "  cd $(quote_arg "$SESSION_DIR")"
+  echo "  $cleanup"
 
   # Read from the copy taken before stashing, not the working tree.
   if [ -f "$DATA_DIR/ideas" ]; then
@@ -511,7 +595,13 @@ main() {
     exit 1
   fi
 
+  # Parse first (the groups.json path may be relative to the cwd), find the
+  # session dir and grab the ideas from it, then do all git work from the
+  # toplevel: `git diff --name-only` paths are relative to it, not to the cwd.
   parse_groups "$1"
+  locate_session
+  capture_ideas
+  cd "$REPO_ROOT" || fail "Cannot cd to repo root $REPO_ROOT."
   preflight
   create_branches
   verify_branches

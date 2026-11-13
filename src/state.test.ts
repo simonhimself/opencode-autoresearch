@@ -19,18 +19,20 @@ describe("summarize", () => {
 })
 
 describe("computeConfidence", () => {
-  test("big gain over a quiet benchmark is confident", () => {
-    const c = computeConfidence([100, 101, 99, 100, 80], 100, 80)
-    expect(c).not.toBeNull()
-    expect(c!).toBeGreaterThanOrEqual(2)
+  const withNoise = (...n: (number | null | undefined)[]) => n.map((noise) => ({ noise }))
+
+  test("a gain far above the measured noise is confident", () => {
+    expect(computeConfidence(withNoise(1, 1.2, 0.8), 100, 80)).toBeCloseTo(20)
   })
-  test("gain inside the noise is not", () => {
-    const c = computeConfidence([100, 120, 85, 110, 95], 100, 95)
-    expect(c).not.toBeNull()
-    expect(c!).toBeLessThan(1)
+  test("a gain inside the noise is not", () => {
+    expect(computeConfidence(withNoise(10, 12, 9), 100, 95)!).toBeLessThan(1)
   })
-  test("too little data or no improvement → null", () => {
-    expect(computeConfidence([100, 90], 100, 90)).toBeNull()
-    expect(computeConfidence([100, 100, 100], 100, 100)).toBeNull()
+  test("two tiny gains are NOT 'likely real' just because they're steps (the old bug)", () => {
+    // values 1000000 → 1000001 → 1000002 used to score 2.0×; with real noise of 45 it's tiny
+    expect(computeConfidence(withNoise(45, 45), 1000000, 1000002)!).toBeLessThan(0.1)
+  })
+  test("no noise measured, or no improvement → null", () => {
+    expect(computeConfidence(withNoise(null, undefined, 0), 100, 80)).toBeNull()
+    expect(computeConfidence(withNoise(1, 1), 100, 100)).toBeNull()
   })
 })

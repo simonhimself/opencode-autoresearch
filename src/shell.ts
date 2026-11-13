@@ -19,6 +19,14 @@ export interface ShellResult {
 
 /** How long to wait for remaining output after the main process exits. */
 const DRAIN_MS = 300
+/** setTimeout's maximum; larger values overflow to 1 ms and would kill the run at once. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1
+
+/** A usable timeout: invalid, zero or negative values fall back, huge values are capped. */
+export function clampTimeout(ms: number, fallbackMs: number): number {
+  if (!Number.isFinite(ms) || ms <= 0) return fallbackMs
+  return Math.min(Math.max(ms, 1_000), MAX_TIMEOUT_MS)
+}
 
 /**
  * Run a program with arguments (no shell), merging stdout+stderr.
@@ -56,10 +64,13 @@ export function run(
       resolve({ code, output, durationMs: performance.now() - started, timedOut })
     }
 
-    const timer = setTimeout(() => {
-      timedOut = true
-      killGroup()
-    }, opts.timeoutMs)
+    const timer = setTimeout(
+      () => {
+        timedOut = true
+        killGroup()
+      },
+      clampTimeout(opts.timeoutMs, 60_000),
+    )
     opts.signal?.addEventListener("abort", killGroup, { once: true })
 
     child.on("exit", (code) => {
@@ -87,8 +98,12 @@ export const bash = (command: string, cwd: string, timeoutMs: number, signal?: A
 export const git = (args: string[], cwd: string, input?: string) =>
   run("git", args, { cwd, timeoutMs: 60_000, input })
 
-/** Everything in the session folder except the plugin's own state. */
-const SCOPE = ["--", ".", ":(exclude).auto"]
+/**
+ * Everything in the session folder except session state: any `.auto` folder at any depth
+ * (in a monorepo, other packages have their own). Glob excludes also work when `.auto` is
+ * gitignored; a plain `:(exclude).auto` makes `git add` fail on an ignored path.
+ */
+export const SCOPE = ["--", ".", ":(exclude,glob)**/.auto/**", ":(exclude,glob)**/.auto"]
 
 export type KeepResult =
   | { ok: true; commit: string | null } // null = nothing to commit (no code change)
@@ -107,7 +122,8 @@ export async function commitKeep(cwd: string, message: string): Promise<KeepResu
   const staged = await git(["diff", "--cached", "--quiet", ...SCOPE], cwd)
   if (staged.code === 0) return { ok: true, commit: null }
 
-  const commit = await git(["commit", "-q", "-F", "-"], cwd, message)
+  // Commit only this scope: anything staged elsewhere (other folders, .auto/) stays out.
+  const commit = await git(["commit", "-q", "-F", "-", ...SCOPE], cwd, message)
   if (commit.code !== 0) {
     await git(["reset", "-q", ...SCOPE], cwd)
     return { ok: false, error: `git commit failed:\n${commit.output.trim()}` }
@@ -121,6 +137,16 @@ export async function commitKeep(cwd: string, message: string): Promise<KeepResu
  * newly added files, and untracked files and folders. `.auto/` and gitignored files stay.
  */
 export async function revertToHead(cwd: string): Promise<{ ok: boolean; output: string }> {
+  const head = await git(["rev-parse", "--verify", "-q", "HEAD"], cwd)
+  if (head.code !== 0) {
+    return { ok: false, output: "This repository has no commits yet. Make an initial commit, then try again." }
+  }
+  // `git restore` fails with "pathspec did not match" when the folder has no tracked files yet.
+  const tracked = await git(["ls-files", ...SCOPE], cwd)
+  if (!tracked.output.trim()) {
+    const clean = await git(["clean", "-fd", ...SCOPE], cwd)
+    return { ok: clean.code === 0, output: clean.output.trim() }
+  }
   const restore = await git(["restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE], cwd)
   // If restoring failed, stop: deleting untracked files on top of a half-done revert would
   // lose work while the tool reports that nothing was logged.

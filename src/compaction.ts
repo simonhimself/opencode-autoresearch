@@ -18,6 +18,10 @@ const MAX_PROMPT_CHARS = 12_000
 const MAX_IDEAS_CHARS = 4_000
 const MAX_USER_NOTES = 10
 const MAX_USER_NOTE_CHARS = 600
+const MAX_DESCRIPTION_CHARS = 300
+const MAX_NAME_CHARS = 200
+/** Hard cap for the whole summary (it replaces the conversation, so it must stay small). */
+const MAX_SUMMARY_CHARS = 40_000
 
 /** asi keys worth carrying forward, in display order, with short labels. */
 const ASI_FIELDS: [key: string, label: string][] = [
@@ -65,17 +69,20 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
       "and run the next experiment. Keep looping until stopped.",
     ].join("\n"),
   ]
-  return sections.filter(Boolean).join("\n\n")
+  const summary = sections.filter(Boolean).join("\n\n")
+  return summary.length > MAX_SUMMARY_CHARS
+    ? truncate(summary, MAX_SUMMARY_CHARS) + "\n\n(Summary cut to size; .auto/ has the full details.)"
+    : summary
 }
 
 function sessionSection(config: ReturnType<typeof currentSegment>["config"], runs: RunEntry[]): string {
-  if (!config) return "## Session\n\nNo `init_experiment` yet. Finish setup per `.auto/prompt.md`."
+  if (!config) return "## Session\n\nNo `autoresearch_init` yet. Finish setup per `.auto/prompt.md`."
   const { baseline, best } = summarize(runs, config.direction)
   const count = (s: RunEntry["status"]) => runs.filter((r) => r.status === s).length
   const lines = [
     "## Session",
     "",
-    `Goal: ${config.name}`,
+    `Goal: ${oneLine(config.name, MAX_NAME_CHARS)}`,
     `Metric: ${config.metric_name} (${config.metric_unit || "no unit"}), ${config.direction} is better`,
     `Runs so far: ${runs.length} (${count("keep")} keep · ${count("discard")} discard · ${count("crash")} crash · ${count("checks_failed")} checks_failed)`,
   ]
@@ -88,7 +95,7 @@ function sessionSection(config: ReturnType<typeof currentSegment>["config"], run
 function userSection(messages: string[]): string {
   const notes = messages.map(userText).filter(Boolean).slice(-MAX_USER_NOTES)
   if (!notes.length) return ""
-  const lines = notes.map((m) => `- ${truncate(m.replace(/\s+/g, " "), MAX_USER_NOTE_CHARS)}`)
+  const lines = notes.map((m) => `- ${oneLine(m, MAX_USER_NOTE_CHARS)}`)
   return [
     "## What the user said in this session (oldest first; later messages override earlier ones)",
     "",
@@ -115,7 +122,8 @@ function recentRunsSection(allRuns: RunEntry[]): string {
   const lines = recent.map((r) => {
     const parts = [
       `#${r.run} ${r.status.padEnd("checks_failed".length)} ${r.status === "crash" ? "—" : fmt(r.metric) + delta(r.metric, baselineOf(r.segment))}`,
-      r.description ? `desc: ${r.description}` : "",
+      // One line, capped: a description can't add headings or blow up the summary.
+      r.description ? `desc: ${oneLine(r.description, MAX_DESCRIPTION_CHARS)}` : "",
       ...asiParts(r.asi),
     ]
     return parts.filter(Boolean).join(" | ")
@@ -137,13 +145,13 @@ function asiParts(asi: Record<string, unknown> | undefined): string[] {
     const v = asi[key]
     if (typeof v !== "string" || !v.trim() || seen.has(label)) continue
     seen.add(label)
-    out.push(`${label}: ${truncate(v.trim().replace(/\s+/g, " "), 200)}`)
+    out.push(`${label}: ${oneLine(v, 200)}`)
   }
   return out
 }
 
-// Up to 5 significant digits, without trailing zeros.
-const fmt = (n: number) => String(Number(n.toPrecision(5)))
+// Exact for integers and short decimals; long ones cut to 8 significant digits.
+const fmt = (n: number) => (Number.isInteger(n) || String(n).length <= 12 ? String(n) : String(Number(n.toPrecision(8))))
 
 function delta(value: number, baseline: number | null): string {
   if (baseline === null || baseline === 0 || value === baseline) return ""
@@ -151,4 +159,9 @@ function delta(value: number, baseline: number | null): string {
   return ` (${pct > 0 ? "+" : ""}${pct.toFixed(1)}%)`
 }
 
-const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
+/** Cut to n characters by code point, so emoji and other surrogate pairs aren't split. */
+function truncate(s: string, n: number): string {
+  const chars = Array.from(s)
+  return chars.length > n ? chars.slice(0, n - 1).join("") + "…" : s
+}
+const oneLine = (s: string, n: number) => truncate(String(s).trim().replace(/\s+/g, " "), n)

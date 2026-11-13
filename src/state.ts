@@ -32,6 +32,10 @@ export interface RunEntry {
   asi: Record<string, unknown>
   commit: string | null
   confidence: number | null
+  /** Spread (MAD) of the primary metric across this run's repeats; null with fewer than 3. */
+  noise?: number | null
+  /** How many times the benchmark ran for this result (the metric is their median). */
+  samples?: number
   timestamp: string
 }
 
@@ -119,31 +123,35 @@ function median(values: number[]): number {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
 }
 
+/** MAD (median absolute deviation): a spread estimate that one outlier can't skew. */
+export function mad(values: number[]): number {
+  const center = median(values)
+  return median(values.map((v) => Math.abs(v - center)))
+}
+
 /**
- * How much bigger the best improvement is than the session's noise floor.
+ * How much bigger the best improvement is than the measurement noise.
  * ≥ 2.0 → likely real, 1.0–2.0 → marginal, < 1.0 → within noise.
  *
- * `values` is every metric value in the current segment (all statuses, so
- * discarded runs still count towards measuring noise). Returns null when
- * there isn't enough data to say anything.
+ * Noise comes only from repeated measurements of the SAME code: each run made with
+ * `repeat` ≥ 3 records the spread (MAD) of its samples, and the median of those is used.
+ * (The old estimate took the spread of all results in the segment. That includes the
+ * improvements themselves, so after two small gains it always said "likely real".)
+ *
+ * Conservative: the noise of one sample is compared with a difference of medians.
+ * Returns null when no run measured its noise, or there's no improvement.
  */
 export function computeConfidence(
-  values: number[],
+  runs: Pick<RunEntry, "noise">[],
   baseline: number | null,
   best: number | null,
 ): number | null {
-  if (values.length < 3 || baseline === null || best === null) return null
+  if (baseline === null || best === null) return null
   const gain = Math.abs(best - baseline)
   if (gain === 0) return null
-
-  // MAD (median absolute deviation) is a noise estimate that one outlier run can't skew.
-  const center = median(values)
-  const mad = median(values.map((v) => Math.abs(v - center)))
-  // MAD is 0 when most runs gave the identical number: the noise can't be measured yet,
-  // so say nothing rather than report an infinite confidence.
-  if (mad === 0) return null
-
-  return gain / mad
+  const noises = runs.map((r) => r.noise).filter((n): n is number => typeof n === "number" && n > 0)
+  if (!noises.length) return null
+  return gain / median(noises)
 }
 
 export { median }

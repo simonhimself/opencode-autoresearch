@@ -18,7 +18,7 @@ The experiment branch usually has uncommitted `.auto/` changes (`.auto/log.jsonl
 2. Read `.auto/prompt.md` for context.
 3. Find the trunk branch (`main`, or `master`, or whatever `git symbolic-ref refs/remotes/origin/HEAD` points to), then the merge-base: `git merge-base HEAD <trunk>`.
 4. Expand every short commit hash to a full one: `git rev-parse <short>`.
-5. For each kept commit, get its diff stat: `$BASE..<commit>` for the first (or `<last setup commit>..<commit>` if you give setup its own group, see below), `<prev_kept>..<commit>` after that. Ignore `.auto/` files. Also check for leftovers after the last kept commit: `git diff --stat <last_kept> HEAD -- . ':!.auto'` should print nothing.
+5. For each kept commit, get its diff stat: `$BASE..<commit>` for the first (or `<last setup commit>..<commit>` if you give setup its own group, see below), `<prev_kept>..<commit>` after that. Ignore `.auto/` files. Also check for leftovers after the last kept commit: `git diff --stat <last_kept> HEAD -- ':(top)' ':(top,exclude,glob)**/.auto/**'` should print nothing (this covers the whole repo, even when run from a package folder).
 6. Group kept commits into logical changesets:
    - **Keep the order.** Group N's commits come before group N+1's.
    - **No two groups may touch the same file.** Each branch is applied to the merge-base on its own, so a shared file would conflict. If two groups share a file, merge them.
@@ -69,25 +69,39 @@ Write it to a temp file (e.g. `/tmp/autoresearch-groups.json`), not into the rep
 - `goal` must not equal the experiment branch's name after `autoresearch/`. Git can't hold both `autoresearch/speed` and `autoresearch/speed/01-…`. Use e.g. `speed-final`.
 - Put the metric change in each `body`. The script warns when it's missing.
 
-Then run it from the project root:
+Then run it from the session folder (the one holding `.auto/`) or any folder below it. In a monorepo that is the package folder where the session ran, not the repo root: the script looks for the nearest `.auto/` at or above the current folder (for the ideas backlog and the cleanup commands) and does its git work from the repo root.
 
 ```bash
 bash <SKILL_DIR>/finalize.sh /tmp/autoresearch-groups.json
 ```
 
-The script creates `autoresearch/<goal>/01-<slug>`, `02-…` branches from the merge-base and checks that together they equal the original branch. It also checks that no `.auto/` files leaked in and that no commit is empty. Then it prints a summary with cleanup commands and the ideas backlog.
+The script first checks that every branch name it will create is valid (no spaces, `..` and so on in `goal` or a `slug`) and fails before touching anything if not. It then creates `autoresearch/<goal>/01-<slug>`, `02-…` branches from the merge-base and checks that together they equal the original branch. Added, changed, deleted and renamed files are all carried over. It also checks that no session files leaked in and that no commit is empty. Then it prints a summary with cleanup commands and the ideas backlog.
+
+Session files are anything inside a `.auto/` folder, plus the older flat files (`autoresearch.jsonl`, `autoresearch.sh`, `autoresearch.md`, `autoresearch.ideas.md`, `autoresearch.checks.sh`, `autoresearch.config.json`) directly in the session folder. Any other file, even one named like `lib/autoresearch.utils.js`, is treated as normal code.
 
 Uncommitted changes (normally the `.auto/` session files) are stashed while the script runs, because checking out the merge-base would otherwise fail. In every outcome the script returns to the original branch and pops that stash, so `.auto/log.jsonl`, `.auto/ideas.md` and the rest are back afterwards. If it can't, it prints a warning: then run `git stash list` and `git stash pop` on the original branch.
 
 - If creating branches fails, it rolls back: deletes the new branches, returns to the original branch and restores the stash.
 - If verification fails, it exits non-zero but leaves the branches so you can inspect them. It still returns to the original branch and restores the stash.
 
+### Testing a branch without leaving the checkout
+
+To run the tests on a created branch, check it out in a separate worktree, so the user's checkout and its `.auto/` files stay untouched:
+
+```bash
+git worktree add /private/tmp/ar-01-forks-pool autoresearch/<goal>/01-forks-pool
+# run the project's tests inside /private/tmp/ar-01-forks-pool
+git worktree remove /private/tmp/ar-01-forks-pool
+```
+
+Use `git worktree remove`, not `rm -rf`. If it refuses because the tests left untracked files (build output, caches), use `git worktree remove --force /private/tmp/ar-01-forks-pool`.
+
 ## Step 3: Report
 
 Tell the user:
 - the branches created and what each contains
 - the overall result, baseline → best, from the log
-- the cleanup commands from the script's summary. **Don't run them yourself.** They delete the experiment branch and `.auto/`, so the user decides.
+- the cleanup commands from the script's summary, exactly as printed and in that order: `cd` to the session folder, remove `.auto` (and any older flat session files), switch to trunk, then delete the experiment branch. **Don't run them yourself.** They delete the experiment branch and the session log, so the user decides.
 
 ## Edge cases
 
@@ -96,3 +110,5 @@ Tell the user:
 - **Commits on the branch that aren't experiments:** they can't be skipped, since each group takes everything in its commit range. Put non-`.auto` changes from setup commits in their own first group (see Step 1). Other ones go in the group whose range contains them, or in a separate group if they're unrelated.
 - **The union check fails:** some non-`.auto` change isn't covered by any group, usually because it comes after the last group's `last_commit`. Delete the created branches (ask the user first), fix `groups.json` and rerun.
 - **A branch name already exists:** pick a different `goal` slug, or ask the user before deleting the old branch.
+- **The script says a branch name is invalid:** use lowercase words joined by `-` for `goal` and every `slug`.
+- **Deleted or renamed files:** no special handling needed. A rename counts as the old path (removed) plus the new path (added), and both belong to the same group, so another group may not touch either name.

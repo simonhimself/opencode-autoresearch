@@ -4,11 +4,11 @@ Let OpenCode optimize something on its own while you do something else. It tries
 
 It works for anything you can measure with a script: test runtime, build time, bundle size, a benchmark, a training loss, a Lighthouse score.
 
-A port of [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) to OpenCode v2. It uses the same `.auto/` session files, so a session started in pi can be resumed here and the other way round.
+A port of [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) to OpenCode v2. It uses the same `.auto/` session files, so a session started in pi can be resumed here and the other way round. The tools are named `autoresearch_init`, `autoresearch_run` and `autoresearch_log` here (pi calls them `init_experiment`, `run_experiment`, `log_experiment`).
 
 ## Install
 
-You need OpenCode v2 (tested on 2.2.5) and [Bun](https://bun.sh).
+You need OpenCode v2 (tested on 2.2.5 and 2.3.0) and [Bun](https://bun.sh).
 
 ```sh
 git clone https://github.com/simonhimself/opencode-autoresearch
@@ -65,7 +65,7 @@ To steer it mid-run, just type a message ("try caching next", "don't touch the e
 
 This opens a page in your browser with:
 - the baseline, the best result and the improvement so far
-- a confidence score: is the gain real, or just measurement noise?
+- a confidence score: is the gain real, or just measurement noise? It's based on noise measured by running the benchmark several times on the same code, so it only appears when the agent uses repeats (the setup skill tells it to for fast benchmarks).
 - a chart of every experiment
 - a table of every run with the agent's notes
 
@@ -115,7 +115,7 @@ Everything lives in `.auto/` at the project root:
 { "maxIterations": 50 }
 ```
 
-`maxIterations` is the most runs per *segment*, counting the baseline (so `6` = baseline + 5 experiments). A segment starts with `init_experiment`; the agent starts a new one when the goal or the way of measuring changes. Set it to limit time and token use: the loop stops by itself when it's reached, and `/autoresearch` won't restart a segment that's already full. Raise the number to continue.
+`maxIterations` is the most runs in total, counting baselines (so `6` = 6 logged runs). Starting a new segment (when the goal or the way of measuring changes) doesn't reset it. Set it to limit time and token use: the loop stops by itself when it's reached, and `/autoresearch` won't restart when the limit is already used up. Raise the number to continue. A broken `config.json` or an invalid value is reported (`/autoresearch status`) instead of silently meaning "no limit".
 
 ## Long runs and compaction
 
@@ -132,7 +132,8 @@ OpenCode still keeps the most recent ~15k tokens of conversation next to it. The
 ## Good to know
 
 - **Discarding deletes untracked files.** Discarded and crashed runs are reverted with `git checkout -- .` and `git clean -fd`; only `.auto/` is spared. That's why it insists on a clean tree and its own branch. Don't point it at a working copy with unsaved work.
-- **Your permission rules don't cover the plugin's git commands.** It runs git itself, so shell rules like `git checkout *: ask` don't apply to them.
+- **Your permission rules apply.** Before running the benchmark or changing git, the plugin checks OpenCode's permission system as a `shell` action with the commands it's about to run (e.g. `./.auto/measure.sh`, `git clean -fd -- .`). With the default allow-all nothing changes and the loop runs unattended. A `deny` rule blocks it, and an `ask` rule pauses the loop until you answer, so only set `ask` for these if you want to approve each experiment.
+- **Other plugins' shell hooks don't apply** to the plugin's own commands (the plugin API has no way to run them through OpenCode's shell).
 - **Keep commits leave `.auto/` out.** The session files change on every run, so they stay uncommitted on the experiment branch (`git status` shows them). That's expected; finalize handles them.
 - **One loop per project.** Starting `/autoresearch` in a second session turns the loop off in the first one.
 - **Approving the first branch.** If your permission rules ask before `git checkout *`, the agent stops once at setup to create the `autoresearch/…` branch. Allow `git checkout -b autoresearch/*` to skip that.

@@ -230,9 +230,9 @@ are never used for a decision. The first measurement only serves as a cheap filt
 
 ## Progress numbers
 
-Because absolute numbers from different times aren't comparable, "improvement" is the
-**compounded gain of the confirmed keeps** in the segment (product of each keep's ratio
-candidate/HEAD from its paired confirmation), not `current / baseline`. Status, tool output, the
+(Superseded by "Progress" in v0.2.2 below, which gives the final rule.) Because absolute numbers
+from different times aren't comparable, "improvement" is the **combined result of the confirmed
+keeps** in the segment, not `current / baseline`. Status, tool output, the
 compaction summary and the dashboard all use it; the baseline and current absolute values are
 shown as "measured at the time". "kept" counts never include the baseline.
 `/autoresearch status` covers the whole session: one line per segment (name, runs, kept,
@@ -334,10 +334,15 @@ noise looks like. No logged number from an earlier time is used for any decision
 
 ## Progress
 
-Compounded gain = product over confirmed **non-simplification** keeps of (1 + gain). A
-simplification keep counts as no change. Tool output gives the agent the sentence to use
-("N % better than the baseline, as the sum of confirmed gains") and the skill tells it never to
-quote a ratio of absolute numbers measured at different times.
+Each confirmed **non-simplification** keep has a ratio r = candidate / HEAD from its pairs
+(lower is better: r = 1 − gain; higher is better: r = 1 + gain). The level is the product of
+the ratios (baseline = 1). Report "N % lower than the baseline" with N = (1 − level) × 100 for
+lower-is-better, "N % higher than the baseline" with N = (level − 1) × 100 for higher-is-better,
+with "(worse)" when the level is on the wrong side. Example: two 10 % reductions, 100 → 90 → 81,
+read "19.0 % lower", not 21 %. A simplification keep counts as no change. Tool output gives the
+agent the exact sentence to quote, and the skill tells it never to quote a ratio of absolute
+numbers measured at different times. Status, tool output, compaction summary and dashboard use
+the same rule.
 
 ## Other fixes
 

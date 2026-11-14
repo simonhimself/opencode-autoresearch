@@ -158,7 +158,7 @@ Use `git worktree remove`, not `rm -rf`. If it refuses because the tests left un
 Tell the user:
 - the branches created and what each contains
 - what each branch measured alone, in the wording of the script's table ("4.1 % better (p = 0.004)", "no measurable change"), including any that don't work on their own and what to do about them
-- the overall result of the session: the compounded gain of the confirmed keeps (the figure `/autoresearch status` and the dashboard show as the improvement over the baseline). Never a ratio of the baseline's and the last run's absolute values: they were measured at different times and aren't comparable
+- the overall result of the session: the combined result of the confirmed keeps, in the sentence `/autoresearch status` gives (e.g. "19.0% lower than the baseline"). Simplification keeps count as no change. Never a ratio of the baseline's and the last run's absolute values: they were measured at different times and aren't comparable
 - the cleanup commands from the script's summary, exactly as printed and in that order: `cd` to the session folder, remove `.auto`, switch to trunk, then delete the experiment branch. **Don't run them yourself.** They delete the experiment branch and the session log, so the user decides.
 
 ## Edge cases

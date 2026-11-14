@@ -341,16 +341,19 @@ function analyze(seg) {
     else if (r.status === "discard" && r.note) k = "unconfirmed";
     kind.set(r, k);
     levelAt.set(r, levelNow());
-    if (r !== baseRun && r.status !== "crash") {
+    // Only decided proposals carry a paired result: keeps, and unconfirmed keeps with a logged
+    // gain. A run that crashed or failed checks mid-decision keeps its partial pairs in the log,
+    // but they are no result (recomputing a gain from them showed a crash as "13.6 % better").
+    if (r !== baseRun && r.status !== "crash" && r.status !== "checks_failed") {
       const pairs = pairList(r.pairs);
-      if (isNum(r.gain) || pairs.length) {
+      if (isNum(r.gain) || (r.status === "keep" && pairs.length)) {
         const diffs = pairGains(pairs, dir);
         const gain = isNum(r.gain) ? r.gain : diffs.length ? median(diffs) : null;
         if (gain != null) pair.set(r, {
           refKind: "pairs", gain, ratio: ratioOf(gain, dir), p: isNum(r.p) ? r.p : null, n: pairs.length, pairs, diffs,
           look: pairList(r.look_pairs), lookDiffs: pairGains(pairList(r.look_pairs), dir),
         });
-      } else {
+      } else if (!pairs.length) { // pre-v0.2.2 entries
         const sm = numSamples(r), cs = numList(r.current_samples);
         const cand = isNum(r.metric) ? r.metric : sm.length ? median(sm) : null;
         let ref = null, refKind = "previous";

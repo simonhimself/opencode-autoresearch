@@ -263,3 +263,94 @@ The segment hash and the run fingerprint cover every file under `.auto/` except 
   (no-op experiments, uniform ±2 % noise, repeat 5, keep proposed when the first measurement
   looks better) shows more than 3 % false keeps per no-op; then use 2.5. Record the simulated
   rate in a test.
+
+---
+
+# v0.2.2: pair-wise measurement and an exact test (overrides v0.2.1 and earlier where they differ)
+
+Live results on v0.2.1 (two testers, several hundred experiments): no false keep among real
+changes and the swap is safe, but (a) ~9 % of proposed no-op keeps were confirmed (the SE from
+the MAD of 5–6 samples is too rough; nominal 2.5 SE was really ~6.4 %), (b) a change that was
+7–10 % faster was rejected twice because a load burst hit one block of the HEAD–candidate–HEAD
+blocks, (c) the first-look advice and pre-filter still used the stale logged number (13 % off
+seventy seconds later), (d) simplification keeps put noise into the compounded gain.
+
+## Principle
+
+Every comparison is made on **adjacent pairs**: one HEAD run and one candidate run measured
+back to back, with the order inside the pair alternating (HC, CH, HC, …). A pair's result is
+the relative difference of its two runs. Bursts and drift hit both runs of a pair alike.
+Decisions use an **exact paired test** (Wilcoxon signed-rank on the pair differences, exact
+null distribution, one-sided), so the false-keep rate is bounded by construction whatever the
+noise looks like. No logged number from an earlier time is used for any decision or advice.
+
+## Modes (fixed per segment by `repeat` at init)
+
+- **Standard** (`repeat` ≥ 3, default 5): for workloads where many runs are affordable.
+- **Slow** (`repeat` 1–2): for workloads where a run takes minutes. No statistical guarantee;
+  say so in tool output and status.
+
+## autoresearch_run (the first look)
+
+- Baseline (segment has no keep yet): as before, `repeat` runs of the clean tree after one
+  warm-up. These numbers are for display only.
+- Otherwise: `LOOK_PAIRS` pairs (standard: 3; slow: 1) HEAD/candidate, then checks on the
+  candidate tree. Output: the paired estimate (median relative difference, per-pair values) and
+  advice ("looks better / about equal / looks worse; propose keep or discard"), worded as a
+  rough look. The pending run stores the pairs.
+- A HEAD failure during the look restores the candidate and returns an error.
+
+## autoresearch_log → keep (the decision)
+
+1. Fingerprint check, no-diff check as before. Pre-filter: refuse (nothing logged) when the
+   first look's median pair difference isn't better than HEAD. (Fresh numbers, so this filter
+   is unbiased; it exists to save benchmark time, not for truth.)
+2. Stage 1: `CONFIRM_PAIRS` fresh pairs (standard: 8). Exact one-sided signed-rank p-value.
+   - p ≤ `ALPHA_STAGE` → confirmed.
+   - p > `EXTEND_BELOW` → not confirmed.
+   - otherwise Stage 2: `CONFIRM_PAIRS` more pairs, test all pairs together; confirmed when
+     p ≤ `ALPHA_STAGE`, else not confirmed.
+   Choose `ALPHA_STAGE` and `EXTEND_BELOW` so that the total false-keep probability of a
+   proposed no-op is ≤ 1 % by exact calculation (e.g. 0.005 per stage), and prove it in a test
+   by enumerating/simulating the null. Report the power for true gains of 1 %, 3 %, 5 % at
+   ±2 % uniform noise and under bursty noise (20 % of runs slowed by 10–40 %).
+3. The look pairs are never pooled into the decision (they were selected on).
+4. Slow mode: `repeat` fresh pairs; confirmed when every pair is better and the median
+   difference is at least `minImprovement`.
+5. `simplification: true` (net deletion required, as before): confirmed unless the candidate is
+   significantly worse (same test in the other direction, p ≤ 0.05) or the median pair
+   difference is worse than `minImprovement`. The pre-filter doesn't apply.
+6. Not confirmed → revert, log as discard with a note, as before. Confirmed → commit.
+
+## Log fields (run entries)
+
+`pairs`: array of `[head, candidate]` values in measurement order (decision pairs only);
+`look_pairs`: the first look's pairs; `gain`: median relative pair difference, positive = better
+(for keeps and unconfirmed keeps); `p`: the one-sided p-value (null in slow mode);
+`metric` = median of the candidate values in `pairs` (baseline: median of `samples`);
+`vs` = median of the HEAD values in `pairs`. Keep writing `samples` (candidate values) and
+`current_samples` (HEAD values) for older readers. `confidence` is no longer written.
+`mode: "slow"` on config entries when `repeat` < 3.
+
+## Progress
+
+Compounded gain = product over confirmed **non-simplification** keeps of (1 + gain). A
+simplification keep counts as no change. Tool output gives the agent the sentence to use
+("N % better than the baseline, as the sum of confirmed gains") and the skill tells it never to
+quote a ratio of absolute numbers measured at different times.
+
+## Other fixes
+
+- Tool schemas use `additionalProperties: true` so unknown arguments reach the plugin's own
+  check and are rejected by name (OpenCode strips undeclared keys otherwise).
+- After an interrupted-swap recovery, `/autoresearch` may start with uncommitted changes when
+  they are exactly the pending run's fingerprinted tree, and the pending run is kept.
+- Compaction: a user's goal/notes are capped at 1500 characters each (was 600).
+- Finalize measures each branch against the merge-base in alternating pairs (worktree A, worktree
+  B, …) and reports the paired median difference; a difference that isn't significant by the
+  same test is written as "no measurable change", not as a percentage.
+- README: provider errors are first retried by OpenCode itself (a usage-limit pause resumed by
+  itself after 4 h in the live test); the plugin's own three retries apply to turns that
+  finally fail.
+- Dashboard and compaction show `gain` and "confirmed (p = …)" per keep; old entries with
+  `confidence` still render.

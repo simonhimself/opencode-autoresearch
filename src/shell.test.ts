@@ -396,7 +396,7 @@ describe("output cap", () => {
 
 // ── v0.2.1 ────────────────────────────────────────────────
 
-describe("swapScope (the paired confirmation's swap)", () => {
+describe("swapScope (the swap between the two runs of a pair)", () => {
   const tree = async (dir: string) => {
     const res = await scopeTreeHash(dir)
     if (!res.ok) throw new Error(res.error)

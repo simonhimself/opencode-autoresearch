@@ -3,24 +3,27 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
-  compoundedGain,
-  CONFIRM_AT,
+  compoundedLevel,
   DEFAULT_SETTINGS,
   gainText,
-  halfRuns,
-  judge,
+  keepRatio,
   keptRuns,
+  levelText,
   median,
+  medianPairGain,
   noImprovementStreak,
+  pairGain,
   parseMetrics,
+  pText,
   readSettings,
   relativeGain,
-  sampleList,
   segmentSummaries,
   summarize,
   type LogEntry,
+  type Pair,
   type RunEntry,
 } from "./state.ts"
+import { buildCompactionSummary } from "./compaction.ts"
 
 const run = (metric: number | null, status: RunEntry["status"], extra: Partial<RunEntry> = {}) =>
   ({ type: "run", metric, status, ...extra }) as RunEntry
@@ -45,14 +48,6 @@ describe("summarize", () => {
   })
 })
 
-describe("sampleList", () => {
-  test("uses the stored samples, or the metric for entries that only stored a count", () => {
-    expect(sampleList({ samples: [1, 2, 3], metric: 2 })).toEqual([1, 2, 3])
-    expect(sampleList({ samples: 5 as never, metric: 2 })).toEqual([2])
-    expect(sampleList({ samples: undefined as never, metric: null })).toEqual([])
-  })
-})
-
 describe("noImprovementStreak", () => {
   const entries = [
     run(100, "keep", { baseline: true }),
@@ -71,28 +66,132 @@ describe("noImprovementStreak", () => {
   })
 })
 
-describe("compounded gain", () => {
-  const keep = (metric: number, vs: number, extra: Partial<RunEntry> = {}) => run(metric, "keep", { vs, ...extra })
+describe("pairs", () => {
+  test("pairGain: how much better the candidate run was than the HEAD run next to it", () => {
+    expect(pairGain([100, 92], "lower")).toBeCloseTo(0.08)
+    expect(pairGain([100, 92], "higher")).toBeCloseTo(-0.08)
+    expect(pairGain([100, 100], "lower")).toBe(0)
+    expect(pairGain([0, 5], "higher")).toBe(Infinity) // from zero: no NaN
+    expect(pairGain([0, 0], "lower")).toBe(0)
+  })
+  test("medianPairGain: the median of the pairs' results, so one burst doesn't move it", () => {
+    const pairs: Pair[] = [[100, 95], [140, 96], [100, 94]] // a burst on HEAD's run in pair 2
+    expect(medianPairGain(pairs, "lower")).toBeCloseTo(0.06)
+    expect(median([3, 1, 2])).toBe(2)
+    expect(median([4, 1, 2, 3])).toBe(2.5)
+  })
+  test("pText: the wording of a p-value", () => {
+    expect([1 / 256, 0.0005, 0.21, 0.098].map(pText)).toEqual(["p = 0.004", "p < 0.001", "p = 0.21", "p = 0.098"])
+  })
+})
 
-  test("the product of the keeps' back-to-back ratios, not current / baseline", () => {
-    // The baseline was logged at 100 on a slow day; the two keeps were each 10 % better
-    // than HEAD when measured next to it, at whatever speed the machine had then.
-    const runs = [run(100, "keep", { baseline: true }), keep(72, 80), run(70, "discard", { vs: 72 }), keep(108, 120)]
-    const g = compoundedGain(runs, "lower")
-    expect(g.ratio).toBeCloseTo(0.81)
-    expect(g.gain).toBeCloseTo(0.19)
-    expect(g).toMatchObject({ keeps: 2, skipped: 0 })
+describe("compounded level", () => {
+  /** A keep as v0.2.2 writes it: `gain` from its decision pairs. */
+  const keep = (gain: number, extra: Partial<RunEntry> = {}) => run(100, "keep", { gain, ...extra })
+  /** A keep as v0.2.1 wrote it: candidate and HEAD medians, no `gain`. */
+  const oldKeep = (metric: number, vs: number, extra: Partial<RunEntry> = {}) => run(metric, "keep", { vs, ...extra })
+
+  test("lower is better: 100 → 90 → 81 is 19 % lower, not 21 % better; and not current / baseline", () => {
+    // The baseline was logged at 100 on a slow day; the two keeps were each 10 % lower
+    // than HEAD in their own pairs, at whatever speed the machine had then.
+    const runs = [run(100, "keep", { baseline: true }), keep(0.1, { metric: 72 }), run(70, "discard", { gain: 0.03 }), keep(0.1, { metric: 108 })]
+    const g = compoundedLevel(runs, "lower")
+    expect(g.level).toBeCloseTo(0.81)
+    expect(g).toMatchObject({ keeps: 2, skipped: 0, simplifications: 0 })
+    expect(levelText(g.level, "lower")).toBe("19.0% lower than the baseline")
     // current / baseline would say "8 % worse".
     expect(summarize(runs)).toMatchObject({ baseline: 100, current: 108 })
+    // Two halvings are 75 % lower; the old product of (1 + gain) said "125 % better".
+    expect(levelText(compoundedLevel([keep(0.5), keep(0.5)], "lower").level, "lower")).toBe("75.0% lower than the baseline")
   })
 
-  test("direction higher; baselines, discards and keeps without a usable ratio don't count", () => {
-    const runs = [run(50, "keep", { baseline: true, vs: 1 }), keep(110, 100), keep(5, 0), run(200, "keep"), run(999, "discard", { vs: 1 })]
-    const g = compoundedGain(runs, "higher")
-    expect(g.gain).toBeCloseTo(0.1)
+  test("higher is better: 100 → 110 → 121 is 21 % higher", () => {
+    const g = compoundedLevel([run(100, "keep", { baseline: true }), keep(0.1), keep(0.1)], "higher")
+    expect(g.level).toBeCloseTo(1.21)
+    expect(levelText(g.level, "higher")).toBe("21.0% higher than the baseline")
+  })
+
+  test("a simplification keep counts as no change: its measured difference is noise", () => {
+    const runs = [run(100, "keep", { baseline: true }), keep(0.1), keep(-0.008, { neutral: true }), keep(0.004, { neutral: true }), keep(0.1)]
+    const g = compoundedLevel(runs, "lower")
+    expect(g.level).toBeCloseTo(0.81)
+    expect(g).toMatchObject({ keeps: 2, simplifications: 2 })
+    expect(levelText(g.level, "lower")).toBe("19.0% lower than the baseline")
+    expect(keptRuns(runs)).toHaveLength(4) // they are kept experiments all the same
+  })
+
+  test("levelText: the metric's own direction, and \"(worse)\" on the wrong side", () => {
+    expect(levelText(0.95, "lower")).toBe("5.0% lower than the baseline")
+    expect(levelText(1.05, "lower")).toBe("5.0% higher than the baseline (worse)")
+    expect(levelText(1.05, "higher")).toBe("5.0% higher than the baseline")
+    expect(levelText(0.95, "higher")).toBe("5.0% lower than the baseline (worse)")
+    expect(levelText(1, "lower")).toBe("no change from the baseline")
+    expect(levelText(0.9996, "lower")).toBe("0.04% lower than the baseline") // not "0.0%"
+    // A lower-is-better level can't read more than 100 % lower: it is a product of positive ratios.
+    expect(levelText(compoundedLevel([keep(0.9), keep(0.9)], "lower").level, "lower")).toBe("99.0% lower than the baseline")
+    // Net worse from keeps: one 10 % worse, one 2 % better.
+    expect(levelText(compoundedLevel([keep(-0.1), keep(0.02)], "lower").level, "lower")).toBe("7.8% higher than the baseline (worse)")
+  })
+
+  test("keepRatio: candidate / HEAD from `gain`, from the pairs, or from metric / vs", () => {
+    expect(keepRatio(keep(0.1), "lower")).toBeCloseTo(0.9)
+    expect(keepRatio(keep(0.1), "higher")).toBeCloseTo(1.1)
+    // The logged `gain` of a lower-is-better pair is (HEAD − candidate) / HEAD, i.e. the reduction 1 − r.
+    expect(pairGain([100, 90], "lower")).toBeCloseTo(0.1)
+    expect(keepRatio(run(90, "keep", { pairs: [[100, 90]] }), "lower")).toBeCloseTo(0.9)
+    expect(keepRatio(oldKeep(72, 80), "lower")).toBeCloseTo(0.9)
+    expect(keepRatio(oldKeep(72, 80), "higher")).toBeCloseTo(0.9) // a ratio has no direction
+    expect(keepRatio(keep(1), "lower")).toBeUndefined() // a candidate of zero: no ratio to multiply with
+    expect(keepRatio(run(5, "keep"), "lower")).toBeUndefined()
+  })
+
+  test("`gain` missing: taken from the pairs; a keep without a usable number is skipped", () => {
+    const fromPairs = run(95, "keep", { pairs: [[100, 95], [100, 94], [100, 96]] })
+    expect(compoundedLevel([fromPairs], "lower").level).toBeCloseTo(0.95)
+    expect(compoundedLevel([keep(null as never), run(200, "keep")], "lower")).toMatchObject({ level: 1, keeps: 0, skipped: 2 })
+    expect(compoundedLevel([run(100, "keep", { baseline: true })], "lower")).toMatchObject({ level: 1, keeps: 0 })
+  })
+
+  test("keeps written before v0.2.2 count with metric / vs, and mix with new ones", () => {
+    const old = [run(100, "keep", { baseline: true }), oldKeep(72, 80), run(70, "discard", { vs: 72 }), oldKeep(108, 120)]
+    expect(compoundedLevel(old, "lower").level).toBeCloseTo(0.81)
+    expect(compoundedLevel([...old, keep(0.1)], "lower").level).toBeCloseTo(0.729)
+    const higher = [run(50, "keep", { baseline: true, vs: 1 }), oldKeep(110, 100), oldKeep(5, 0), run(200, "keep"), run(999, "discard", { vs: 1 })]
+    const g = compoundedLevel(higher, "higher")
+    expect(g.level).toBeCloseTo(1.1)
     expect(g).toMatchObject({ keeps: 1, skipped: 2 })
-    expect(keptRuns(runs)).toHaveLength(3)
-    expect(compoundedGain([run(100, "keep", { baseline: true })], "lower")).toMatchObject({ ratio: 1, gain: 0, keeps: 0 })
+  })
+
+  test("status and compaction read the same number from the same log", async () => {
+    // Lower is better: two confirmed keeps of 10 % each, a simplification between them, a
+    // keep that wasn't confirmed, and one that crashed while it was measured again.
+    const ps = (head: number, gain: number, n = 8) => Array.from({ length: n }, () => [head, head * (1 - gain)] as Pair)
+    const entry = (n: number, status: string, head: number, gain: number | null, extra: object = {}) => ({
+      type: "run", segment: 1, run: n, status, metric: head * (1 - (gain ?? 0)), description: "d", asi: {}, commit: null,
+      pairs: ps(head, gain ?? 0.136, gain === null ? 2 : 8), gain, p: gain === null ? null : 0.004, vs: head, ...extra,
+    })
+    const entries = [
+      { type: "config", segment: 1, name: "t", metric_name: "ms", metric_unit: "ms", direction: "lower", repeat: 5 },
+      { type: "run", segment: 1, run: 1, status: "keep", metric: 100, baseline: true, description: "baseline", asi: {} },
+      entry(2, "keep", 100, 0.1),
+      entry(3, "keep", 90, -0.008, { neutral: true }),
+      entry(4, "keep", 90, 0.1),
+      entry(5, "discard", 81, 0.006, { p: 0.21, note: "keep not confirmed" }),
+      entry(6, "discard", 81, null, { metric: null, note: "keep not confirmed: crash while the candidate was measured again (pair 3)" }),
+    ]
+    const dir = mkdtempSync(join(tmpdir(), "ar-level-"))
+    mkdirSync(join(dir, ".auto"))
+    writeFileSync(join(dir, ".auto", "log.jsonl"), entries.map((e) => JSON.stringify(e)).join("\n") + "\n")
+
+    const [seg] = segmentSummaries(entries as LogEntry[])
+    expect(seg.level).toBeCloseTo(0.81)
+    expect(seg).toMatchObject({ kept: 3, gains: 2, simplifications: 1 })
+    const status = levelText(seg.level, "lower")
+    expect(status).toBe("19.0% lower than the baseline")
+    const summary = await buildCompactionSummary(dir, [])
+    const compaction = /^Improvement: (.*?)\. /m.exec(summary)?.[1]
+    expect(compaction).toBe("19.0 % lower than the baseline")
+    expect(compaction!.replace(" %", "%")).toBe(status)
   })
 
   test("segmentSummaries: one per segment, kept without the baseline", () => {
@@ -100,15 +199,17 @@ describe("compounded gain", () => {
     const entries = [
       config(1, "first"),
       run(100, "keep", { segment: 1, baseline: true }),
-      keep(90, 100, { segment: 1 }),
+      keep(0.1, { segment: 1, metric: 90, run: 2, p: 1 / 256 }),
       run(95, "discard", { segment: 1 }),
       config(2, "second"),
       run(50, "keep", { segment: 2, baseline: true }),
     ] as LogEntry[]
     const [a, b] = segmentSummaries(entries)
-    expect(a).toMatchObject({ runs: 3, kept: 1, baseline: 100, current: 90 })
-    expect(a.gain).toBeCloseTo(0.1)
-    expect(b).toMatchObject({ runs: 1, kept: 0, gain: 0, baseline: 50, current: 50 })
+    expect(a).toMatchObject({ runs: 3, kept: 1, gains: 1, simplifications: 0, baseline: 100, current: 90 })
+    expect(a.lastKeep).toMatchObject({ run: 2, gain: 0.1 })
+    expect(b.lastKeep).toBeUndefined()
+    expect(a.level).toBeCloseTo(0.9)
+    expect(b).toMatchObject({ runs: 1, kept: 0, level: 1, baseline: 50, current: 50 })
   })
 
   test("gainText: one wording, never a sign", () => {
@@ -119,166 +220,6 @@ describe("compounded gain", () => {
     expect(gainText(Infinity)).toContain("better")
     expect(relativeGain(90, 100, "lower")).toBeCloseTo(0.1)
     expect(relativeGain(90, 100, "higher")).toBeCloseTo(-0.1)
-  })
-})
-
-describe("judge", () => {
-  const base = { direction: "lower" as const, minImprovement: 0.01 }
-
-  test("a clear gain over the noise is confirmed, with a per-keep confidence", () => {
-    const v = judge({ ...base, current: [100, 101, 99, 100.5, 99.5], candidate: [90, 91, 89, 90.5, 89.5] })
-    expect(v.confirmed).toBe(true)
-    expect(v.gain).toBeCloseTo(10)
-    expect(v.relGain).toBeCloseTo(0.1)
-    expect(v.confidence!).toBeGreaterThan(CONFIRM_AT)
-    expect(v.reason).toContain("Confirmed")
-    expect(v.reason).toContain("10.0% better")
-  })
-
-  test("a gain inside the noise is not confirmed", () => {
-    const v = judge({ ...base, current: [100, 104, 96, 102, 98], candidate: [99, 103, 95, 101, 97] })
-    expect(v.confirmed).toBe(false)
-    expect(v.confidence!).toBeLessThan(CONFIRM_AT)
-    expect(v.reason).toContain("Not confirmed")
-  })
-
-  test("the threshold is 2.5 standard errors (see the simulation below)", () => {
-    expect(CONFIRM_AT).toBe(2.5)
-    // 2.2 standard errors: passed at 2, doesn't pass now.
-    const current = [100, 101, 99, 100.5, 99.5, 100]
-    const candidate = [98.76, 99.76, 97.76, 99.26, 98.26]
-    const v = judge({ ...base, current, candidate })
-    expect(v.confidence!).toBeGreaterThan(2)
-    expect(v.confidence!).toBeLessThan(2.5)
-    expect(v.confirmed).toBe(false)
-    expect(judge({ ...base, current, candidate, confirmAt: 2 }).confirmed).toBe(true)
-  })
-
-  test("direction higher: more is better", () => {
-    const v = judge({ ...base, direction: "higher", current: [100, 101, 99], candidate: [120, 121, 119] })
-    expect(v.confirmed).toBe(true)
-    expect(v.gain).toBeCloseTo(20)
-    expect(judge({ ...base, direction: "higher", current: [100, 101, 99], candidate: [80, 81, 79] }).confirmed).toBe(false)
-  })
-
-  test("the wording never mixes a signed percentage with better/worse", () => {
-    const worse = judge({ ...base, current: [77.4, 77.5, 77.3], candidate: [131.6, 131.5, 131.7] })
-    expect(worse.reason).toContain("70.0% worse")
-    expect(worse.reason).not.toMatch(/[+-]\d+(\.\d+)?%/)
-    expect(worse.reason).toContain("below HEAD")
-  })
-
-  test("deterministic metric: exact comparison, confidence reported as exact (null)", () => {
-    const better = judge({ ...base, current: [1000, 1000, 1000], candidate: [999, 999, 999] })
-    expect(better).toMatchObject({ confirmed: true, exact: true, confidence: null, se: 0 })
-    const same = judge({ ...base, current: [1000, 1000, 1000], candidate: [1000, 1000, 1000] })
-    expect(same.confirmed).toBe(false)
-    expect(judge({ ...base, neutral: true, current: [1000, 1000, 1000], candidate: [1000, 1000, 1000] }).confirmed).toBe(true)
-    expect(judge({ ...base, neutral: true, current: [1000, 1000, 1000], candidate: [1001, 1001, 1001] }).confirmed).toBe(false)
-  })
-
-  test("zero spread from ties in a coarse metric is NOT treated as exact", () => {
-    // MAD is 0 on both sides although the samples differ (integer milliseconds).
-    const v = judge({ ...base, current: [100, 100, 100, 101, 99], candidate: [100, 100, 100, 99, 99.9] })
-    expect(v.exact).toBe(false)
-    expect(v.confirmed).toBe(false) // falls back to minImprovement: 0 % < 1 %
-  })
-
-  test("fewer than 3 samples: the paired gain must reach minImprovement", () => {
-    expect(judge({ ...base, current: [100], candidate: [98] }).confirmed).toBe(true)
-    expect(judge({ ...base, current: [100], candidate: [99.5] }).confirmed).toBe(false)
-    const v = judge({ ...base, current: [100, 101], candidate: [90, 91] })
-    expect(v).toMatchObject({ confirmed: true, se: null, confidence: null })
-  })
-
-  test("simplification: not worse beyond the noise AND not worse by more than minImprovement", () => {
-    const current = [100, 101, 99, 100.5, 99.5]
-    expect(judge({ ...base, neutral: true, current, candidate: [100.2, 101.1, 99.3, 100.4, 99.8] }).confirmed).toBe(true)
-    expect(judge({ ...base, neutral: true, current, candidate: [110, 111, 109, 110.5, 109.5] }).confirmed).toBe(false)
-    // A noisy benchmark: 3 % slower is "within the noise", and used to pass as a simplification.
-    const noisy = judge({ ...base, neutral: true, current: [100, 110, 90, 105, 95], candidate: [103, 113, 93, 108, 98] })
-    expect(noisy.confidence!).toBeGreaterThan(-CONFIRM_AT)
-    expect(noisy.confirmed).toBe(false)
-    expect(noisy.reason).toContain("may not cost more than 1%")
-    expect(judge({ ...base, minImprovement: 0.05, neutral: true, current: [100, 110, 90, 105, 95], candidate: [103, 113, 93, 108, 98] }).confirmed).toBe(true)
-    // few samples: not worse by more than minImprovement
-    expect(judge({ ...base, neutral: true, current: [100], candidate: [100.5] }).confirmed).toBe(true)
-    expect(judge({ ...base, neutral: true, current: [100], candidate: [102] }).confirmed).toBe(false)
-  })
-
-  test("a zero current value doesn't produce NaN", () => {
-    const v = judge({ ...base, current: [0], candidate: [0] })
-    expect(v.relGain).toBe(0)
-    expect(v.confirmed).toBe(false)
-  })
-})
-
-// The procedure the tools apply, simulated with the real judge(), as docs/design.md asks:
-// experiments that change NOTHING, uniform ±2 % noise, a keep proposed whenever the first
-// measurement looks better than current's logged samples, then HEAD / candidate / HEAD
-// measured fresh and judged. Every no-op counts in the denominator, proposed or not.
-//
-// Two versions of "current's logged samples":
-// - fresh: an unbiased measurement of the same code (the state after a baseline or a real
-//   keep). This is the rate that decides the threshold: it's what a session's first no-ops see.
-// - ratchet: after a false keep its (lucky) samples become the logged current, so later
-//   no-ops rarely even pass the first look. Over a long run of no-ops the rate drops far
-//   below the fresh one; it's reported, but nothing relies on it.
-describe("judge: simulation of the paired confirmation", () => {
-  test("halfRuns: equal halves around the candidate, at least 3 each once repeat ≥ 3", () => {
-    expect([1, 2, 3, 4, 5, 6, 7, 10].map(halfRuns)).toEqual([1, 1, 3, 3, 3, 3, 4, 5])
-  })
-
-  function simulate(opts: { repeat: number; effect: number; confirmAt: number; trials: number; seed: number; ratchet?: boolean }) {
-    let seed = opts.seed
-    const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0), seed / 2 ** 32)
-    const draw = (mean: number, n: number) => Array.from({ length: n }, () => mean * (1 + 0.02 * (2 * rnd() - 1)))
-    const half = halfRuns(opts.repeat)
-    const candidateMean = 100 * (1 - opts.effect)
-    let kept = 0
-    let logged = draw(100, opts.repeat)
-    for (let i = 0; i < opts.trials; i++) {
-      if (!opts.ratchet) logged = draw(100, opts.repeat)
-      const first = median(draw(candidateMean, opts.repeat))
-      if (!(first < median(logged))) continue // the pre-filter: the agent logs a discard
-      const headBefore = draw(100, half)
-      const candidate = draw(candidateMean, opts.repeat)
-      const headAfter = draw(100, half)
-      const v = judge({ current: [...headBefore, ...headAfter], candidate, direction: "lower", minImprovement: 0.01, confirmAt: opts.confirmAt })
-      if (!v.confirmed) continue
-      kept++
-      if (opts.ratchet) logged = candidate
-    }
-    return kept / opts.trials
-  }
-  const noop = { effect: 0, trials: 400_000, seed: 42 }
-
-  test("no-ops, repeat 5: 2 standard errors lets through more than 3 %, so the threshold is 2.5", () => {
-    // Measured (400 000 no-ops, standard error of the estimate ≈ 0.03 points): 4.9 % at 2, 3.2 % at 2.5.
-    const at2 = simulate({ ...noop, repeat: 5, confirmAt: 2 })
-    const at25 = simulate({ ...noop, repeat: 5, confirmAt: CONFIRM_AT })
-    expect(at2).toBeGreaterThan(0.045)
-    expect(at2).toBeLessThan(0.053)
-    expect(at2).toBeGreaterThan(0.03) // the design's condition for raising the threshold
-    expect(at25).toBeGreaterThan(0.029)
-    expect(at25).toBeLessThan(0.036)
-  })
-
-  test("no-ops, other repeat counts (measured: repeat 3 ≈ 4.2 %, repeat 10 ≈ 1.7 %)", () => {
-    // Repeat 3 judges on 6 + 3 samples; the candidate's spread estimate is rough there.
-    expect(simulate({ ...noop, repeat: 3, confirmAt: CONFIRM_AT })).toBeLessThan(0.05)
-    expect(simulate({ ...noop, repeat: 10, confirmAt: CONFIRM_AT })).toBeLessThan(0.025)
-  })
-
-  test("no-ops in a row with the ratchet: far fewer (measured ≈ 0.05 % per no-op)", () => {
-    expect(simulate({ ...noop, repeat: 5, confirmAt: CONFIRM_AT, ratchet: true })).toBeLessThan(0.003)
-  })
-
-  test("a real 5 % gain, repeat 5: practically always confirmed (measured: 100 %); a 2 % gain about half the time (≈ 48 %)", () => {
-    expect(simulate({ repeat: 5, effect: 0.05, confirmAt: CONFIRM_AT, trials: 100_000, seed: 7 })).toBeGreaterThan(0.999)
-    const small = simulate({ repeat: 5, effect: 0.02, confirmAt: CONFIRM_AT, trials: 100_000, seed: 7 })
-    expect(small).toBeGreaterThan(0.4)
-    expect(small).toBeLessThan(0.56)
   })
 })
 

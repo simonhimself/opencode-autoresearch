@@ -27,14 +27,20 @@ set -euo pipefail
 #     trunk, then delete the experiment branch)
 #   - the end state is always the experiment branch's HEAD; a `final_tree` in groups.json is
 #     only compared with it (a stale hash used to let later commits slip past the union check)
-#   - each created branch is measured on its own in a temporary worktree, next to the
-#     merge-base, and the numbers are appended to the branch's commit message
+#   - each created branch is measured on its own in a temporary worktree, against the
+#     merge-base in a second worktree, in alternating pairs (one merge-base run and one
+#     branch run back to back). The median pair difference goes into the branch's commit
+#     message, and only when an exact one-sided Wilcoxon signed-rank test finds it
+#     significant; otherwise the message says "no measurable change". (Measuring the
+#     merge-base once and then the branches one after another reported machine drift as a
+#     result: "-2.2%" for a branch that only removed dead code.)
 
 # autoresearch-finalize: creates independent branches from an autoresearch session
 #
-# Usage: finalize.sh [--no-measure] [--timeout <seconds>] <groups.json>
+# Usage: finalize.sh [--no-measure] [--pairs <n>] [--timeout <seconds>] <groups.json>
 #
 #   --no-measure        don't measure the branches (only create and verify them)
+#   --pairs <n>         pairs of (merge-base run, branch run) per branch (default 8, 5 to 100)
 #   --timeout <seconds> limit for one run of measure.sh or checks.sh (default 600)
 #
 # groups.json format:
@@ -82,9 +88,15 @@ MEASURE=true
 MEASURE_SKIP_REASON=""
 MEASURED=false
 MEASURE_TIMEOUT=600
+# Pairs of (merge-base run, branch run) per branch. Below 5 the exact test can't reach
+# p <= 0.05 at all (4 pairs: 1/16 at best), so every branch would read "no measurable change".
+PAIRS=8
+MIN_PAIRS=5
+MAX_PAIRS=100
+# One-sided p-value at or below which a difference is reported as better / worse.
+SIGNIFICANT=0.05
 METRIC_NAME=""
 DIRECTION="lower"
-REPEAT=5
 HAS_CHECKS=0
 WT_ROOT=""
 
@@ -362,7 +374,7 @@ preflight() {
     echo "  Session:    $SESSION_DIR"
   fi
   if [ "$MEASURE" = true ]; then
-    echo "  Measuring:  each branch alone, $REPEAT run(s) of ${SESSION_PREFIX}.auto/measure.sh, ${MEASURE_TIMEOUT}s limit per run"
+    echo "  Measuring:  each branch alone, $PAIRS pairs of (merge-base run, branch run) of ${SESSION_PREFIX}.auto/measure.sh, ${MEASURE_TIMEOUT}s limit per run"
   else
     echo "  Measuring:  skipped ($MEASURE_SKIP_REASON)"
   fi
@@ -465,17 +477,14 @@ for (const line of fs.readFileSync(logFile, 'utf-8').split('\n')) {
   } catch (e) { /* a damaged line is not a reason to stop */ }
 }
 if (config && typeof config.metric_name === 'string' && /^[\w.\-]+$/.test(config.metric_name)) {
-  const repeat = Number.isInteger(config.repeat) && config.repeat >= 1 && config.repeat <= 50 ? config.repeat : 5;
   fs.writeFileSync(outDir + '/metric_name', config.metric_name);
   fs.writeFileSync(outDir + '/direction', config.direction === 'higher' ? 'higher' : 'lower');
-  fs.writeFileSync(outDir + '/repeat', String(repeat));
 }
 CONFIG_JS
   node "$DATA_DIR/config.js" "$auto/log.jsonl" "$DATA_DIR" 2>/dev/null || true
   if [ -s "$DATA_DIR/metric_name" ]; then
     METRIC_NAME=$(cat "$DATA_DIR/metric_name")
     DIRECTION=$(cat "$DATA_DIR/direction")
-    REPEAT=$(cat "$DATA_DIR/repeat")
   fi
 }
 
@@ -661,19 +670,37 @@ verify_branches() {
 # Measure each branch on its own
 # ---------------------------------------------------------------------------
 
-# The runner: runs .auto/measure.sh `repeat` times in one checkout, takes the
-# median of `METRIC <name>=<number>` (same parsing as the plugin), then runs
-# .auto/checks.sh. Each run is its own process group, so a timeout (or Ctrl-C)
-# kills the script and everything it started. macOS has no `timeout` command.
+# The runner. Two modes:
+#
+#   probe <base>            one run of .auto/measure.sh in the merge-base worktree (does it
+#                           work in a clean checkout at all? also its warm-up), then
+#                           .auto/checks.sh there.
+#   pairs <base> <branch>   one warm-up run in the branch worktree (not counted; a branch
+#                           that fails alone is found here), then N pairs of one
+#                           merge-base run and one branch run back to back, the order
+#                           alternating inside the pairs (base-branch, branch-base, ...),
+#                           so drift and load bursts hit both sides alike. Then checks.sh
+#                           in the branch worktree.
+#
+# A pair's result is the relative difference of its two runs, positive = the branch is
+# better. Reported: the median of those, and an exact one-sided Wilcoxon signed-rank
+# p-value in each direction (same idea as the plugin's keep decision; implemented here
+# because this script runs on its own).
+#
+# `METRIC <name>=<number>` is parsed as the plugin does. Each run is its own process
+# group, so a timeout (or Ctrl-C) kills the script and everything it started. macOS has
+# no `timeout` command. Stops at the first failed run: a hanging measure.sh costs one
+# timeout, not one per pair.
 write_measure_runner() {
   cat > "$DATA_DIR/measure.js" <<'MEASURE_JS'
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const [cwd, metric, repeatArg, timeoutArg, outDir, hasChecks, baseArg, direction] = process.argv.slice(2);
-const repeat = Number(repeatArg);
+const [mode, baseDir, branchDir, metric, pairsArg, timeoutArg, outDir, hasChecks, direction, alphaArg] = process.argv.slice(2);
+const pairCount = Number(pairsArg);
 const timeoutMs = Number(timeoutArg) * 1000;
+const alpha = Number(alphaArg);
 const put = (name, value) => fs.writeFileSync(path.join(outDir, name), String(value));
 
 let group = null; // pid of the running script = id of its process group
@@ -700,7 +727,7 @@ function readTail(file) {
 
 // Output goes straight to a file, and we wait for the script's exit, not for
 // its pipes to close: a background process it leaves behind can't hang us.
-function run(script) {
+function run(cwd, script) {
   return new Promise((resolve) => {
     const logFile = path.join(outDir, 'output.log');
     const relative = './.auto/' + script;
@@ -760,44 +787,139 @@ function format(x) {
 const lastLines = (text) => text.split('\n').filter((l) => l.trim()).slice(-12).join('\n');
 const why = (r) => (r.signal ? 'killed by ' + r.signal : 'exit ' + r.code);
 
-(async () => {
-  const samples = [];
-  for (let i = 0; i < repeat; i++) {
-    const r = await run('measure.sh');
-    let status = null;
-    if (r.timedOut) status = 'timeout';
-    else if (r.code !== 0) status = 'failed';
-    else if (parseMetrics(r.output)[metric] === undefined) status = 'no_metric';
-    if (status) {
-      put('detail', why(r));
-      put('tail', lastLines(r.output));
-      put('status', status);
-      return;
+// One run of measure.sh: { value } or { status, detail, tail }.
+async function measure(cwd) {
+  const r = await run(cwd, 'measure.sh');
+  let status = null;
+  if (r.timedOut) status = 'timeout';
+  else if (r.code !== 0) status = 'failed';
+  else if (parseMetrics(r.output)[metric] === undefined) status = 'no_metric';
+  if (status) return { status, detail: why(r), tail: lastLines(r.output) };
+  return { value: parseMetrics(r.output)[metric] };
+}
+function putFailure(f, status) {
+  put('detail', f.detail);
+  put('tail', f.tail);
+  put('status', status || f.status);
+}
+async function checks(cwd) {
+  if (hasChecks !== '1') return;
+  const r = await run(cwd, 'checks.sh');
+  put('checks', r.timedOut ? 'timeout' : r.code === 0 ? 'passed' : 'failed');
+  put('checks_detail', why(r));
+  if (r.timedOut || r.code !== 0) put('checks_tail', lastLines(r.output));
+}
+
+// How much better the branch run is than the merge-base run next to it, as a
+// fraction of the merge-base run. A merge-base value of 0 has no relative
+// difference: equal = 0, otherwise only the direction is known (±Infinity, which
+// still ranks; the median then has no percentage).
+function pairDifference(base, branch) {
+  const better = direction === 'higher' ? branch - base : base - branch;
+  if (better === 0) return 0;
+  if (base === 0) return better > 0 ? Infinity : -Infinity;
+  return better / Math.abs(base);
+}
+
+// Exact one-sided Wilcoxon signed-rank test on the pair differences.
+// Returns P(a result at least this favourable | no real difference) for
+// "positive" (the branch is better) when sign = +1, for "negative" when -1.
+//
+// Conservative with ties and zeros: all pairs are ranked by |difference| with
+// midranks for ties, a zero difference keeps its (lowest) ranks and counts
+// AGAINST the direction tested, and the null distribution is computed for
+// exactly these ranks (each rank falls on either side with probability 1/2).
+// So a zero can only raise the p-value, and ties don't make it too small.
+function signedRankP(differences, sign) {
+  const n = differences.length;
+  if (!n) return 1;
+  const order = differences.map((d, i) => ({ a: Math.abs(d), i })).sort((x, y) => x.a - y.a);
+  const rank2 = new Array(n); // doubled midranks, so they are integers
+  for (let start = 0; start < n; ) {
+    let end = start;
+    while (end + 1 < n && order[end + 1].a === order[start].a) end++;
+    for (let k = start; k <= end; k++) rank2[order[k].i] = start + end + 2; // 2 × mean of ranks start+1 … end+1
+    start = end + 1;
+  }
+  let observed = 0, total = 0;
+  for (let i = 0; i < n; i++) {
+    total += rank2[i];
+    if (differences[i] * sign > 0) observed += rank2[i];
+  }
+  // Distribution of the sum of the ranks on the tested side.
+  let dist = new Float64Array(total + 1);
+  dist[0] = 1;
+  for (let i = 0; i < n; i++) {
+    const next = new Float64Array(total + 1);
+    for (let w = 0; w <= total; w++) {
+      if (!dist[w]) continue;
+      next[w] += dist[w] / 2;
+      next[w + rank2[i]] += dist[w] / 2;
     }
-    samples.push(parseMetrics(r.output)[metric]);
+    dist = next;
   }
-  const value = median(samples);
-  put('raw', value);
-  put('median', format(value));
-  if (baseArg !== '') {
-    const base = Number(baseArg);
-    if (base !== 0) {
-      let pct = (((value - base) / Math.abs(base)) * 100).toFixed(1);
-      if (Number(pct) === 0) pct = '0.0';
-      else if (Number(pct) > 0) pct = '+' + pct;
-      put('pct', pct + '%');
-    }
-    const better = direction === 'lower' ? value < base : value > base;
-    put('verdict', value === base ? 'same' : better ? 'better' : 'worse');
-  }
-  if (hasChecks === '1') {
-    const r = await run('checks.sh');
-    put('checks', r.timedOut ? 'timeout' : r.code === 0 ? 'passed' : 'failed');
-    put('checks_detail', why(r));
-    if (r.timedOut || r.code !== 0) put('checks_tail', lastLines(r.output));
-  }
+  let p = 0;
+  for (let w = observed; w <= total; w++) p += dist[w];
+  return Math.min(1, p);
+}
+const pText = (p) => (p < 0.001 ? 'p < 0.001' : 'p = ' + (p >= 0.1 ? p.toFixed(2) : p.toFixed(3)));
+function percent(fraction) {
+  const pct = Math.abs(fraction) * 100;
+  return (pct >= 0.1 ? pct.toFixed(1) : String(Number(pct.toPrecision(2)))) + ' %';
+}
+
+async function probe() {
+  const m = await measure(baseDir);
+  if (m.status) return putFailure(m);
+  put('median', format(m.value));
+  await checks(baseDir);
   put('status', 'ok');
-})().catch((e) => {
+}
+
+async function pairs() {
+  // Warm-up of the branch worktree; the merge-base had its own in the probe.
+  const warm = await measure(branchDir);
+  if (warm.status) return putFailure(warm);
+
+  const rows = [];
+  for (let i = 0; i < pairCount; i++) {
+    const order = i % 2 === 0 ? ['base', 'branch'] : ['branch', 'base'];
+    const got = {};
+    for (const side of order) {
+      const m = await measure(side === 'base' ? baseDir : branchDir);
+      // The merge-base worked in the probe, so its failure here says nothing about the branch.
+      if (m.status) return putFailure(m, side === 'base' ? 'base_failed' : m.status);
+      got[side] = m.value;
+    }
+    rows.push([got.base, got.branch]);
+  }
+  const differences = rows.map(([base, branch]) => pairDifference(base, branch));
+  fs.writeFileSync(path.join(outDir, 'pairs.tsv'),
+    rows.map((r, i) => [r[0], r[1], differences[i]].join('\t')).join('\n') + '\n');
+
+  const middle = median(differences); // NaN only for +Infinity next to -Infinity
+  const pBetter = signedRankP(differences, 1);
+  const pWorse = signedRankP(differences, -1);
+  // A difference is reported only when the test finds it AND the median points the same way.
+  let verdict = 'none';
+  if (pBetter <= alpha && middle > 0) verdict = 'better';
+  else if (pWorse <= alpha && middle < 0) verdict = 'worse';
+  put('verdict', verdict);
+  put('pairs', rows.length);
+  put('p_better', pBetter);
+  put('p_worse', pWorse);
+  if (verdict !== 'none') {
+    put('p', pText(verdict === 'better' ? pBetter : pWorse));
+    put('pct', Number.isFinite(middle) ? percent(middle) : '');
+  }
+  put('median', format(median(rows.map((r) => r[1]))));
+  put('base_median', format(median(rows.map((r) => r[0]))));
+
+  await checks(branchDir);
+  put('status', 'ok');
+}
+
+(mode === 'probe' ? probe() : pairs()).catch((e) => {
   put('detail', String(e && e.message));
   put('status', 'error');
 });
@@ -809,16 +931,13 @@ result() { cat "$DATA_DIR/$1/$2" 2>/dev/null || true; }
 # "exit 1", "timed out after 600 s", ... for a result dir whose status isn't ok.
 failure_reason() {
   case "$(result "$1" status)" in
-    failed)    result "$1" detail;;
-    timeout)   echo "timed out after ${MEASURE_TIMEOUT} s";;
-    no_metric) echo "no METRIC ${METRIC_NAME}=<number> line in the output";;
-    worktree)  echo "git could not create a temporary worktree";;
-    *)         echo "the measuring step broke: $(result "$1" detail)";;
+    failed)      result "$1" detail;;
+    timeout)     echo "timed out after ${MEASURE_TIMEOUT} s";;
+    no_metric)   echo "no METRIC ${METRIC_NAME}=<number> line in the output";;
+    worktree)    echo "git could not create a temporary worktree";;
+    base_failed) echo "a run on the $TRUNK merge-base failed between the branch's runs: $(result "$1" detail)";;
+    *)           echo "the measuring step broke: $(result "$1" detail)";;
   esac
-}
-
-runs_label() {
-  if [ "$REPEAT" = "1" ]; then echo "1 run"; else echo "median of $REPEAT"; fi
 }
 
 # Check <ref> out into the temporary worktree <wt>, detached. The user's own
@@ -838,20 +957,42 @@ remove_worktree() {
 }
 
 # Put the session's current measure.sh / checks.sh at the same relative path
-# inside the worktree and run them from the session path. Never fails: the
-# outcome is in $DATA_DIR/<out>/status.
-run_measure() {
-  local wt="$1" out="$2" base_raw="$3"
-  local session_path="$wt/${SESSION_PREFIX}"
-  if mkdir -p "$session_path.auto" \
+# inside the worktree, so they run from the session path.
+prepare_worktree() {
+  local session_path="$1/${SESSION_PREFIX}"
+  mkdir -p "$session_path.auto" \
     && cp -p "$DATA_DIR/measure.sh" "$session_path.auto/measure.sh" \
-    && { [ "$HAS_CHECKS" != "1" ] || cp -p "$DATA_DIR/checks.sh" "$session_path.auto/checks.sh"; }; then
-    node "$DATA_DIR/measure.js" "$session_path" "$METRIC_NAME" "$REPEAT" "$MEASURE_TIMEOUT" \
-      "$DATA_DIR/$out" "$HAS_CHECKS" "$base_raw" "$DIRECTION" || true
+    && { [ "$HAS_CHECKS" != "1" ] || cp -p "$DATA_DIR/checks.sh" "$session_path.auto/checks.sh"; }
+}
+
+# run_measure probe <out> <base worktree>
+# run_measure pairs <out> <base worktree> <branch worktree>
+# Never fails: the outcome is in $DATA_DIR/<out>/status.
+run_measure() {
+  local mode="$1" out="$2" base_wt="$3" branch_wt="${4:-}"
+  local target="$base_wt" branch_path=""
+  if [ "$mode" = "pairs" ]; then
+    target="$branch_wt"
+    branch_path="$branch_wt/${SESSION_PREFIX}"
+  fi
+  if prepare_worktree "$target"; then
+    node "$DATA_DIR/measure.js" "$mode" "$base_wt/${SESSION_PREFIX}" "$branch_path" "$METRIC_NAME" "$PAIRS" \
+      "$MEASURE_TIMEOUT" "$DATA_DIR/$out" "$HAS_CHECKS" "$DIRECTION" "$SIGNIFICANT" || true
   else
     echo "could not copy measure.sh into the worktree" > "$DATA_DIR/$out/detail"
   fi
   [ -s "$DATA_DIR/$out/status" ] || echo "error" > "$DATA_DIR/$out/status"
+}
+
+# "4.1 % better (p = 0.004)" / "no measurable change" for a measured branch.
+verdict_text() {
+  local out="$1" pct
+  case "$(result "$out" verdict)" in
+    better|worse)
+      pct=$(result "$out" pct)
+      echo "${pct:+$pct }$(result "$out" verdict) ($(result "$out" p))";;
+    *) echo "no measurable change";;
+  esac
 }
 
 # Write the lines that go under a branch's commit message to <out>/trailer.
@@ -873,7 +1014,7 @@ write_trailer() {
     echo "Measured alone: FAILED ($(failure_reason "$out")) — this branch may depend on another one, or needs a longer --timeout" > "$file"
     return 0
   fi
-  # Our own tooling broke, which says nothing about the branch.
+  # Our own tooling broke, or the merge-base did, which says nothing about the branch.
   case "$status" in
     failed|no_metric|ok) ;;
     *) echo "Measured alone: could not be measured ($(failure_reason "$out"))" > "$file"; return 0;;
@@ -883,11 +1024,15 @@ write_trailer() {
     return 0
   fi
 
-  local pct line
-  pct=$(result "$out" pct)
-  line="Measured alone ($(runs_label)): $METRIC_NAME $(result "$out" median) vs $(result m.base median) on $TRUNK merge-base"
-  [ -z "$pct" ] || line="$line ($pct)"
-  echo "$line" > "$file"
+  # A percentage only when the paired test finds the difference; noise is not a result.
+  local pairs
+  pairs=$(result "$out" pairs)
+  case "$(result "$out" verdict)" in
+    better|worse)
+      echo "Measured alone, $pairs pairs against the $TRUNK merge-base: $METRIC_NAME $(verdict_text "$out")" > "$file";;
+    *)
+      echo "Measured alone: no measurable change against the $TRUNK merge-base ($pairs pairs)" > "$file";;
+  esac
 
   case "$(result "$out" checks)" in
     passed) echo "Checks: passed" >> "$file";;
@@ -939,7 +1084,8 @@ measure_branches() {
   echo ""
   info "═══ Measuring each branch on its own ═══"
   echo ""
-  echo "  ${SESSION_PREFIX}.auto/measure.sh, $REPEAT run(s) per checkout, ${MEASURE_TIMEOUT}s limit per run."
+  echo "  ${SESSION_PREFIX}.auto/measure.sh, ${MEASURE_TIMEOUT}s limit per run. Per branch: $PAIRS pairs of one merge-base run"
+  echo "  and one branch run back to back (order alternating), so drift hits both alike."
   echo "  Each checkout is a clean temporary worktree: only committed files are there."
   echo ""
 
@@ -953,14 +1099,15 @@ measure_branches() {
   write_measure_runner
   MEASURED=true
 
-  local wt="$WT_ROOT/wt-base"
-  echo "  merge-base ($TRUNK) ..."
-  if add_worktree "$wt" "$BASE" m.base; then
-    run_measure "$wt" m.base ""
+  # The merge-base worktree stays for the whole step: every branch's pairs run in it.
+  # (Removed by cleanup_worktrees at the end and on every other exit path.)
+  local base_wt="$WT_ROOT/wt-base" wt
+  echo "  merge-base ($TRUNK): one run to see that it works in a clean checkout ..."
+  if add_worktree "$base_wt" "$BASE" m.base; then
+    run_measure probe m.base "$base_wt"
   fi
-  remove_worktree "$wt"
   if [ "$(result m.base status)" = "ok" ]; then
-    echo "    $METRIC_NAME $(result m.base median)"
+    echo "    ok ($METRIC_NAME $(result m.base median))"
   else
     warn "  The merge-base could not be measured ($(failure_reason m.base)), so the branches aren't measured either."
   fi
@@ -974,7 +1121,7 @@ measure_branches() {
     echo "  $branch ..."
     if add_worktree "$wt" "$branch" "$out"; then
       if [ "$(result m.base status)" = "ok" ]; then
-        run_measure "$wt" "$out" "$(result m.base raw)"
+        run_measure pairs "$out" "$base_wt" "$wt"
       else
         echo "base" > "$DATA_DIR/$out/status"
       fi
@@ -1003,13 +1150,14 @@ print_measurements() {
     return 0
   fi
 
-  echo "Measured alone ($METRIC_NAME, $(runs_label), $DIRECTION is better; clean checkout of each branch):"
+  echo "Measured alone ($METRIC_NAME, $DIRECTION is better). Each branch against the $TRUNK merge-base in $PAIRS pairs"
+  echo "of runs back to back, clean checkouts. Shown: the median difference of the pairs, and only"
+  echo "when an exact signed-rank test finds it (one-sided p <= $SIGNIFICANT); otherwise \"no measurable change\"."
   echo ""
   local base_status
   base_status=$(result m.base status)
   if [ "$base_status" = "ok" ]; then
-    printf '  %-44s %-12s %-9s %-7s %s\n' "$TRUNK merge-base" "$(result m.base median)" "" "" \
-      "$(checks_cell m.base)"
+    printf '  %-44s %-28s %s\n' "$TRUNK merge-base" "reference" "$(checks_cell m.base)"
   else
     printf '  %-44s %s\n' "$TRUNK merge-base" "FAILED ($(failure_reason m.base))"
   fi
@@ -1023,8 +1171,7 @@ print_measurements() {
     if [ "$base_status" != "ok" ]; then
       printf '  %-44s %s\n' "${branch#autoresearch/${GOAL}/}" "not measured"
     elif [ "$status" = "ok" ]; then
-      printf '  %-44s %-12s %-9s %-7s %s\n' "${branch#autoresearch/${GOAL}/}" "$(result "$out" median)" \
-        "$(result "$out" pct)" "$(result "$out" verdict)" "$(checks_cell "$out")"
+      printf '  %-44s %-28s %s\n' "${branch#autoresearch/${GOAL}/}" "$(verdict_text "$out")" "$(checks_cell "$out")"
       case "$(result "$out" checks)" in passed|"") ;; *) [ "$(result m.base checks)" != "passed" ] || alone="$alone $out";; esac
     elif [ "$status" = "failed" ] || [ "$status" = "timeout" ] || [ "$status" = "no_metric" ]; then
       printf '  %-44s %s\n' "${branch#autoresearch/${GOAL}/}" "DOESN'T WORK ON ITS OWN ($(failure_reason "$out"))"
@@ -1146,7 +1293,7 @@ print_summary() {
 # ---------------------------------------------------------------------------
 
 usage() {
-  echo "Usage: $0 [--no-measure] [--timeout <seconds>] <groups.json>"
+  echo "Usage: $0 [--no-measure] [--pairs <n>] [--timeout <seconds>] <groups.json>"
   exit 1
 }
 
@@ -1159,6 +1306,10 @@ main() {
         [ $# -ge 2 ] || usage
         MEASURE_TIMEOUT="$2"; shift;;
       --timeout=*) MEASURE_TIMEOUT="${1#--timeout=}";;
+      --pairs)
+        [ $# -ge 2 ] || usage
+        PAIRS="$2"; shift;;
+      --pairs=*) PAIRS="${1#--pairs=}";;
       -h|--help) usage;;
       -*) echo "Unknown option: $1" >&2; usage;;
       *)
@@ -1171,6 +1322,14 @@ main() {
   case "$MEASURE_TIMEOUT" in
     ""|*[!0-9]*|0*) echo "--timeout needs a whole number of seconds, 1 or more." >&2; exit 1;;
   esac
+  # Length first, so the comparison below never sees a number bash can't hold.
+  case "$PAIRS" in
+    ""|*[!0-9]*|0*|????*) PAIRS="invalid";;
+  esac
+  if [ "$PAIRS" = "invalid" ] || [ "$PAIRS" -lt "$MIN_PAIRS" ] || [ "$PAIRS" -gt "$MAX_PAIRS" ]; then
+    echo "--pairs needs a whole number from $MIN_PAIRS to $MAX_PAIRS. With fewer than $MIN_PAIRS pairs the test can never find a difference; use --no-measure to skip measuring." >&2
+    exit 1
+  fi
 
   # Ctrl-C and kill go through the EXIT trap, so temp worktrees are removed and
   # the workspace is restored there too.

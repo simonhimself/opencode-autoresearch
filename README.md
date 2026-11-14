@@ -10,10 +10,10 @@ An OpenCode v2 plugin. The idea and parts of the skills come from [pi-autoresear
 
 Benchmarks give slightly different numbers on every run. An agent that keeps "whatever looked better" collects lucky runs and reports them as progress. So here **the agent proposes and the plugin decides**:
 
-- **Every keep is re-measured, side by side.** When the agent proposes a keep, the plugin measures the current state, then the candidate, then the current state again, back to back. Machine speed changes within minutes, so numbers taken at different times are never compared. A gain that doesn't clearly beat the noise is reverted and logged as "not confirmed".
+- **Every keep is re-measured in pairs.** When the agent proposes a keep, the plugin measures the current state and the candidate in alternating pairs, back to back, so machine slowdowns hit both sides of a pair alike. Numbers taken at different times are never compared. An exact statistical test on the pairs decides: a change that does nothing is kept less than 1 % of the time. A gain that doesn't pass is reverted and logged as "not confirmed".
 - **The measured code is the committed code.** The plugin fingerprints the files when it measures. If anything changed before the keep, it refuses.
 - **The benchmark is locked.** `.auto/measure.sh`, `.auto/checks.sh` and any helper files next to them are fingerprinted per *segment*. Changing them means starting a new segment with a new baseline, which shows in the log and the dashboard. The agent can't swap in another command or type in a number.
-- **Final numbers are measured again.** At the end, each branch is measured on its own, next to your main branch, and those numbers go into the commit message.
+- **Final numbers are measured again.** At the end, each branch is measured on its own in pairs against your main branch, and the result goes into the commit message ("4.1 % better", or "no measurable change").
 
 ## Install
 
@@ -57,7 +57,7 @@ It stops by itself, and tells you why, when:
 - 3 turns pass without an experiment
 - someone switched branches or committed underneath it
 
-You stop it with `/autoresearch off` (or `stop`, `pause`) or the stop button. If the model provider fails, it retries three times (after 30 s, 2 min, 5 min) before pausing.
+You stop it with `/autoresearch off` (or `stop`, `pause`) or the stop button. If the model provider fails, OpenCode first retries by itself (in a live test, a usage-limit pause resumed on its own hours later). If a turn still fails, the plugin retries three times (after 30 s, 2 min, 5 min) before pausing.
 
 To steer it mid-run, type a message ("try caching next", "don't touch the e2e folder"). It finishes the current experiment first.
 
@@ -67,7 +67,7 @@ To steer it mid-run, type a message ("try caching next", "don't touch the e2e fo
 /autoresearch dashboard
 ```
 
-A local page (127.0.0.1 only) showing the level relative to the baseline (built from confirmed gains only), each run with its sample spread, which keeps were confirmed and by how much, which were not confirmed, and the agent's notes. It updates live. `/autoresearch dashboard off` closes it. `/autoresearch status` gives a text summary in the chat.
+A local page (127.0.0.1 only) showing progress relative to the baseline (built from confirmed gains only), each keep with its measured pairs and the chance it is luck, which keeps were confirmed and by how much, which were not confirmed, and the agent's notes. It updates live. `/autoresearch dashboard off` closes it. `/autoresearch status` gives a text summary in the chat.
 
 ### 4. Finish
 
@@ -111,11 +111,20 @@ Only the setup commit contains `.auto/` files. Later changes to them stay uncomm
 |---|---|---|
 | `maxIterations` | 50 | Most logged runs in total, across segments. |
 | `maxNoImprovement` | 10 | Pause after this many runs in a row without a confirmed gain. |
-| `minImprovement` | 0.01 | Gain needed (1 %) when the benchmark runs fewer than 3 times per measurement. |
+| `minImprovement` | 0.01 | In slow mode (below), the gain a keep needs (1 %). |
 
 Invalid values are reported in `/autoresearch status` and the defaults apply.
 
-How often the benchmark runs per measurement (`repeat`, default 5) is fixed when a segment starts. A proposed keep therefore costs about `3 × repeat` benchmark runs in total (the first measurement, then the current state and the candidate side by side). For slow workloads the agent can choose a lower `repeat`; below 3 there is no noise estimate, a keep needs a gain of at least `minImprovement`, and false keeps are much more likely (roughly 1 in 10 for a change that does nothing). Use 3 or more whenever the workload allows.
+What a step costs, in benchmark runs:
+
+| | Standard (default) | Slow mode |
+|---|---|---|
+| First look at an experiment | 6 (3 pairs) | 2 (1 pair) |
+| Proposing a keep | 16 more (8 pairs), or 32 if the result is borderline | 2 × `repeat` more |
+
+Slow mode is for workloads where one run takes minutes: the agent sets `repeat` to 1 or 2 when the segment starts. It has no statistical guarantee: a keep needs every pair to be better and a median gain of at least `minImprovement`, and the plugin says so in its output.
+
+If the benchmark rebuilds the project on every run, that rebuild time can hide small gains (it can't cause a false keep). Build once in the setup and time only the workload.
 
 ## Long sessions
 
@@ -131,8 +140,9 @@ When a session nears the model's context limit, OpenCode replaces older conversa
 - **One loop per project.** Starting it in a second session turns it off in the first.
 - **Command answers cost a short model reply.** OpenCode's plugin API has no way to show text only to you.
 - **Known limits.**
-  - The confirmation makes a false keep unlikely, not impossible: in simulation about 3 % of proposed keeps that change nothing get through (at 2 % noise and 5 runs per measurement). Over a long session that can add up to one or two small false gains. The per-branch measurement at finalize is the final check.
-  - Progress is reported as the compounded gain of the confirmed keeps. The absolute baseline and current values are shown as measured at the time and aren't comparable with each other.
+  - The test caps false keeps at about 1 % of proposals (0.85 % exactly, 0.6–0.8 % in simulations with several kinds of noise). Over 50 proposals of changes that do nothing, that's still about a 1 in 3 chance of one small false gain. The per-branch measurement at finalize is the final check.
+  - On a machine with very erratic load (single runs randomly slowed by 10–40 %), small real gains are often missed: about 3 in 10 gains of 3 % get confirmed. Nothing false gets kept. A quieter machine or a longer benchmark run helps.
+  - Progress is reported as the combined result of the confirmed keeps (e.g. two 10 % speedups read "19 % lower than the baseline"). Simplification keeps count as no change. The absolute baseline and current values are shown as measured at the time and aren't comparable with each other.
   - No code can tell whether a benchmark represents real use. The setup skill lists what counts as cheating (shrinking the workload, special-casing its input, weakening tests), and benchmark changes are visible as new segments.
   - At finalize, branches are measured in a clean checkout. If the benchmark needs untracked files (installed dependencies, build output), the per-branch numbers read "could not be measured".
 

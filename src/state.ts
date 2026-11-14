@@ -1,10 +1,10 @@
 // Session state for autoresearch. Everything durable lives in `<cwd>/.auto/`,
 // so a fresh agent (or a new OpenCode session) can resume from files alone.
 //
-// This file also holds the pure rules: what "baseline" and "current" mean (summarize) and
-// when a candidate counts as better than HEAD (judge), and how progress is counted
-// (compoundedGain). They are pure on purpose: the
-// keep decision is the heart of the plugin and must be testable without git or OpenCode.
+// This file also holds the pure rules about the log: what "baseline" and "current" mean
+// (summarize), what one HEAD/candidate pair says (pairGain) and how progress is counted
+// (compoundedLevel). The keep decision itself is in stats.ts. All of it is pure on purpose:
+// it must be testable without git or OpenCode.
 
 import { appendFile, mkdir, readFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
@@ -24,8 +24,14 @@ export interface ConfigEntry {
   metric_name: string
   metric_unit: string
   direction: Direction
-  /** Benchmark runs per measurement, fixed for the segment (mixed counts aren't comparable). */
+  /**
+   * Fixed for the segment. It sets the mode: 3 or more = standard (keeps are decided by an
+   * exact test on HEAD/candidate pairs), 1–2 = slow (a few pairs, no statistical guarantee).
+   * Also the number of benchmark runs of the baseline measurement.
+   */
   repeat: number
+  /** Written when `repeat` < 3, so readers needn't know the rule. */
+  mode?: "slow"
   /** sha256 of .auto/measure.sh when the segment started. */
   measure_hash: string
   /** sha256 of .auto/checks.sh, or null when the segment has no checks. */
@@ -39,53 +45,72 @@ export interface ConfigEntry {
   timestamp: string
 }
 
+/** One HEAD run and one candidate run measured back to back: `[head, candidate]`. */
+export type Pair = [head: number, candidate: number]
+
 /** Written by autoresearch_log, one per measured experiment. */
 export interface RunEntry {
   type: "run"
   segment: number
   run: number
   status: RunStatus
-  /** Median of `samples`; null when the run produced no value (crash, missing METRIC line). */
+  /**
+   * Median of `samples`; null when the run produced no value (crash, missing METRIC line).
+   * An absolute number as measured at the time: comparable only with `vs` of the same entry.
+   */
   metric: number | null
   /** Secondary metrics as measured (medians), never typed in by the agent. */
   metrics: Record<string, number>
   /**
-   * The measured values. For a proposed keep (confirmed or not) these are the candidate's
-   * samples from the paired confirmation (the first measurement was selected for looking
-   * good, so it's biased); the baseline's are its only measurement.
+   * The candidate's measured values. Proposed keeps (confirmed or not): from the decision
+   * pairs. Other experiments: from the first look's pairs. Baseline: its only measurement.
    */
   samples: number[]
-  /**
-   * Proposed keeps only: HEAD's samples from the same paired confirmation, measured right
-   * before and right after the candidate. The decision compares `samples` with these and
-   * with nothing else: numbers logged at other times aren't comparable (machine speed drifts).
-   */
+  /** Proposed keeps only: HEAD's values from the decision pairs (same order as `samples`). */
   current_samples?: number[]
-  /** Spread (MAD) of `samples`; null with fewer than 3. */
-  noise: number | null
+  /**
+   * Proposed keeps only: the pairs the decision was made on, in measurement order. The
+   * order INSIDE a pair alternated (HEAD first in pairs 1, 3, …; the candidate first in
+   * pairs 2, 4, …), whatever the order of the two values here.
+   */
+  pairs?: Pair[]
+  /** The first look's pairs (autoresearch_run). Never part of a decision: the proposal was selected on them. */
+  look_pairs?: Pair[]
+  /**
+   * Proposed keeps only: the median relative difference of `pairs`, positive = better
+   * (0.05 = the candidate was 5 % better than HEAD measured next to it). Null when the
+   * candidate failed while being measured.
+   */
+  gain?: number | null
+  /**
+   * Proposed keeps only: exact one-sided p-value (Wilcoxon signed-rank on `pairs`) for
+   * "the candidate is better". Null in slow mode and when the candidate failed.
+   */
+  p?: number | null
+  /** Simplification proposals: the same test in the other direction ("the candidate is worse"). */
+  p_worse?: number | null
   description: string
   asi: Record<string, unknown>
   commit: string | null
-  /**
-   * gain / standard error of THIS proposed keep vs HEAD in its paired confirmation. Also
-   * recorded for keeps that weren't confirmed (logged as discard), for auditing. Null for
-   * other runs, for "exact" and when there's no noise estimate.
-   */
-  confidence: number | null
   /** The segment's first keep: the unchanged code, measured on a clean tree. */
   baseline?: true
-  /** A simplification kept at equal performance (not an improvement). */
+  /** A simplification kept at equal performance (not an improvement; no part of the progress). */
   neutral?: true
-  /** Median of the first (pre-confirmation) measurement, for keeps and unconfirmed keeps. */
+  /** Proposed keeps: the candidate's median in the first look. */
   first_metric?: number
   /**
-   * What this run was compared with. Proposed keeps: the median of `current_samples`.
-   * Other runs: current's logged metric (a rough reference from another time).
+   * What `metric` was measured next to: the median of HEAD's values in `pairs` (proposed
+   * keeps) or in `look_pairs` (other experiments).
    */
   vs?: number
-  /** E.g. "keep not confirmed: first 95, confirmed 101, current 100". */
+  /** E.g. "keep not confirmed: median 0.5% worse over 8 pairs (p = 0.63)". */
   note?: string
   timestamp: string
+  // Entries written before v0.2.2 (still read, no longer written):
+  /** v0.2.0–v0.2.1: gain / standard error of the keep. */
+  confidence?: number | null
+  /** v0.2.0–v0.2.1: spread (MAD) of `samples`. */
+  noise?: number | null
 }
 
 export type LogEntry = ConfigEntry | RunEntry
@@ -137,9 +162,6 @@ export function currentSegment(entries: LogEntry[]) {
 
 export const countRuns = (entries: LogEntry[]) => entries.filter((e) => e.type === "run").length
 
-export const isBetter = (a: number, b: number, direction: Direction) =>
-  direction === "lower" ? a < b : a > b
-
 /** The last keep of a segment: the run that describes HEAD, which every candidate is compared with. */
 export function currentRun<R extends Pick<RunEntry, "status">>(runs: R[]): R | undefined {
   for (let i = runs.length - 1; i >= 0; i--) if (runs[i].status === "keep") return runs[i]
@@ -164,50 +186,114 @@ export function summarize(runs: Pick<RunEntry, "status" | "metric">[], _directio
 export const keptRuns = <R extends Pick<RunEntry, "status" | "baseline">>(runs: R[]) =>
   runs.filter((r) => r.status === "keep" && !r.baseline)
 
+const signedGain = (candidate: number, current: number, direction: Direction) =>
+  direction === "lower" ? current - candidate : candidate - current
+const relative = (gain: number, base: number) =>
+  base !== 0 ? gain / Math.abs(base) : gain === 0 ? 0 : gain > 0 ? Infinity : -Infinity
+
+/** Relative gain of `value` over `reference` in the given direction; positive = better. */
+export function relativeGain(value: number, reference: number, direction: Direction): number {
+  return relative(signedGain(value, reference, direction), reference)
+}
+
+/** One pair's result: how much better the candidate run was than the HEAD run next to it. */
+export const pairGain = ([head, candidate]: Pair, direction: Direction) => relativeGain(candidate, head, direction)
+
+/** The median of the pairs' results: the `gain` of a look or of a decision. */
+export const medianPairGain = (pairs: Pair[], direction: Direction) => median(pairs.map((p) => pairGain(p, direction)))
+
+const isPairList = (v: unknown): v is Pair[] =>
+  Array.isArray(v) && v.length > 0 && v.every((p) => Array.isArray(p) && p.length === 2 && p.every((x) => typeof x === "number"))
+
 /**
- * How much better the code got over a segment: the compounded gain of its confirmed keeps.
- *
- * Each keep was decided by measuring candidate and HEAD back to back, and that ratio
- * (`metric` / `vs`) is the only trustworthy number about it. `current / baseline` is not:
- * the two were measured at different times, and the same code measured 13 % apart within
- * minutes on a busy machine. So progress = the product of the keeps' ratios.
- *
- * All non-baseline keeps count, simplifications too (their ratio is near 1). Keeps without
- * a usable ratio (no `vs`, a zero or a sign change) are left out and counted in `skipped`.
- * `gain` is relative and positive when better: 0.1 = "10 % better" in the segment's direction.
+ * A keep's ratio r = candidate / HEAD, from its own pairs; undefined when it carries no
+ * usable number. `gain` is the relative pair difference, positive = better, so for a
+ * lower-is-better metric r = 1 - gain (gain IS the reduction) and for a higher-is-better
+ * one r = 1 + gain. Keeps written before v0.2.2 have no `gain`: r = `metric` / `vs`.
  */
-export function compoundedGain(runs: Pick<RunEntry, "status" | "baseline" | "metric" | "vs">[], direction: Direction) {
-  let ratio = 1
+export function keepRatio(run: Pick<RunEntry, "metric" | "vs" | "gain" | "pairs">, direction: Direction): number | undefined {
+  const gain = typeof run.gain === "number" ? run.gain : isPairList(run.pairs) ? medianPairGain(run.pairs, direction) : undefined
+  const r =
+    gain !== undefined
+      ? direction === "lower"
+        ? 1 - gain
+        : 1 + gain
+      : typeof run.metric === "number" && typeof run.vs === "number" && run.vs !== 0
+        ? run.metric / run.vs
+        : NaN
+  return Number.isFinite(r) && r > 0 ? r : undefined
+}
+
+/**
+ * Where the code stands against the baseline of its segment: the compounded level.
+ *
+ * Each keep was decided on HEAD/candidate pairs measured back to back, and its ratio
+ * r = candidate / HEAD (keepRatio) is the only trustworthy number about it.
+ * `current / baseline` is not: the two were measured at different times, and the same code
+ * measured 13 % apart within minutes on a busy machine. So level = product of r over the
+ * keeps, with the baseline = 1 (docs/design.md, and the same rule as in compaction.ts and
+ * the dashboard, so all three show one number). The level is in the metric's own terms:
+ * two 10 % reductions give 0.81 ("19 % lower"), two 10 % increases 1.21 ("21 % higher").
+ * (Multiplying 1 + gain instead overstated lower-is-better metrics: 21 % for 100 -> 81.)
+ *
+ * - The baseline isn't a change. A simplification keep (`neutral`) counts as no change: it
+ *   was kept for being simpler, and its measured difference is noise that would otherwise
+ *   pile up in the product.
+ * - Keeps without a usable number are left out and counted in `skipped`.
+ */
+export function compoundedLevel(
+  runs: Pick<RunEntry, "status" | "baseline" | "neutral" | "metric" | "vs" | "gain" | "pairs">[],
+  direction: Direction,
+) {
+  let level = 1
   let keeps = 0
   let skipped = 0
+  let simplifications = 0
   for (const run of keptRuns(runs)) {
-    const r = typeof run.metric === "number" && typeof run.vs === "number" && run.vs !== 0 ? run.metric / run.vs : NaN
-    if (!Number.isFinite(r) || r <= 0) {
+    if (run.neutral) {
+      simplifications++
+      continue
+    }
+    const r = keepRatio(run, direction)
+    if (r === undefined) {
       skipped++
       continue
     }
-    ratio *= r
+    level *= r
     keeps++
   }
-  return { ratio, gain: direction === "lower" ? 1 - ratio : ratio - 1, keeps, skipped }
+  return { level, keeps, skipped, simplifications }
+}
+
+/** "12.4%", "0.04%": one decimal, more only when that would read as zero. Takes a fraction. */
+const percentText = (fraction: number) => {
+  const pct = Math.abs(fraction) * 100
+  return `${pct >= 0.1 ? pct.toFixed(1) : String(Number(pct.toPrecision(2)))}%`
 }
 
 /**
  * A relative gain in words. The one way improvements are worded everywhere: "+69.9%" next
  * to "(-69.9%)" for the same result (gain vs change of a lower-is-better metric) confused
  * both the agent and the user. Never a sign, always "better" or "worse".
+ * For ONE comparison (a pair, a look, a keep against HEAD): "better" is the reduction of a
+ * lower-is-better metric (1 - r) or the increase of a higher-is-better one (r - 1).
  */
 export function gainText(rel: number): string {
   if (!Number.isFinite(rel)) return rel > 0 ? "better (from zero)" : "worse (from zero)"
   if (rel === 0) return "no change"
-  const pct = Math.abs(rel) * 100
-  const digits = pct >= 0.1 ? pct.toFixed(1) : String(Number(pct.toPrecision(2)))
-  return `${digits}% ${rel > 0 ? "better" : "worse"}`
+  return `${percentText(rel)} ${rel > 0 ? "better" : "worse"}`
 }
 
-/** Relative gain of `value` over `reference` in the given direction; positive = better. */
-export function relativeGain(value: number, reference: number, direction: Direction): number {
-  return relative(signedGain(value, reference, direction), reference)
+/**
+ * A compounded level in words, in the metric's own direction: "19.0% lower than the
+ * baseline" (level 0.81), "21.0% higher than the baseline" (1.21). A level on the wrong
+ * side for the direction (the keeps net out worse) gets "(worse)".
+ */
+export function levelText(level: number, direction: Direction): string {
+  if (Math.abs(level - 1) < 5e-7) return "no change from the baseline"
+  const lower = level < 1
+  const worse = lower !== (direction === "lower")
+  return `${percentText(level - 1)} ${lower ? "lower" : "higher"} than the baseline${worse ? " (worse)" : ""}`
 }
 
 export interface SegmentSummary {
@@ -219,10 +305,16 @@ export interface SegmentSummary {
   /** Absolute values as measured at the time; not comparable with each other. */
   baseline: number | null
   current: number | null
-  /** compoundedGain() of the segment. */
-  gain: number
-  /** Keeps left out of `gain` because they have no usable ratio. */
+  /** compoundedLevel() of the segment: 1 = the baseline, 0.81 = 19 % lower, 1.21 = 21 % higher. */
+  level: number
+  /** Keeps that went into `level`. */
+  gains: number
+  /** Kept simplifications: counted in `kept`, no part of `level`. */
+  simplifications: number
+  /** Keeps left out of `level` because they carry no usable number. */
   skipped: number
+  /** The last kept experiment (never the baseline), for "last keep: … (p = …)". */
+  lastKeep: RunEntry | undefined
 }
 
 /** One summary per segment, oldest first: what `/autoresearch status` shows for the whole session. */
@@ -232,15 +324,10 @@ export function segmentSummaries(entries: LogEntry[]): SegmentSummary[] {
     .map((config) => {
       const runs = entries.filter((e): e is RunEntry => e.type === "run" && e.segment === config.segment)
       const { baseline, current } = summarize(runs)
-      const { gain, skipped } = compoundedGain(runs, config.direction)
-      return { config, runs: runs.length, kept: keptRuns(runs).length, baseline, current, gain, skipped }
+      const { level, keeps, skipped, simplifications } = compoundedLevel(runs, config.direction)
+      const kept = keptRuns(runs)
+      return { config, runs: runs.length, kept: kept.length, baseline, current, level, gains: keeps, simplifications, skipped, lastKeep: kept.at(-1) }
     })
-}
-
-/** A run's samples as a list (entries written before v0.2 stored only a count). */
-export function sampleList(run: Pick<RunEntry, "samples" | "metric">): number[] {
-  if (Array.isArray(run.samples)) return run.samples.filter((v) => typeof v === "number")
-  return typeof run.metric === "number" ? [run.metric] : []
 }
 
 /**
@@ -280,191 +367,10 @@ export function median(values: number[]): number {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
 }
 
-/** MAD (median absolute deviation): a spread estimate that one outlier can't skew. */
-export function mad(values: number[]): number {
-  const center = median(values)
-  return median(values.map((v) => Math.abs(v - center)))
-}
-
-// ── judge ─────────────────────────────────────────────────
-
-/**
- * Benchmark runs on HEAD before the candidate's runs of a paired confirmation, and again
- * after them. Equal halves, so HEAD's runs sit symmetrically around the candidate's and a
- * steady drift of the machine's speed cancels. At least 3 per half once repeat ≥ 3: every
- * swap gives the changed files new timestamps, so the first run after it often pays for a
- * rebuild or cold caches; with 2 + 2 half of HEAD's samples would be such runs and the
- * median would land between "cold" and "warm" (a real 10 % gain then read as 14 %).
- */
-export const halfRuns = (repeat: number) => (repeat >= 3 ? Math.max(3, Math.ceil(repeat / 2)) : Math.ceil(repeat / 2))
-
-/** Benchmark runs a proposed keep costs on top of the first measurement. */
-export const confirmationRuns = (repeat: number) => 2 * halfRuns(repeat) + repeat
-
-export interface JudgeInput {
-  /** HEAD's samples from the paired confirmation (measured right before and after the candidate). */
-  current: number[]
-  /** The candidate's samples from the same paired confirmation. */
-  candidate: number[]
-  direction: Direction
-  /** Relative gain needed when there's no noise estimate (settings.minImprovement). */
-  minImprovement: number
-  /** A simplification: "not worse" is enough. */
-  neutral?: boolean
-  /** Standard errors a gain must clear. Only the simulation test sets it; the tools use CONFIRM_AT. */
-  confirmAt?: number
-}
-
-export interface Verdict {
-  confirmed: boolean
-  /** Improvement of the candidate median over the current median; positive = better. */
-  gain: number
-  /** `gain` relative to the current median. */
-  relGain: number
-  /** Standard error of the difference of medians; null without a noise estimate. */
-  se: number | null
-  /** gain / se; null when the metric is exact or the noise is unknown. */
-  confidence: number | null
-  /** True when both sides repeat one identical value (a deterministic metric such as a file size). */
-  exact: boolean
-  /** A sentence the tool shows the agent. */
-  reason: string
-}
-
-/** MAD → standard deviation for normal data. */
-const MAD_TO_SIGMA = 1.4826
-/** The median of n samples has about 1.2533 × sigma / sqrt(n) standard error. */
-const MEDIAN_SE = 1.2533
-/**
- * Standard errors a gain must clear. The design's rule: 2, unless a simulation of the
- * paired procedure (no-op experiments, uniform ±2 % noise, repeat 5, a keep proposed
- * whenever the first measurement looks better) gives more than 3 % false keeps per no-op;
- * then 2.5. It gives 4.9 % at 2 and 3.2 % at 2.5 (state.test.ts runs it), so: 2.5.
- * (The spread is estimated from only 5–6 samples per side, which is why "2 standard
- * errors" lets through more than the 2.3 % a known spread would.)
- */
-export const CONFIRM_AT = 2.5
-
-const signedGain = (candidate: number, current: number, direction: Direction) =>
-  direction === "lower" ? current - candidate : candidate - current
-const relative = (gain: number, base: number) =>
-  base !== 0 ? gain / Math.abs(base) : gain === 0 ? 0 : gain > 0 ? Infinity : -Infinity
-const num = (n: number) => (Number.isInteger(n) || String(n).length <= 12 ? String(n) : String(Number(n.toPrecision(8))))
-const percent = (fraction: number) => `${(fraction * 100).toFixed(2).replace(/\.?0+$/, "")}%`
-
-/**
- * Is the candidate better than HEAD (or, for a simplification, not worse)?
- *
- * Both sample sets must come from one paired confirmation: HEAD and the candidate measured
- * back to back, HEAD before and after. Samples logged at another time must never be passed
- * in: the machine's speed drifts by more than most gains within minutes, which rejected
- * sound changes and let no-ops through. The first measurement (the one that made the agent
- * propose the keep) plays no part here either; it was selected for looking good.
- *
- * Confidence is per keep: this candidate against the state before it, never cumulative,
- * so one real win can't make later noise look significant.
- *
- * - With ≥ 3 samples on both sides the noise is estimated from the samples themselves and
- *   the gain must clear CONFIRM_AT standard errors.
- * - Without a noise estimate (repeat 1–2), or when the estimate is zero although the
- *   samples differ (a coarse metric with ties), the gain must reach `minImprovement`.
- * - A simplification must not be worse beyond the noise AND not worse by more than
- *   `minImprovement`: with a noisy benchmark "within the noise" alone would wave through
- *   a real slowdown of several percent.
- */
-export function judge(input: JudgeInput): Verdict {
-  const { current, candidate, direction, minImprovement, neutral = false, confirmAt = CONFIRM_AT } = input
-  if (!current.length || !candidate.length) {
-    return { confirmed: false, gain: 0, relGain: 0, se: null, confidence: null, exact: false, reason: "No samples to compare." }
-  }
-  const cur = median(current)
-  const cand = median(candidate)
-  const gain = signedGain(cand, cur, direction)
-  const relGain = relative(gain, cur)
-  const numbers = `candidate ${num(cand)} vs HEAD ${num(cur)}, measured back to back: ${gainText(relGain)}`
-  const base = { gain, relGain }
-  const tolerance = percent(minImprovement)
-
-  if (current.length >= 3 && candidate.length >= 3) {
-    const sigma = MAD_TO_SIGMA * median([mad(current), mad(candidate)])
-    const se = MEDIAN_SE * sigma * Math.sqrt(1 / current.length + 1 / candidate.length)
-    const identical = (xs: number[]) => xs.every((x) => x === xs[0])
-
-    if (se === 0 && identical(current) && identical(candidate)) {
-      const confirmed = neutral ? gain >= 0 : gain > 0
-      return {
-        ...base,
-        confirmed,
-        se: 0,
-        confidence: null,
-        exact: true,
-        reason: confirmed
-          ? neutral && gain === 0
-            ? `Confirmed: the metric is exact and unchanged (${numbers}).`
-            : `Confirmed: the metric is exact and better (${numbers}).`
-          : `Not confirmed: the metric is exact and ${gain === 0 ? "unchanged" : "worse"} (${numbers}).`,
-      }
-    }
-    if (se > 0) {
-      const confidence = gain / se
-      const errors = `${Math.abs(confidence).toFixed(1)} standard errors ${confidence >= 0 ? "above" : "below"} HEAD`
-      if (neutral) {
-        const withinNoise = confidence >= -confirmAt
-        const withinTolerance = relGain >= -minImprovement
-        const confirmed = withinNoise && withinTolerance
-        return {
-          ...base,
-          confirmed,
-          se,
-          confidence,
-          exact: false,
-          reason: confirmed
-            ? `Confirmed as a simplification: not worse than HEAD beyond the noise or by more than ${tolerance} (${numbers}).`
-            : !withinNoise
-              ? `Not confirmed: worse than HEAD beyond the noise (${numbers}, ${errors}).`
-              : `Not confirmed: a simplification may not cost more than ${tolerance} (${numbers}).`,
-        }
-      }
-      const confirmed = confidence >= confirmAt
-      return {
-        ...base,
-        confirmed,
-        se,
-        confidence,
-        exact: false,
-        reason: confirmed
-          ? `Confirmed: ${numbers}, ${errors} (a keep needs ${confirmAt}).`
-          : `Not confirmed: ${numbers}, ${errors}; a keep needs ${confirmAt} above. ` +
-            (gain > 0 ? "The gain doesn't stand out from the noise." : "The first measurement was a lucky draw, or the machine was faster then."),
-      }
-    }
-    // se === 0 but the samples differ: fall through to the fixed threshold.
-  }
-
-  if (neutral) {
-    const confirmed = relGain >= -minImprovement
-    return {
-      ...base,
-      confirmed,
-      se: null,
-      confidence: null,
-      exact: false,
-      reason: confirmed
-        ? `Confirmed as a simplification: not worse than HEAD by more than ${tolerance} (${numbers}).`
-        : `Not confirmed: worse than HEAD by more than ${tolerance} (${numbers}).`,
-    }
-  }
-  const confirmed = relGain >= minImprovement
-  return {
-    ...base,
-    confirmed,
-    se: null,
-    confidence: null,
-    exact: false,
-    reason: confirmed
-      ? `Confirmed: at least ${tolerance} better (${numbers}). No noise estimate with fewer than 3 usable samples.`
-      : `Not confirmed: without a noise estimate a keep needs at least ${tolerance} (${numbers}).`,
-  }
+/** "p = 0.004", "p = 0.21", "p < 0.001": the same wording as in compaction.ts. */
+export function pText(p: number): string {
+  if (p < 0.001) return "p < 0.001"
+  return `p = ${p >= 0.1 ? p.toFixed(2) : p.toFixed(3)}`
 }
 
 // ── Settings ──────────────────────────────────────────────
@@ -475,8 +381,8 @@ export interface Settings {
   /** Pause after this many runs in a row without a (non-baseline) keep. */
   maxNoImprovement: number
   /**
-   * Relative gain needed when there are fewer than 3 samples, and the most a
-   * simplification may cost.
+   * Relative gain a keep needs in slow mode (`repeat` 1–2), and the most a simplification
+   * may cost in any mode.
    */
   minImprovement: number
   /** Problems found in .auto/config.json; shown to the user instead of silently ignored. */

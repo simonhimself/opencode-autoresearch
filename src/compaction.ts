@@ -16,11 +16,12 @@
 // (old entries lack the newer fields; a hand-edited log can hold anything), so it has
 // no dependency on state.ts.
 //
-// Numbers (v0.2.1): machine speed drifts within minutes, so absolute values logged at
-// different times are NOT comparable. Progress is therefore the compounded gain of the
-// kept runs, each one's candidate against HEAD measured right alongside it (`samples`
-// vs `current_samples`), never current / baseline. dashboard.html uses the same rule;
-// keep the two in step (see "Paired results" below).
+// Numbers: machine speed drifts within minutes, so absolute values logged at different
+// times are NOT comparable. Progress is therefore the compounded level of the confirmed
+// keeps, each one's candidate against HEAD measured right alongside it, never
+// current / baseline. Since v0.2.2 a keep carries `gain` (the median relative difference
+// of its HEAD/candidate pairs) and `p` (exact one-sided test); those are what is shown.
+// dashboard.html uses the same rules; keep the two in step (see "Paired results" below).
 
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
@@ -41,9 +42,18 @@ const USER_NOTES_HEADING = "## What the user said in this session"
 const SETUP_GOAL = /Set up and start an autoresearch session\.\s*Goal:([\s\S]*)/
 
 // Budgets. Every piece of the fixed sections is capped, which is what makes the cap hold:
-// fixed sections stay under ~14k, prompt + ideas under ~16.5k, the rest goes to runs.
+// fixed sections stay under ~17k (notes at their reduced total), prompt + ideas under
+// ~16.5k, the rest goes to runs.
 const MAX_USER_NOTES = 10
-const MAX_USER_NOTE_CHARS = 600
+/** One note (the goal given at the start is one too). Was 600 before v0.2.2: long goals were cut mid-sentence. */
+const MAX_USER_NOTE_CHARS = 1_500
+/**
+ * All notes together, applied only when the summary is short of room (see NOTE_AND_FILE_BUDGETS):
+ * then the oldest notes go first, the newest always stays.
+ */
+const MAX_USER_NOTES_CHARS = 8_000
+/** Full-length notes are kept only while at least this many of the newest runs still fit. */
+const MIN_RUNS_WITH_ALL_NOTES = 10
 const MAX_NAME_CHARS = 200
 const MAX_METRIC_NAME_CHARS = 80
 const MAX_UNIT_CHARS = 20
@@ -57,11 +67,17 @@ const MAX_ASI_CHARS = 600
 const MAX_RUN_LINE_CHARS = 1_400
 /** With many segments only the latest are listed, one line each. */
 const MAX_SEGMENT_LINES = 8
-/** prompt.md / ideas.md budgets, tried in order; the smaller ones are only a safety net. */
-const FILE_BUDGETS: [prompt: number, ideas: number][] = [
-  [12_000, 4_000],
-  [4_000, 1_000],
-  [0, 0],
+/**
+ * Budgets tried in order: all notes together, prompt.md, ideas.md, and how many of the
+ * newest runs must still fit for the try to count. First everything at full length; if
+ * that leaves too little room for runs, the oldest notes are dropped; the smaller file
+ * budgets are only a safety net.
+ */
+const BUDGETS: [notes: number, prompt: number, ideas: number, minRuns: number][] = [
+  [Infinity, 12_000, 4_000, MIN_RUNS_WITH_ALL_NOTES],
+  [MAX_USER_NOTES_CHARS, 12_000, 4_000, 1],
+  [MAX_USER_NOTES_CHARS, 4_000, 1_000, 1],
+  [MAX_USER_NOTES_CHARS, 0, 0, 1],
 ]
 
 export interface LiveState {
@@ -80,6 +96,8 @@ interface Config {
   unit: string
   direction: string
   repeat: number | null
+  /** No statistical check on keeps: `mode: "slow"`, or `repeat` below 3. */
+  slow: boolean
 }
 
 interface Run {
@@ -99,6 +117,12 @@ interface Run {
   currentSamples: number[] | null
   /** What the run was compared with: the median of `currentSamples` (v0.2.0: current's logged metric). */
   vs: number | null
+  /** v0.2.2: median relative difference of the decision pairs, positive = better. */
+  gain: number | null
+  /** v0.2.2: exact one-sided p-value of the decision pairs; null in slow mode. */
+  p: number | null
+  /** v0.2.2: the decision pairs, `[head, candidate]` in measurement order. */
+  pairs: [number, number][] | null
 }
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null)
@@ -108,6 +132,12 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 const numList = (v: unknown): number[] | null => {
   if (!Array.isArray(v)) return null
   const xs = v.filter((x): x is number => num(x) !== null)
+  return xs.length ? xs : null
+}
+/** A non-empty list of `[head, candidate]` pairs of finite numbers, or null. */
+const pairList = (v: unknown): [number, number][] | null => {
+  if (!Array.isArray(v)) return null
+  const xs = v.filter((x): x is [number, number] => Array.isArray(x) && x.length === 2 && num(x[0]) !== null && num(x[1]) !== null)
   return xs.length ? xs : null
 }
 function median(xs: number[]): number {
@@ -138,6 +168,7 @@ async function readLog(cwd: string): Promise<{ configs: Config[]; runs: Run[] }>
         unit: oneLine(str(p.metric_unit), MAX_UNIT_CHARS),
         direction: p.direction === "higher" ? "higher" : "lower",
         repeat: num(p.repeat),
+        slow: p.mode === "slow" || (num(p.repeat) !== null && num(p.repeat)! < 3),
       })
     } else if (p.type === "run") {
       runs.push({
@@ -154,6 +185,9 @@ async function readLog(cwd: string): Promise<{ configs: Config[]; runs: Run[] }>
         samples: numList(p.samples),
         currentSamples: numList(p.current_samples),
         vs: num(p.vs),
+        gain: num(p.gain),
+        p: num(p.p),
+        pairs: pairList(p.pairs),
       })
     }
     // Other entry types are ignored.
@@ -163,29 +197,52 @@ async function readLog(cwd: string): Promise<{ configs: Config[]; runs: Run[] }>
 
 // ── Paired results ───────────────────────────────────────
 //
-// The same rule as in dashboard.html (analyze()):
+// The same rules as in dashboard.html (analyze()).
+//
+// v0.2.2 entries (they carry `gain` or `pairs`):
+//   gain = `gain`: the median relative difference of the HEAD/candidate pairs measured
+//          back to back, positive = better (recomputed from `pairs` if the field is missing)
+// Older entries:
 //   candidate = the run's metric (else the median of its samples)
 //   reference = `vs`, else the median of `current_samples`, else (entries from before
 //               v0.2) the metric of the keep before it
-//   gain      = how much better the candidate is than the reference, as a fraction,
-//               positive = better in the segment's direction
-//   level     = product of candidate / reference over the segment's keeps, baseline excluded
-// A keep whose two values aren't both positive numbers counts as factor 1.
+//   gain      = how much better the candidate is than the reference, as a fraction
+//
+// A result is shown only for a decision that was completed: `gain` is a number (a keep
+// whose `gain` field is missing is recomputed from its pairs). A proposed keep that
+// crashed while it was being measured is logged as a discard with `gain: null` and the
+// pairs done so far: those pairs decided nothing, so no result is shown for it. Crashes
+// and checks_failed never show one.
+//
+// Level of a segment = product of r over its confirmed keeps, baseline = 1, where
+// r = candidate / reference: 1 − gain for a lower-is-better metric (gain is the reduction),
+// 1 + gain for a higher-is-better one; older keeps: candidate / reference as logged.
+// It is reported in the metric's own direction: "19.0 % lower than the baseline" for two
+// 10 % reductions (0.9 × 0.9 = 0.81), "21.0 % higher" for two 10 % increases. (The product
+// of 1 + gain said 21 % for both.) Same rule as compoundedLevel() in state.ts.
+// The baseline is not a change and a simplification keep (`neutral`) counts as no change:
+// it was kept for being simpler, and its measured difference is noise.
 
-/** Where a run's reference value comes from, best first. */
-type RefKind = "paired" | "logged" | "previous"
-const REF_LABEL: Record<RefKind, string> = {
+/** Where a run's comparison comes from, best first. */
+type RefKind = "pairs" | "paired" | "logged" | "previous"
+const REF_LABEL: Record<Exclude<RefKind, "pairs">, string> = {
   paired: "HEAD alongside",
   logged: "current as logged",
   previous: "the keep before",
 }
 
 interface Paired {
-  candidate: number
-  reference: number
   kind: RefKind
   /** Fraction better than the reference (negative = worse). */
   gain: number
+  /** candidate / reference: what the keep multiplies the segment's level by. */
+  ratio: number
+  /** Older entries only: the two medians the gain comes from. */
+  candidate?: number
+  reference?: number
+  /** v0.2.2: how many pairs decided, and the p-value (null in slow mode). */
+  pairs?: number
+  p?: number | null
 }
 
 interface SegmentStats {
@@ -197,24 +254,58 @@ interface SegmentStats {
   current: Run | null
   /** Keeps without the baseline. */
   kept: number
-  /** Product of candidate / reference over those keeps (1 = unchanged). */
+  /** Of those, simplification keeps: they count as no change. */
+  simplifications: number
+  /** Compounded level after the other keeps: 1 = the baseline, 0.81 = 19 % lower. */
   level: number
-  /** How many of them had a usable ratio. */
+  /** How many keeps went into `level`. */
   measured: number
-  /** How many of those were measured against HEAD alongside (v0.2.1 entries). */
+  /** How many of those were measured against HEAD alongside (v0.2.1 and later). */
   alongside: number
 }
 
 const usable = (n: number | null): n is number => n !== null && n > 0
 const gainOf = (ratio: number, direction: string) => (direction === "higher" ? ratio - 1 : 1 - ratio)
 const valueOf = (r: Run): number | null => r.metric ?? (r.samples ? median(r.samples) : null)
+/** One pair's result: how much better the candidate run was than the HEAD run next to it. */
+const pairGain = ([head, candidate]: [number, number], direction: string) =>
+  head !== 0 ? ((direction === "higher" ? candidate - head : head - candidate) / Math.abs(head)) : null
+
+/** A run's comparison, or undefined when it has none. `previous` = metric of the keep before it. */
+function pairedOf(r: Run, direction: string, previous: number | null): Paired | undefined {
+  if (r.gain !== null || r.pairs) {
+    let gain = r.gain
+    if (gain === null) {
+      // Pairs without a `gain`: a decision that never finished (a crash while the candidate
+      // was measured again). Only a keep, a completed decision, is recomputed from them.
+      if (r.status !== "keep") return undefined
+      const diffs = r.pairs!.map((p) => pairGain(p, direction)).filter((d): d is number => d !== null)
+      if (!diffs.length) return undefined
+      gain = median(diffs)
+    }
+    return { kind: "pairs", gain, ratio: direction === "higher" ? 1 + gain : 1 - gain, pairs: r.pairs?.length, p: r.p }
+  }
+  const candidate = valueOf(r)
+  const isKeep = r.status === "keep" && r.metric !== null
+  const [reference, kind]: [number | null, RefKind] = r.currentSamples
+    ? [r.vs ?? median(r.currentSamples), "paired"]
+    : r.vs !== null
+      ? [r.vs, "logged"]
+      : [isKeep ? previous : null, "previous"]
+  if (!usable(candidate) || !usable(reference)) return undefined
+  return { kind, gain: gainOf(candidate / reference, direction), ratio: candidate / reference, candidate, reference }
+}
 
 /** Segments in log order (a later config for the same id replaces the earlier one), and each run's paired result. */
 function analyze(configs: Config[], runs: Run[]): { segments: SegmentStats[]; paired: Map<Run, Paired> } {
   const byId = new Map<number, SegmentStats>()
   const stats = (segment: number) => {
     let s = byId.get(segment)
-    if (!s) byId.set(segment, (s = { segment, config: undefined, runs: [], baseline: null, current: null, kept: 0, level: 1, measured: 0, alongside: 0 }))
+    if (!s)
+      byId.set(
+        segment,
+        (s = { segment, config: undefined, runs: [], baseline: null, current: null, kept: 0, simplifications: 0, level: 1, measured: 0, alongside: 0 }),
+      )
     return s
   }
   for (const c of configs) {
@@ -233,25 +324,19 @@ function analyze(configs: Config[], runs: Run[]): { segments: SegmentStats[]; pa
     let previous: number | null = null // metric of the last keep seen so far
     for (const r of s.runs) {
       const isKeep = r.status === "keep" && r.metric !== null
-      if (r !== s.baseline && r.status !== "crash") {
-        const candidate = valueOf(r)
-        const reference: [number | null, RefKind] = r.currentSamples
-          ? [r.vs ?? median(r.currentSamples), "paired"]
-          : r.vs !== null
-            ? [r.vs, "logged"]
-            : [isKeep ? previous : null, "previous"]
-        if (usable(candidate) && usable(reference[0])) {
-          paired.set(r, { candidate, reference: reference[0], kind: reference[1], gain: gainOf(candidate / reference[0], direction) })
-        }
+      if (r !== s.baseline && r.status !== "crash" && r.status !== "checks_failed") {
+        const p = pairedOf(r, direction, previous)
+        if (p) paired.set(r, p)
       }
       if (isKeep) {
         if (r !== s.baseline) {
           s.kept++
           const p = paired.get(r)
-          if (p) {
-            s.level *= p.candidate / p.reference
+          if (r.neutral) s.simplifications++
+          else if (p && Number.isFinite(p.ratio) && p.ratio > 0) {
+            s.level *= p.ratio
             s.measured++
-            if (p.kind === "paired") s.alongside++
+            if (p.kind === "pairs" || p.kind === "paired") s.alongside++
           }
         }
         previous = r.metric
@@ -268,11 +353,29 @@ function betterWorse(gain: number): string {
   return `${pct >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))} % ${gain > 0 ? "better" : "worse"}`
 }
 
+/**
+ * A segment's level in words, in the metric's own direction: "19.0 % lower than the
+ * baseline" (level 0.81). On the wrong side for the direction it says "(worse)".
+ */
+function levelWords(level: number, direction: string): string {
+  const pct = Math.abs(level - 1) * 100
+  if (pct < 0.00005) return "no change from the baseline"
+  const lower = level < 1
+  const worse = lower !== (direction !== "higher")
+  return `${pct >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))} % ${lower ? "lower" : "higher"} than the baseline${worse ? " (worse)" : ""}`
+}
+
+/** "p = 0.004", "p = 0.21", "p < 0.001". */
+function pText(p: number): string {
+  if (p < 0.001) return "p < 0.001"
+  return `p = ${p >= 0.1 ? p.toFixed(2) : p.toFixed(3)}`
+}
+
 /** A segment's progress in words. */
 function improvement(s: SegmentStats): string {
   if (!s.kept) return "no kept change yet"
-  if (!s.measured) return "not known (the kept runs carry no comparison)"
-  return betterWorse(gainOf(s.level, s.config?.direction ?? "lower"))
+  if (!s.measured) return s.simplifications === s.kept ? "no gain (simplifications only)" : "not known (the kept runs carry no comparison)"
+  return levelWords(s.level, s.config?.direction ?? "lower")
 }
 
 // ── Summary ──────────────────────────────────────────────
@@ -285,7 +388,7 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
   const segmentRuns = segment?.runs ?? []
   const liveText = liveSection(live)
 
-  const before = [
+  const before = (notesMax: number) => [
     [
       SUMMARY_HEADER,
       "",
@@ -294,7 +397,7 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
     ].join("\n"),
     sessionSection(segment, segments, runs.length),
     liveText,
-    userSection(userMessages),
+    userSection(userMessages, notesMax),
     RULES_SECTION,
   ]
   const nextStep = nextStepSection(Boolean(liveText), Boolean(config), segmentRuns.length > 0)
@@ -303,15 +406,16 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
   // Decided from the whole log (configs too: right after a new init the old runs are the
   // only ones, and that's when their numbers stop being comparable), not from what fits.
   const multi = segments.length > 1
-  const runLines = runs.map((r) => runLine(r, multi, paired.get(r))).reverse() // newest first
+  const slow = new Map(segments.map((s) => [s.segment, s.config?.slow ?? false]))
+  const runLines = runs.map((r) => runLine(r, multi, paired.get(r), slow.get(r.segment) ?? false)).reverse() // newest first
 
   const promptRaw = await readAutoFile(cwd, "prompt.md")
   const ideasRaw = await readAutoFile(cwd, "ideas.md")
 
   let summary = ""
-  for (const [promptMax, ideasMax] of FILE_BUDGETS) {
+  for (const [notesMax, promptMax, ideasMax, minRuns] of BUDGETS) {
     const head = [
-      ...before,
+      ...before(notesMax),
       fileSection("Experiment rules", "prompt.md", promptRaw, promptMax),
       fileSection("Ideas backlog", "ideas.md", ideasRaw, ideasMax),
     ].filter(Boolean)
@@ -324,8 +428,8 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
       if (summary.length <= MAX_SUMMARY_CHARS || take === 0) break
       take--
     }
-    // Prefer smaller file budgets over a summary without its newest run.
-    if (summary.length <= MAX_SUMMARY_CHARS && (take > 0 || !runLines.length)) return summary
+    // Prefer fewer old notes and smaller file budgets over a summary without its newest runs.
+    if (summary.length <= MAX_SUMMARY_CHARS && take >= Math.min(minRuns, runLines.length)) return summary
   }
   if (summary.length <= MAX_SUMMARY_CHARS) return summary
   // Not reachable while every fixed piece is capped; kept so the cap holds no matter what.
@@ -345,7 +449,12 @@ function sessionSection(segment: SegmentStats | undefined, segments: SegmentStat
     `Metric: ${oneLine(config.metricName, MAX_METRIC_NAME_CHARS)} (${unit || "no unit"}), ${config.direction} is better`,
   ]
   if (config.repeat !== null)
-    lines.push(`Repeat: each measurement is the median of ${config.repeat} benchmark run(s), fixed for this segment`)
+    lines.push(
+      `Repeat: ${config.repeat}, fixed for this segment. ` +
+        (config.slow
+          ? "Slow mode: a keep is decided on a few HEAD/candidate pairs, with NO statistical check."
+          : "A keep is decided on HEAD/candidate pairs measured back to back, with an exact test."),
+    )
 
   const { baseline, current } = segment
   const at = (r: Run) => `${fmt(r.metric!)}${unit} (run #${r.run ?? "?"})`
@@ -356,15 +465,18 @@ function sessionSection(segment: SegmentStats | undefined, segments: SegmentStat
       !segment.kept
         ? "Improvement: none yet (no kept change since the baseline)."
         : !segment.measured
-          ? `Improvement: ${improvement(segment)}.`
-          : `Improvement: ${improvement(segment)} than the baseline. This is the compounded gain of the ${segment.kept} kept change(s), ` +
+          ? segment.simplifications === segment.kept
+            ? `Improvement: none measured. The ${segment.kept} kept change(s) are simplifications (no measurable loss); they count as no change.`
+            : `Improvement: ${improvement(segment)}.`
+          : `Improvement: ${improvement(segment)}. This is the compounded result of the ${segment.measured} confirmed keep(s) (not a ratio of raw numbers), ` +
             (segment.alongside === segment.measured
               ? "each measured against HEAD right alongside it."
-              : "each against its own reference (HEAD measured alongside it; older entries: the value logged before it)."),
+              : "each against its own reference (HEAD measured alongside it; older entries: the value logged before it).") +
+            (segment.simplifications ? ` ${segment.simplifications} simplification keep(s) count as no change.` : ""),
       current === baseline
         ? `Baseline: ${at(baseline)}, still current = HEAD. As measured at the time.`
         : `Baseline: ${at(baseline)} · current (the last keep = HEAD): ${at(current)}. Each as measured at the time.`,
-      "Values measured at different times aren't comparable (machine speed drifts), so don't compute progress from them.",
+      "Values measured at different times aren't comparable (machine speed drifts): never quote a ratio of them as progress.",
     )
   }
 
@@ -487,13 +599,21 @@ function carriedNotes(summary: string): string[] {
 }
 
 /** The user's own messages: steering like "focus on X" or "don't touch Y" must survive compaction. */
-function userSection(messages: string[]): string {
+function userSection(messages: string[], maxTotal: number): string {
   const all = messages
     .flatMap(userNotes)
     .map((m) => oneLine(m, MAX_USER_NOTE_CHARS))
     .filter(Boolean)
   // A note can arrive twice (the original message and a summary that carried it): keep the last.
-  const notes = all.filter((n, i) => all.lastIndexOf(n) === i).slice(-MAX_USER_NOTES)
+  const latest = all.filter((n, i) => all.lastIndexOf(n) === i).slice(-MAX_USER_NOTES)
+  // Within the total budget, newest first: what doesn't fit is the oldest. The newest always stays.
+  const notes: string[] = []
+  let used = 0
+  for (const n of latest.reverse()) {
+    if (notes.length && used + n.length > maxTotal) break
+    notes.unshift(n)
+    used += n.length
+  }
   if (!notes.length) return ""
   return [`${USER_NOTES_HEADING} (oldest first; later messages override earlier ones)`, "", ...notes.map((n) => `- ${n}`)].join(
     "\n",
@@ -505,8 +625,12 @@ const RULES_SECTION = [
   "",
   "- Tools: `autoresearch_init`, `autoresearch_run`, `autoresearch_log`, `autoresearch_pause` (in Code Mode: `tools.autoresearch.*`).",
   "- One experiment = edit, `autoresearch_run`, then `autoresearch_log` with `keep`, `discard`, `crash` or `checks_failed`.",
-  "- You propose a keep; the plugin decides. It re-measures HEAD and your candidate back to back and commits only if the gain is confirmed against that fresh HEAD measurement; otherwise it reverts and logs a discard.",
-  "- `simplification: true` is only for a change that removes more lines than it adds; it is kept when it isn't worse than HEAD.",
+  "- Every comparison is pair-wise: one HEAD run and one candidate run measured back to back, order alternating. `autoresearch_run` gives a rough first look from a few pairs.",
+  "- You propose a keep; the plugin decides. It measures fresh pairs and runs an exact paired test; it commits only when the gain is confirmed, otherwise it reverts and logs a discard.",
+  "- Proposing a keep costs benchmark time, but it can't produce a false result more than about 1 % of the time. So propose when the first look says better, and discard when it doesn't.",
+  "- Slow mode (`repeat` below 3) has no such guarantee: there a keep is decided on a few pairs without a statistical check. Say so when you report results.",
+  "- Progress is the compounded result of the confirmed keeps, each measured against HEAD alongside it, stated in the metric's own direction (\"N % lower than the baseline\", or \"higher\"). Never quote a ratio of absolute numbers: values measured at different times aren't comparable.",
+  "- `simplification: true` is only for a change that removes more lines than it adds; it is kept when it isn't measurably worse than HEAD, and counts as no change, never as a gain.",
   "- Every file under `.auto/` except `log.jsonl`, `ideas.md`, `config.json` and `prompt.md` is frozen for the segment (`measure.sh`, `checks.sh` and whatever they read). Changing one needs a commit and `autoresearch_init`, which starts a new segment with a new baseline.",
   "- Don't game the metric: no special-casing the benchmark's input, no skipping the work it measures, no weakening the checks.",
   "- Out of ideas, blocked, or need the user: call `autoresearch_pause` with the reason. No filler experiments.",
@@ -537,24 +661,40 @@ function headAndTail(content: string, max: number, file: string): string {
   return content.slice(0, headEnd).trimEnd() + marker + content.slice(tailStart).trimStart()
 }
 
-function runLine(r: Run, multi: boolean, paired: Paired | undefined): string {
+function runLine(r: Run, multi: boolean, paired: Paired | undefined, slow: boolean): string {
   const label = `${multi ? `s${r.segment}` : ""}#${r.run ?? "?"}`
-  // A crash's metric is a placeholder, not a measurement.
-  const value = r.status === "crash" || r.metric === null ? "—" : fmt(r.metric)
-  const head = [label, oneLine(r.status, 20), value]
-  // A keep the plugin re-measured and didn't confirm is logged as a discard with a note.
-  const unconfirmed = r.status === "discard" && Boolean(r.note.trim()) && paired?.kind === "paired"
-  // Only a result measured against a reference gets a comparison. A rejected run's single
-  // measurement is shown bare: set against a baseline from another time it misleads.
-  if (paired && (r.status === "keep" || unconfirmed)) {
-    head.push(`vs ${REF_LABEL[paired.kind]} ${fmt(paired.reference)}: ${betterWorse(paired.gain)}`)
-    if (r.confidence !== null) head[head.length - 1] += `, conf ${fmt(Number(r.confidence.toFixed(1)))}`
-  } else if (r.status === "keep" && r.confidence !== null) {
-    head.push(`conf ${fmt(Number(r.confidence.toFixed(1)))}`)
+  const head = [label, oneLine(r.status, 20)]
+  // A keep the plugin measured and didn't confirm is logged as a discard with a note.
+  const unconfirmed =
+    r.status === "discard" && Boolean(r.note.trim()) && (paired?.kind === "pairs" || paired?.kind === "paired")
+  if (paired?.kind === "pairs" && (r.status === "keep" || unconfirmed)) {
+    // v0.2.2: only the paired result is shown. The absolute values belong to the moment
+    // they were measured in and would only invite a ratio against another run's.
+    const n = paired.pairs ? `${paired.pairs} pair${paired.pairs === 1 ? "" : "s"}` : ""
+    // No p-value: slow mode, where a keep has no statistical check (say so on the line).
+    const test = paired.p != null ? pText(paired.p) : slow ? "slow mode: no statistical check" : "no p-value logged"
+    const how = `(${[n, test].filter(Boolean).join(", ")})`
+    if (unconfirmed) head.push(`${betterWorse(paired.gain)} than HEAD measured alongside, not confirmed ${how}`)
+    // Never worded as a gain: a simplification is kept for being simpler. No p-value either:
+    // its test asks "is it worse?", so the number doesn't read like the one on a gain.
+    else if (r.neutral) head.push(`kept as a simplification (no measurable loss)${n ? ` (${n})` : ""}`)
+    else head.push(`${betterWorse(paired.gain)} than HEAD measured alongside ${how}`)
+  } else {
+    // Entries from before v0.2.2, and every run that wasn't a (proposed) keep.
+    // A crash's metric is a placeholder, not a measurement.
+    head.push(r.status === "crash" || r.metric === null ? "—" : fmt(r.metric))
+    // Only a result measured against a reference gets a comparison. A rejected run's single
+    // measurement is shown bare: set against a baseline from another time it misleads.
+    if (paired && paired.kind !== "pairs" && (r.status === "keep" || unconfirmed)) {
+      head.push(`vs ${REF_LABEL[paired.kind]} ${fmt(paired.reference!)}: ${betterWorse(paired.gain)}`)
+      if (r.confidence !== null) head[head.length - 1] += `, conf ${fmt(Number(r.confidence.toFixed(1)))}`
+    } else if (r.status === "keep" && r.confidence !== null) {
+      head.push(`conf ${fmt(Number(r.confidence.toFixed(1)))}`)
+    }
+    if (r.neutral) head.push("[neutral]")
+    if (unconfirmed) head.push("[keep not confirmed]")
   }
-  if (r.baseline) head.push("[baseline]")
-  if (r.neutral) head.push("[neutral]")
-  if (unconfirmed) head.push("[keep not confirmed]")
+  if (r.baseline) head.splice(3, 0, "[baseline]")
   const parts = [
     head.join(" "),
     // e.g. a keep the plugin didn't confirm, logged as a discard.
@@ -584,7 +724,7 @@ function asiText(asi: Record<string, unknown>): string {
 }
 
 const RUNS_HEADING =
-  "## Runs (newest first; a keep shows candidate vs HEAD measured alongside it; other values are single measurements, not comparable over time)"
+  "## Runs (newest first; a keep shows its gain over HEAD measured alongside it, in pairs; bare values are single measurements, not comparable over time)"
 const runsFooter = (omitted: number) =>
   omitted > 0
     ? `${omitted} older run(s) left out to fit (the oldest were dropped first). All runs are in .auto/log.jsonl.`

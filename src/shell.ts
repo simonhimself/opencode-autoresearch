@@ -240,7 +240,7 @@ export const GIT_COMMIT = [
 export const GIT_RESTORE = [...NO_HOOKS, "restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE]
 export const GIT_CLEAN = [...NO_HOOKS, "clean", "-fd", ...SCOPE]
 /**
- * The swap of a paired confirmation (see swapScope). Two tree ids follow at run time, so
+ * The swap between the two runs of a HEAD/candidate pair (see swapScope). Two tree ids follow at run time, so
  * this prefix is what the permission prompt shows and what "always allow" can match.
  */
 export const GIT_SWAP = [...NO_HOOKS, "read-tree", "-m", "-u"]
@@ -350,8 +350,8 @@ async function withScopeIndex<T>(
 
 /**
  * Make the scope's files equal `target`, a tree that scopeTreeHash() produced earlier (the
- * candidate's fingerprint) or HEAD's tree. This is the swap of the paired confirmation:
- * candidate → HEAD → candidate → HEAD → candidate.
+ * candidate's fingerprint) or HEAD's tree. This is the swap inside every HEAD/candidate
+ * pair of a first look or a keep decision: candidate → HEAD → candidate → HEAD → … → candidate.
  *
  * How: a temporary index is filled with the files as they are now (tree A), then
  * `git read-tree -m -u A target` moves index and files from A to the target. That is the
@@ -371,7 +371,7 @@ async function withScopeIndex<T>(
  *
  * A swap never overwrites a file nobody told it about. The caller says where the files
  * are expected to be:
- * - `expect.exactly`: the files must hash to this tree (the steps of a confirmation: the
+ * - `expect.exactly`: the files must hash to this tree (the swaps between runs: the
  *   candidate before going to HEAD, HEAD before going back). An edit made meanwhile, by a
  *   parallel tool call or by the user, is refused instead of silently replaced.
  * - `expect.oneOf`: every path must equal its version in one of these trees or in the

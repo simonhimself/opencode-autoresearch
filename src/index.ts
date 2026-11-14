@@ -2,7 +2,8 @@
 // what doesn't, repeat. For OpenCode v2.
 //
 // Split of responsibilities:
-//   - experiment.ts = the tools (measure, judge, commit/revert); the plugin decides, the agent proposes
+//   - experiment.ts = the tools (measure, commit/revert); the plugin decides, the agent proposes
+//   - stats.ts      = the keep decision: an exact paired test on HEAD/candidate pairs
 //   - this file     = wiring into OpenCode: the /autoresearch command, loop on/off, keeping
 //                     the loop going across turns, provider errors and restarts
 //   - the skill     = how to set up a session for a specific goal (explains; enforces nothing)
@@ -21,6 +22,7 @@ import {
   initExperiment,
   limitReached,
   logExperiment,
+  modeText,
   pauseLoop,
   progressText,
   recoverInterruptedSwap,
@@ -28,24 +30,27 @@ import {
   runKey,
   type ActiveState,
   type Host,
-  type PendingRun,
+  type StoredRun,
   type ToolCtx,
 } from "./experiment.ts"
 import { timing } from "./timing.ts"
-import { currentBranch, fileHash, frozenInputs, git, headSha, isTrunk, scopeStatus, sessionBranches, tailLines } from "./shell.ts"
+import { currentBranch, fileHash, frozenInputs, git, headSha, isTrunk, scopeStatus, scopeTreeHash, sessionBranches, tailLines } from "./shell.ts"
 import {
   autoDir,
   checksPath,
-  confirmationRuns,
   countRuns,
   currentSegment,
+  gainText,
   measurePath,
+  medianPairGain,
   noImprovementStreak,
   promptPath,
+  pText,
   readLog,
   readSettings,
   segmentSummaries,
 } from "./state.ts"
+import { isSlow } from "./stats.ts"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
 const SKILL_ID = "autoresearch-create"
@@ -82,8 +87,9 @@ const ACTIVE_INSTRUCTION = [
   "During setup (until autoresearch_init has run) follow the autoresearch-create skill: create the branch, write and commit the session files.",
   "",
   "Rules once autoresearch_init has run:",
-  "- One experiment = change code, autoresearch_run, autoresearch_log. Don't edit files between run and log, or while autoresearch_log runs.",
-  "- The plugin decides keeps. When the measurement looks better, log `keep`: the plugin measures the last commit and your change back to back and commits only a confirmed gain; otherwise it reverts and logs a discard. Not better: log `discard`. A change that removes more lines than it adds, at about equal performance: `keep` with `simplification: true`.",
+  "- One experiment = change code, autoresearch_run, autoresearch_log. Don't edit files between run and log, or while either tool runs (both swap the project's files to the last commit and back).",
+  "- The plugin decides keeps. autoresearch_run gives a first look: a few back-to-back pairs of the last commit and your change. Looks better: log `keep`; the plugin measures fresh pairs, applies an exact paired test and commits only a confirmed gain, otherwise it reverts and logs a discard. Doesn't look better: log `discard`. A change that removes more lines than it adds, at about equal performance: `keep` with `simplification: true`.",
+  "- Report progress only with the sentence the tools give you (\"N% lower than the baseline, the compounded result of K confirmed keeps (not a ratio of raw numbers)\"; \"higher\" for a higher-is-better metric). Never quote a ratio or difference of absolute numbers measured at different times: they aren't comparable.",
   "- The benchmark is frozen: don't touch .auto/measure.sh, .auto/checks.sh or any helper file under .auto/ during experiments (only prompt.md, ideas.md and config.json may change). A legitimate change means: revert code changes, edit the file, commit that edit, call autoresearch_init (a new segment, visible to the user).",
   "- No cheating: don't shrink or special-case the workload, edit the benchmark to print better numbers, cache results between runs, remove or weaken tests or checks, or hard-code benchmark inputs.",
   "- Never commit, stash, reset, or switch branches yourself; the plugin does all git changes. The one exception: committing an edit of the benchmark files under .auto/ right before autoresearch_init.",
@@ -289,7 +295,7 @@ export default Plugin.define({
         name: "init",
         options: { namespace: "autoresearch" },
         description:
-          "Start a segment of comparable runs: name, primary metric, unit, direction and how often each measurement repeats. " +
+          "Start a segment of comparable runs: name, primary metric, unit, direction and the mode (`repeat`). " +
           "Freezes the benchmark (.auto/measure.sh, .auto/checks.sh and every helper file under .auto/ are hashed). Needs: the loop " +
           "on, a branch that isn't main/master, a clean working tree, an executable .auto/measure.sh, and measure.sh/checks.sh " +
           "committed. Call again only when the goal or the benchmark legitimately changes; that starts a new segment with a fresh baseline.",
@@ -305,13 +311,16 @@ export default Plugin.define({
               minimum: 1,
               maximum: 50,
               description:
-                "Benchmark runs per measurement, fixed for the segment (default 5). The median is used and the spread gives the noise. " +
-                "A proposed keep costs about twice as many runs again (the last commit and the change, back to back). " +
-                "Use 1–2 only when one run takes minutes; then a keep needs a fixed minimum gain instead.",
+                "Fixed for the segment (default 5). 3 or more = standard mode: every experiment gets a first look of 3 back-to-back pairs " +
+                "(the last commit and the change), and a proposed keep is decided on 8 fresh pairs (8 more if needed) by an exact paired test. " +
+                "1–2 = slow mode, only for benchmarks that take minutes: 1 pair to look, `repeat` pairs to decide, NO statistical check. " +
+                "Also the number of runs of the baseline measurement.",
             },
           },
           required: ["name", "metric_name", "direction"],
-          additionalProperties: false,
+          // true: OpenCode strips undeclared keys from a strict schema before the plugin sees
+          // them, so an agent passing `command` or `metric` was never told. The tool rejects them by name.
+          additionalProperties: true,
         },
         execute: (input, context) => initExperiment(host, input, context),
       })
@@ -320,16 +329,18 @@ export default Plugin.define({
         name: "run",
         options: { namespace: "autoresearch" },
         description:
-          "Measure the current code: runs ./.auto/measure.sh as often as the segment's `repeat` says, parses `METRIC name=value` " +
-          "lines, then runs ./.auto/checks.sh if it exists. Tells you how the result compares with current and what to log. " +
-          "Doesn't log; call autoresearch_log next, without changing files in between. Takes no command: the benchmark is fixed.",
+          "A first look at your change: measures a few back-to-back pairs of the last commit and your change with ./.auto/measure.sh " +
+          "(3 pairs = 6 benchmark runs; slow mode 1 pair; the plugin swaps the files itself and puts them back), then runs " +
+          "./.auto/checks.sh if it exists. Tells you whether it looks better and what to log. For the first run of a segment it " +
+          "measures the baseline instead (unchanged code). Doesn't log; call autoresearch_log next, without changing files in between. " +
+          "Takes no command: the benchmark is fixed.",
         input: {
           type: "object",
           properties: {
             timeout_seconds: { type: "number", description: "Timeout per benchmark run (default 600)" },
             checks_timeout_seconds: { type: "number", description: "checks.sh timeout (default 300)" },
           },
-          additionalProperties: false,
+          additionalProperties: true, // see init: unknown arguments are rejected by name
         },
         execute: (input, context) => runExperiment(host, input, context),
       })
@@ -339,8 +350,9 @@ export default Plugin.define({
         options: { namespace: "autoresearch" },
         description:
           "Record the last autoresearch_run (each run is logged once; the plugin records the measured numbers itself). " +
-          "`keep` proposes to keep the change: the plugin measures the last commit and the change back to back (it swaps the files " +
-          "itself and puts them back), and commits if the gain is confirmed, otherwise reverts and logs a discard. " +
+          "`keep` proposes to keep the change: the plugin measures fresh back-to-back pairs of the last commit and the change " +
+          "(8 pairs = 16 benchmark runs, 8 more if those are promising but not conclusive; it swaps the files itself and puts them back), " +
+          "and commits if an exact paired test confirms the gain, otherwise reverts and logs a discard. " +
           "`discard`, `crash` and `checks_failed` revert the code to the last commit (.auto/ is preserved). " +
           "Always include `asi` notes: what you learned, so a future agent doesn't repeat dead ends.",
         input: {
@@ -357,11 +369,11 @@ export default Plugin.define({
               type: "boolean",
               description:
                 "With status keep: the change removes more lines than it adds (checked) and isn't meant to be faster. It's kept " +
-                "when the back-to-back measurement shows it's not worse than the last commit beyond the noise, nor by more than minImprovement.",
+                "unless the fresh pairs show it measurably worse than the last commit, or worse by more than minImprovement.",
             },
           },
           required: ["status", "description"],
-          additionalProperties: false,
+          additionalProperties: true, // see init: unknown arguments are rejected by name
         },
         execute: (input, context) => logExperiment(host, input, context),
       })
@@ -378,7 +390,7 @@ export default Plugin.define({
             reason: { type: "string", description: "For the user: why you're pausing and what you need from them" },
           },
           required: ["reason"],
-          additionalProperties: false,
+          additionalProperties: true, // see init: unknown arguments are rejected by name
         },
         execute: (input, context) => pauseLoop(host, input, context),
       })
@@ -391,7 +403,7 @@ export default Plugin.define({
      * do. In code, not in the skill: a resume on main with uncommitted work once wiped that
      * work with the first discard.
      */
-    const preflight = async (cwd: string, resume: boolean): Promise<string | null> => {
+    const preflight = async (cwd: string, resume: boolean, ownExperiment = false): Promise<string | null> => {
       if (!(await headSha(cwd))) {
         return (
           "Autoresearch needs a git repository with at least one commit, because it commits what works and reverts what doesn't. " +
@@ -400,7 +412,7 @@ export default Plugin.define({
       }
       const status = await scopeStatus(cwd)
       if (!status.ok) return `Couldn't check the working tree (git status failed):\n${tailLines(status.error, 10)}`
-      if (status.status) {
+      if (status.status && !ownExperiment) {
         const lines = status.status.split("\n")
         return (
           "Not started: the working tree has uncommitted changes, and the loop reverts to the last commit after every failed experiment, " +
@@ -443,6 +455,23 @@ export default Plugin.define({
       return null
     }
 
+    /**
+     * This session's stored run, when the working tree's uncommitted changes are exactly
+     * the tree it measured (same commit, same branch). Those changes are the experiment's
+     * own, not the user's work, so the loop may start over them and the run stays loggable.
+     * This is what's left after a crash in the middle of a measurement: the swap recovery
+     * puts the experiment's files back, and without this rule `/autoresearch` then refused
+     * to start because of the very files it had just restored.
+     */
+    const unfinishedExperiment = async (sessionID: string, cwd: string): Promise<StoredRun | undefined> => {
+      const stored = (await ctx.storage.get(runKey(sessionID))) as StoredRun | undefined
+      const fp = stored?.fingerprint
+      if (!fp) return undefined
+      const [tree, head, branch, status] = await Promise.all([scopeTreeHash(cwd), headSha(cwd), currentBranch(cwd), scopeStatus(cwd)])
+      const dirty = status.ok && status.status !== ""
+      return dirty && tree.ok && tree.tree === fp.tree && head === fp.head && branch === fp.branch ? stored : undefined
+    }
+
     await ctx.command.transform((editor) => {
       editor.add({
         name: "autoresearch",
@@ -458,10 +487,10 @@ export default Plugin.define({
             return
           }
 
-          // A keep's confirmation that was cut off (crash, restart) leaves the project's
-          // files at the last commit and the experiment's files in git. Put them back before
+          // A first look or a keep decision that was cut off (crash, restart) can leave the
+          // project's files at the last commit and the experiment's files in git. Put them back before
           // anything below looks at the working tree; a clean-looking tree would be a lie.
-          // (Nothing happens while a confirmation is running right now.)
+          // (Nothing happens while pairs are being measured right now.)
           const recovery = sub.startsWith("dashboard") ? null : await recoverInterruptedSwap(host, await cwdOf(sessionID))
           const recoveryNote = recovery?.failed ?? recovery?.note
 
@@ -557,7 +586,8 @@ export default Plugin.define({
           }
 
           const setup = !existsSync(promptPath(cwd))
-          const problem = await preflight(cwd, !setup)
+          const unfinished = setup ? undefined : await unfinishedExperiment(sessionID, cwd)
+          const problem = await preflight(cwd, !setup, !!unfinished)
           if (problem) {
             // E.g. "uncommitted changes": if those are the experiment that was just put back, say so.
             await say(problem + (recovery?.note ? `\n${recovery.note}` : ""))
@@ -587,8 +617,8 @@ export default Plugin.define({
           }
 
           // A measurement from before this start describes a tree that's gone (the tree is
-          // clean now); it must not be logged.
-          await ctx.storage.remove(runKey(sessionID))
+          // clean now); it must not be logged. Unless the tree still is that measurement's.
+          if (!unfinished) await ctx.storage.remove(runKey(sessionID))
           const stopped = (await ctx.storage.get(stoppedKey(sessionID))) as { reason?: string; at?: string; unseen?: boolean } | undefined
           await ctx.storage.remove(stoppedKey(sessionID))
           const state: ActiveState = {
@@ -606,6 +636,15 @@ export default Plugin.define({
           await activate(sessionID, state)
           // Delivered with the turn the prompt below starts.
           if (recovery?.note) await notify(sessionID, recovery.note)
+          if (unfinished) {
+            await notify(
+              sessionID,
+              "The uncommitted changes in the working tree are your unfinished experiment, exactly as it was measured. " +
+                ("running" in unfinished
+                  ? "Its measurement was cut off: call autoresearch_run again, then autoresearch_log."
+                  : "It is measured but not logged: call autoresearch_log for it (no need to run again). Don't change files first."),
+            )
+          }
           if (stopped?.unseen && stopped.reason) {
             await notify(sessionID, `For the record, why the loop had stopped before this start (${stopped.at ?? "?"}): ${stopped.reason}`)
           }
@@ -645,16 +684,24 @@ export default Plugin.define({
         const segments = segmentSummaries(entries)
         const repeat = config.repeat ?? 1
         lines.push(
-          `Session: ${config.name} · ${config.metric_name} (${config.direction} is better) · ${repeat} benchmark run${repeat > 1 ? "s" : ""} per measurement, ` +
-            `${confirmationRuns(repeat)} more to confirm a keep`,
+          `Session: ${config.name} · ${config.metric_name} (${config.direction} is better)`,
+          modeText(repeat, settings.minImprovement),
         )
         // Every segment, not only the current one: after a benchmark change the earlier
         // segments' kept experiments are still in the branch, and showing only the last
         // segment made a session look like it had achieved nothing.
         for (const seg of segments) {
+          // The last keep with its own evidence: the gain measured in its pairs and the test's p.
+          const last = seg.lastKeep
+          const lastText = !last
+            ? ""
+            : ` · last keep: run #${last.run}` +
+              (last.neutral ? " (simplification)" : typeof last.gain === "number" ? `, ${gainText(last.gain)}` : "") +
+              (typeof last.p === "number" && !last.neutral ? ` (${pText(last.p)})` : "")
           lines.push(
             `Segment ${seg.config.segment} "${seg.config.name}"${seg.config.segment === config.segment ? " (current)" : ""}: ` +
-              `${seg.runs} run${seg.runs === 1 ? "" : "s"}, ${progressText(seg)}`,
+              `${seg.runs} run${seg.runs === 1 ? "" : "s"}, ${progressText(seg)}${lastText}` +
+              (isSlow(seg.config.repeat ?? 1) ? " · slow mode: keeps had no statistical check" : ""),
           )
         }
         const kept = segments.reduce((sum, seg) => sum + seg.kept, 0)
@@ -663,7 +710,7 @@ export default Plugin.define({
             (segments.length > 1 ? ` in ${segments.length} segments (gains of different segments aren't combined: their benchmarks differ)` : ""),
           `Limits: maxIterations ${settings.maxIterations} · maxNoImprovement ${settings.maxNoImprovement}` +
             (state ? ` (now ${noImprovementStreak(entries, state.startRunCount)} runs without a keep since the loop was last started)` : "") +
-            ` · minImprovement ${settings.minImprovement * 100}% (the gain a keep needs when a measurement has fewer than 3 runs, and the most a simplification may cost)`,
+            ` · minImprovement ${settings.minImprovement * 100}% (the gain a keep needs in slow mode, and the most a simplification may cost)`,
         )
         const inputs = await frozenInputs(autoDir(cwd))
         const drift = benchmarkDrift(config, {
@@ -712,13 +759,24 @@ export default Plugin.define({
         // What's in flight right now. Compaction usually happens mid-experiment; without
         // this the summary says "start the next experiment" on top of uncommitted edits.
         const status = await scopeStatus(state.directory)
-        const stored = (await ctx.storage.get(runKey(event.sessionID))) as PendingRun | { running: true } | undefined
+        const stored = (await ctx.storage.get(runKey(event.sessionID))) as StoredRun | undefined
+        const direction = currentSegment(await readLog(state.directory)).config?.direction ?? "lower"
         const pendingRun = !stored
           ? undefined
           : "running" in stored
             ? "autoresearch_run was in progress (or was interrupted); it has no result. Run it again before logging."
-            : `measured but not logged yet: ${stored.metric === null ? "the benchmark failed" : `first measurement ${fmt(stored.metric)}`}` +
-              `${stored.checks === "failed" ? ", checks failed" : ""}. Call autoresearch_log for it before anything else, without changing files.`
+            : stored.headFailure
+              ? "the last commit failed the benchmark during the first look, so the change can't be kept. Call autoresearch_run again (a flaky benchmark) or log `discard`."
+              : "measured but not logged yet: " +
+                (stored.metric === null
+                  ? "the benchmark failed"
+                  : stored.look?.length
+                    ? `the first look (${stored.look.length} pair${stored.look.length === 1 ? "" : "s"}) said ${gainText(medianPairGain(stored.look, direction))}`
+                    : `baseline ${fmt(stored.metric)}`) +
+                `${stored.checks === "failed" ? ", checks failed" : ""}. ` +
+                (stored.decision
+                  ? `A keep decision is under way (${stored.decision.pairs.length} pairs measured): call autoresearch_log with status keep${stored.decision.neutral ? " and simplification: true" : ""} again, without changing files.`
+                  : "Call autoresearch_log for it before anything else, without changing files.")
         const summary = await buildCompactionSummary(state.directory, userMessages, {
           workingTree: status.ok ? status.status : undefined,
           pendingRun,
@@ -881,7 +939,7 @@ export default Plugin.define({
     // continue, which arrived after the agent had paused: "The loop is ON now" on a paused loop.
     const startup = setTimeout(() => {
       void (async () => {
-        // A restart may have cut off a keep's confirmation: put the experiment's files back
+        // A restart may have cut off a measurement: put the experiment's files back
         // first, or the agent would be told to carry on over a tree that only looks clean.
         const recovery = await recoverInterruptedSwap(host, ctx.location.directory)
         for (const [sessionID, since] of loopsAtStart) {

@@ -58,11 +58,14 @@ describe("session and runs", () => {
     expect(s.startsWith(SUMMARY_HEADER)).toBe(true)
     expect(s).toContain("Goal: speed up tests")
     expect(s).toContain("Metric: total_s (s), lower is better")
-    expect(s).toContain("median of 5 benchmark run(s)")
-    // 36/45 × 36/36 × 27/30 = 0.72: the product of the kept runs' paired ratios,
-    // NOT current / baseline (27 / 40 would read 32.5 % and mixes measurements from different times).
+    expect(s).toContain("Repeat: 5, fixed for this segment. A keep is decided on HEAD/candidate pairs measured back to back, with an exact test.")
+    // v0.2.1 entries: 36/45 × 27/30 = 0.72, the product of the kept runs' paired ratios (the
+    // neutral keep counts as no change), NOT current / baseline (27 / 40 would read 32.5 %
+    // and mixes measurements from different times).
     expect(s).not.toContain("32.5")
-    expect(s).toContain("Improvement: 28.0 % better than the baseline. This is the compounded gain of the 3 kept change(s), each measured against HEAD right alongside it.")
+    expect(s).toContain(
+      "Improvement: 28.0 % lower than the baseline. This is the compounded result of the 2 confirmed keep(s) (not a ratio of raw numbers), each measured against HEAD right alongside it. 1 simplification keep(s) count as no change.",
+    )
     // Current is the LAST keep, and both absolute values are marked as measured at the time.
     expect(s).toContain("Baseline: 40s (run #1) · current (the last keep = HEAD): 27s (run #8). Each as measured at the time.")
     expect(s).toContain("aren't comparable (machine speed drifts)")
@@ -94,7 +97,7 @@ describe("session and runs", () => {
     // yet it beat HEAD measured right alongside (60).
     const log = jsonl(config, run(1, "keep", 50, "baseline", { baseline: true }), paired(2, "keep", 52, 60, "faster"))
     const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
-    expect(s).toContain("Improvement: 13.3 % better than the baseline")
+    expect(s).toContain("Improvement: 13.3 % lower than the baseline")
     expect(s).toContain("Baseline: 50s (run #1) · current (the last keep = HEAD): 52s (run #2)")
   })
 
@@ -107,7 +110,7 @@ describe("session and runs", () => {
       paired(4, "discard", 115, 121, "c", { confidence: -3, note: "keep not confirmed" }),
     )
     const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
-    expect(s).toContain("Improvement: 21.0 % better than the baseline")
+    expect(s).toContain("Improvement: 21.0 % higher than the baseline")
     expect(s).toContain("#3 keep 121 vs HEAD alongside 110: 10.0 % better")
     expect(s).toContain("#4 discard 115 vs HEAD alongside 121: 5.0 % worse")
   })
@@ -145,7 +148,7 @@ describe("session and runs", () => {
     const s = await buildCompactionSummary(dir, [])
     expect(s).not.toContain("Repeat:")
     // Fallbacks: baseline = first keep; a keep without `vs` is compared with the keep before it.
-    expect(s).toContain("Improvement: 32.5 % better than the baseline. This is the compounded gain of the 2 kept change(s), each against its own reference")
+    expect(s).toContain("Improvement: 32.5 % lower than the baseline. This is the compounded result of the 2 confirmed keep(s) (not a ratio of raw numbers), each against its own reference")
     expect(s).toContain("Baseline: 40s (run #1) · current (the last keep = HEAD): 27s (run #4)")
     expect(s).toContain("#1 keep 40 | desc: baseline")
     expect(s).toContain("#2 keep 30 vs the keep before 40: 25.0 % better | desc: parallel")
@@ -189,11 +192,11 @@ describe("session and runs", () => {
     expect(s).toContain("Runs in segment 2: 2 (1 kept, the baseline not counted")
     // The headline numbers are the current segment's.
     expect(s).toContain("Goal: speed up tests, bigger input")
-    expect(s).toContain("Improvement: 10.0 % better than the baseline")
+    expect(s).toContain("Improvement: 10.0 % lower than the baseline")
     expect(s).toContain("Baseline: 100s (run #1) · current (the last keep = HEAD): 90s (run #2)")
     const session = section(s, "## Session")
-    expect(session).toContain("- segment 1: speed up tests · 3 run(s) · 1 kept · 25.0 % better")
-    expect(session).toContain("- segment 2 (current): speed up tests, bigger input · 2 run(s) · 1 kept · 10.0 % better")
+    expect(session).toContain("- segment 1: speed up tests · 3 run(s) · 1 kept · 25.0 % lower than the baseline")
+    expect(session).toContain("- segment 2 (current): speed up tests, bigger input · 2 run(s) · 1 kept · 10.0 % lower than the baseline")
     expect(s).toContain("s1#2 keep 30 vs HEAD alongside 40: 25.0 % better")
     expect(s).toContain("s2#2 keep 90 vs HEAD alongside 100: 10.0 % better")
   })
@@ -239,6 +242,230 @@ describe("session and runs", () => {
     const s = await buildCompactionSummary(project({ "log.jsonl": jsonl(config) }), [])
     expect(s).toContain("Baseline: none yet")
     expect(section(s, "## Next step")).toContain("Measure the baseline")
+  })
+})
+
+// v0.2.2 (docs/design.md, "pair-wise measurement and an exact test"): a keep carries the
+// pairs it was decided on, `gain` (median relative pair difference, positive = better)
+// and `p`. `metric` / `vs` are the medians of the candidate / HEAD values.
+const pairs = (head: number, gains: number[], direction = "lower") =>
+  gains.map((g) => [head, direction === "lower" ? head * (1 - g) : head * (1 + g)] as [number, number])
+const decided = (n: number, status: string, head: number, gain: number, p: number | null, description: string, extra: object = {}) => {
+  const ps = pairs(head, Array(p === null ? 2 : 8).fill(gain))
+  return {
+    type: "run", segment: 1, run: n, status, metric: ps[0]![1], metrics: {}, description, asi: {}, commit: null, timestamp: "",
+    pairs: ps, look_pairs: ps.slice(0, 3), gain, p, vs: head,
+    samples: ps.map((x) => x[1]), current_samples: ps.map((x) => x[0]),
+    ...extra,
+  }
+}
+
+describe("v0.2.2: gain and p per keep", () => {
+  test("keep, unconfirmed keep and simplification lines; level = product of (1 − gain) for a lower-is-better metric, without simplifications", async () => {
+    const log = jsonl(
+      config,
+      run(1, "keep", 1000, "baseline", { baseline: true }),
+      decided(2, "keep", 1100, 0.042, 0.004, "skip the copy"),
+      decided(3, "discard", 990, 0.006, 0.21, "inline helper", { note: "keep not confirmed: 0.6 % better over 8 pairs, p = 0.21" }),
+      // A simplification's measured difference is noise: it must not move the total.
+      decided(4, "keep", 1050, -0.008, 0.31, "drop dead code", { neutral: true }),
+      { ...decided(5, "keep", 900, 0.1, 0.00012, "two stages"), pairs: pairs(900, Array(16).fill(0.1)) },
+      decided(6, "discard", 950, -0.02, 0.9, "worse", { note: "keep not confirmed" }),
+      run(7, "discard", 940, "plain discard"),
+    )
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    // Each keep's ratio to HEAD: 0.958 × 0.9 = 0.8622, so 13.8 % lower. Not 1.042 × 1.1 − 1
+    // (14.6 %), and the simplification's −0.8 % isn't in it.
+    expect(s).not.toContain("14.6")
+    expect(s).toContain(
+      "Improvement: 13.8 % lower than the baseline. This is the compounded result of the 2 confirmed keep(s) (not a ratio of raw numbers), each measured against HEAD right alongside it. 1 simplification keep(s) count as no change.",
+    )
+    expect(s).toContain("Runs in segment 1: 7 (3 kept, the baseline not counted · 3 discard")
+    const runs = section(s, "## Runs")
+    expect(runs).toContain("#2 keep 4.2 % better than HEAD measured alongside (8 pairs, p = 0.004) | desc: skip the copy")
+    expect(runs).toContain(
+      "#3 discard 0.6 % better than HEAD measured alongside, not confirmed (8 pairs, p = 0.21) | note: keep not confirmed: 0.6 % better over 8 pairs, p = 0.21 | desc: inline helper",
+    )
+    expect(runs).toContain("#4 keep kept as a simplification (no measurable loss) (8 pairs) | desc: drop dead code")
+    expect(runs).not.toMatch(/#4 keep.*(better|worse)/)
+    expect(runs).toContain("#5 keep 10.0 % better than HEAD measured alongside (16 pairs, p < 0.001)")
+    expect(runs).toContain("#6 discard 2.0 % worse than HEAD measured alongside, not confirmed (8 pairs, p = 0.90)")
+    expect(runs).toContain("#7 discard 940 | desc: plain discard")
+    // No absolute values on the lines that carry a paired result: nothing to build a ratio from.
+    expect(runs).not.toMatch(/#[2-6] \w+ \d+(\.\d+)? (vs|\|)/)
+  })
+
+  test("higher is better: the logged gain is used as it is", async () => {
+    const log = jsonl(
+      { ...config, direction: "higher" },
+      run(1, "keep", 100, "baseline", { baseline: true }),
+      { ...decided(2, "keep", 100, 0.05, 0.004, "a"), pairs: pairs(100, Array(8).fill(0.05), "higher") },
+    )
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    expect(s).toContain("Improvement: 5.0 % higher than the baseline")
+    expect(s).toContain("#2 keep 5.0 % better than HEAD measured alongside (8 pairs, p = 0.004)")
+  })
+
+  test("`gain` missing: the median of the pair differences is used", async () => {
+    const e = { ...decided(2, "keep", 200, 0, 0.004, "x"), pairs: [[200, 190], [200, 180], [210, 168], [0, 5], ["junk", 1]] } as Record<string, unknown>
+    delete e.gain
+    const s = await buildCompactionSummary(project({ "log.jsonl": jsonl(config, run(1, "keep", 200, "b", { baseline: true }), e) }), [])
+    // Differences 5 %, 10 %, 20 % (a HEAD value of 0 gives none; the junk pair is dropped on reading).
+    expect(s).toContain("#2 keep 10.0 % better than HEAD measured alongside (4 pairs, p = 0.004)")
+    expect(s).toContain("Improvement: 10.0 % lower than the baseline")
+  })
+
+  test("slow mode: said in the session section and on every decided line, and no p-value is shown", async () => {
+    const slow = { ...config, repeat: 2, mode: "slow" }
+    const log = jsonl(
+      slow,
+      run(1, "keep", 1000, "baseline", { baseline: true }),
+      decided(2, "keep", 1000, 0.03, null, "a"),
+      decided(3, "discard", 1000, 0.004, null, "b", { note: "keep not confirmed: below minImprovement" }),
+    )
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    expect(s).toContain("Repeat: 2, fixed for this segment. Slow mode: a keep is decided on a few HEAD/candidate pairs, with NO statistical check.")
+    expect(s).toContain("#2 keep 3.0 % better than HEAD measured alongside (2 pairs, slow mode: no statistical check)")
+    expect(s).toContain("#3 discard 0.4 % better than HEAD measured alongside, not confirmed (2 pairs, slow mode: no statistical check)")
+    expect(section(s, "## Runs")).not.toContain("p =")
+    // `mode` missing (hand-written config): repeat below 3 is enough.
+    const s2 = await buildCompactionSummary(project({ "log.jsonl": jsonl({ ...config, repeat: 1 }) }), [])
+    expect(s2).toContain("Slow mode")
+  })
+
+  test("lower is better: 100 → 90 → 81 reads 19 % lower, a simplification in between changes nothing", async () => {
+    const log = jsonl(
+      config,
+      run(1, "keep", 100, "baseline", { baseline: true }),
+      decided(2, "keep", 100, 0.1, 0.004, "a"),
+      decided(3, "keep", 90, -0.008, 0.31, "less code", { neutral: true }),
+      decided(4, "keep", 90, 0.1, 0.004, "b"),
+    )
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    expect(s).toContain("Improvement: 19.0 % lower than the baseline.")
+    expect(s).not.toContain("21.0")
+    // Per keep the wording stays "better than HEAD": for a lower-is-better metric that is the reduction.
+    expect(s).toContain("#4 keep 10.0 % better than HEAD measured alongside (8 pairs, p = 0.004)")
+  })
+
+  test("higher is better: 100 → 110 → 121 reads 21 % higher", async () => {
+    const hi = (n: number, head: number, gain: number) => ({ ...decided(n, "keep", head, gain, 0.004, "x"), pairs: pairs(head, Array(8).fill(gain), "higher") })
+    const log = jsonl({ ...config, direction: "higher" }, run(1, "keep", 100, "baseline", { baseline: true }), hi(2, 100, 0.1), hi(3, 110, 0.1))
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    expect(s).toContain("Improvement: 21.0 % higher than the baseline.")
+  })
+
+  test("net worse: the level is on the wrong side and says so", async () => {
+    // Can't come from the plugin's own keeps, but a hand-edited or old log can hold it.
+    const lower = jsonl(config, run(1, "keep", 100, "baseline", { baseline: true }), decided(2, "keep", 100, -0.05, 0.004, "a"))
+    expect(await buildCompactionSummary(project({ "log.jsonl": lower }), [])).toContain("Improvement: 5.0 % higher than the baseline (worse).")
+    const higher = jsonl({ ...config, direction: "higher" }, run(1, "keep", 100, "baseline", { baseline: true }), decided(2, "keep", 100, -0.05, 0.004, "a"))
+    expect(await buildCompactionSummary(project({ "log.jsonl": higher }), [])).toContain("Improvement: 5.0 % lower than the baseline (worse).")
+  })
+
+  test("a proposed keep that crashed while it was measured again shows no paired result", async () => {
+    // As experiment.ts logs it: a discard with a note, `gain: null`, the pairs completed so
+    // far, no metric, HEAD's values in current_samples / vs. Those pairs decided nothing.
+    const crashed = {
+      ...decided(3, "discard", 1000, 0.136, null, "crashes later", { note: "keep not confirmed: the benchmark crashed while the candidate was measured again (pair 3); first look 12.0% better" }),
+      gain: null, metric: null, samples: [],
+    }
+    expect(crashed.pairs).toHaveLength(2)
+    const failed = { ...decided(4, "checks_failed", 1000, 0.05, 0.004, "checks") }
+    const crash = { ...decided(5, "crash", 1000, 0.05, 0.004, "boom") }
+    const log = jsonl(config, run(1, "keep", 1000, "baseline", { baseline: true }), decided(2, "keep", 1000, 0.1, 0.004, "a"), crashed, failed, crash)
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    const runs = section(s, "## Runs")
+    expect(runs).toContain("#3 discard — | note: keep not confirmed: the benchmark crashed")
+    expect(runs).not.toContain("13.6")
+    expect(runs).not.toMatch(/#3 discard[^|]*(better|worse|not confirmed)/)
+    expect(runs).not.toMatch(/#[45] \w+[^|]*(better|worse)/)
+    expect(s).toContain("Improvement: 10.0 % lower than the baseline.")
+  })
+
+  test("only simplifications kept: no gain is claimed", async () => {
+    const log = jsonl(config, run(1, "keep", 1000, "baseline", { baseline: true }), decided(2, "keep", 1000, 0.012, 0.2, "less code", { neutral: true }))
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    expect(s).toContain("Improvement: none measured. The 1 kept change(s) are simplifications (no measurable loss); they count as no change.")
+    expect(s).not.toContain("1.2 %")
+  })
+
+  test("a segment that spans the upgrade: old ratios and new keeps' ratios multiply", async () => {
+    const log = jsonl(
+      config,
+      run(1, "keep", 40, "baseline", { baseline: true }),
+      paired(2, "keep", 36, 45, "v0.2.1 keep", { confidence: 3 }), // 36/45: 20 % better
+      decided(3, "keep", 36, 0.1, 0.004, "v0.2.2 keep"),
+    )
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    // 36/45 = 0.8, then 1 − 0.1 = 0.9: 0.72.
+    expect(s).toContain("Improvement: 28.0 % lower than the baseline. This is the compounded result of the 2 confirmed keep(s) (not a ratio of raw numbers), each measured against HEAD right alongside it.")
+    expect(s).toContain("#2 keep 36 vs HEAD alongside 45: 20.0 % better, conf 3")
+    expect(s).toContain("#3 keep 10.0 % better than HEAD measured alongside (8 pairs, p = 0.004)")
+  })
+
+  test("odd values in the new fields are tolerated", async () => {
+    const log = jsonl(
+      config,
+      run(1, "keep", 40, "baseline", { baseline: true }),
+      { ...run(2, "keep", 30, "x"), gain: "big", p: "tiny", pairs: "none", look_pairs: 7 },
+      { ...run(3, "keep", 30, "y"), gain: 0.05, p: "tiny", pairs: [[1], "x", null] },
+      { ...run(4, "keep", 30, "z"), gain: -3, p: 2, pairs: [] },
+    )
+    const s = await buildCompactionSummary(project({ "log.jsonl": log }), [])
+    expect(s).toContain("#2 keep 30 vs the keep before 40: 25.0 % better")
+    expect(s).toContain("#3 keep 5.0 % better than HEAD measured alongside (no p-value logged)")
+    // 30/40 × (1 − 0.05) × (1 + 3): a "gain" of −300 % is a candidate 4× HEAD. Nothing breaks.
+    expect(s).toContain("Improvement: 185.0 % higher than the baseline (worse)")
+    expect(s).not.toContain("NaN")
+  })
+})
+
+describe("user notes: 1500 characters each, oldest dropped first", () => {
+  const notes = (s: string) => section(s, "## What the user said").trim().split("\n").filter((l) => l.startsWith("- "))
+
+  test("a long goal survives whole up to 1500 characters (was cut at 600)", async () => {
+    const goal = "make the importer faster. " + "Detail that matters. ".repeat(60) + "END-OF-GOAL" // ~1300 characters
+    expect(goal.length).toBeGreaterThan(600)
+    expect(goal.length).toBeLessThan(1500)
+    const s = await buildCompactionSummary(project({}), [`Set up and start an autoresearch session. Goal: ${goal}`, "x".repeat(4_000)])
+    expect(notes(s)[0]).toBe(`- Goal given at the start: ${goal}`)
+    expect(notes(s)[1]!.length).toBe(2 + 1500)
+    expect(notes(s)[1]!.endsWith("…")).toBe(true)
+  })
+
+  test("notes are only dropped when room is short: ten 1400-character notes all survive in a normal summary", async () => {
+    const runs = Array.from({ length: 12 }, (_, i) => run(i + 1, i ? "discard" : "keep", 40 + i, `run-${i + 1}-marker`, { baseline: i === 0 }))
+    const dir = project({ "log.jsonl": jsonl(config, ...runs), "prompt.md": "p".repeat(3_000), "ideas.md": "- idea" })
+    const s = await buildCompactionSummary(dir, Array.from({ length: 10 }, (_, i) => `note-${i} ` + "y".repeat(1_390)))
+    expect(notes(s).length).toBe(10)
+    expect(notes(s)[0]!.startsWith("- note-0 ")).toBe(true)
+    expect(s).toContain("run-1-marker")
+    expect(s).not.toContain("left out")
+    expect(s.length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS)
+  })
+
+  test("ten maximum-length notes and full files: the newest notes stay, the oldest go, the newest run stays", async () => {
+    const dir = project({
+      // Thirty long run lines: with all ten notes at full length fewer than ten of them would fit.
+      "log.jsonl": jsonl(
+        config,
+        run(1, "keep", 40, "baseline", { baseline: true }),
+        ...Array.from({ length: 29 }, (_, i) => run(i + 2, "discard", 41, `old-run-${i + 2} ` + "d".repeat(300), { asi: { learned: "l".repeat(200), next: "n".repeat(200) } })),
+        run(31, "discard", 41, "newest-run-marker"),
+      ),
+      "prompt.md": "p".repeat(30_000),
+      "ideas.md": "i".repeat(30_000),
+    })
+    const s = await buildCompactionSummary(dir, Array.from({ length: 10 }, (_, i) => `note-${i} ` + "y".repeat(3_000)))
+    const kept = notes(s)
+    expect(kept.length).toBe(5) // short of room: 8000 characters in total
+    expect(kept[0]!.startsWith("- note-5 ")).toBe(true)
+    expect(kept.at(-1)!.startsWith("- note-9 ")).toBe(true)
+    expect(s.length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS)
+    expect(s).toContain("newest-run-marker")
+    expect(s.match(/^#\d+ discard/gm)!.length).toBeGreaterThanOrEqual(10) // the room went to the newest runs
+    expect(nextSteps(s)).toBe(1)
   })
 })
 
@@ -416,12 +643,18 @@ describe("6. rules block", () => {
     for (const tool of ["autoresearch_init", "autoresearch_run", "autoresearch_log", "autoresearch_pause", "tools.autoresearch.*"])
       expect(rules).toContain(tool)
     expect(rules).toContain("You propose a keep; the plugin decides")
-    expect(rules).toContain("re-measures HEAD and your candidate back to back")
+    // v0.2.2: pair-wise measurement, the exact test, what a keep proposal costs and can't do.
+    expect(rules).toContain("pair-wise: one HEAD run and one candidate run measured back to back, order alternating")
+    expect(rules).toContain("exact paired test")
+    expect(rules).toContain("costs benchmark time, but it can't produce a false result more than about 1 % of the time")
+    expect(rules).toContain("Slow mode (`repeat` below 3) has no such guarantee")
+    expect(rules).toContain("Never quote a ratio of absolute numbers")
     expect(rules).toContain("`simplification: true` is only for a change that removes more lines than it adds")
+    expect(rules).toContain("counts as no change, never as a gain")
     expect(rules).toContain("Every file under `.auto/` except `log.jsonl`, `ideas.md`, `config.json` and `prompt.md` is frozen for the segment")
     expect(rules).toContain("Don't game the metric")
     expect(rules).not.toMatch(/\d+(\.\d+)?\s*(×|standard errors)/) // the threshold may change; it lives in the code
-    expect(rules.length).toBeLessThan(1_800)
+    expect(rules.length).toBeLessThan(2_600)
   })
 })
 

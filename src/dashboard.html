@@ -63,7 +63,8 @@
   #tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 12px; padding: 6px 8px; border-radius: 6px; max-width: 280px; display: none; z-index: 2; }
   #tip b { font-variant-numeric: tabular-nums; }
   .tablewrap { overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; min-width: 900px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  table.runs { min-width: 900px; }
   th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th.num, td.num { text-align: right; white-space: nowrap; }
@@ -85,6 +86,14 @@
   dl.kv dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
   .kvh { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; margin: 6px 0 3px; }
   .kvh:first-child { margin-top: 0; }
+  /* The pairs of a run, inside its detail row. Undoes the run table's rules (min-width,
+     borders, the detail cell's indent) for this small nested table. */
+  table.pairs { width: auto; min-width: 0; font-size: 12.5px; margin: 0 0 4px; }
+  tr.detail table.pairs th, tr.detail table.pairs td { padding: 1px 16px 1px 0; border: 0; background: none; }
+  tr.detail table.pairs th { font-size: 11px; }
+  tr.detail table.pairs tr.med td { color: var(--muted); padding-top: 3px; }
+  .pairwrap { overflow-x: auto; max-width: 100%; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 4px; border: 1px dashed currentColor; color: var(--checks); white-space: nowrap; }
   .empty { text-align: center; color: var(--muted); padding: 48px 16px; }
   @media (max-width: 480px) { main { padding: 10px; } .stat .v { font-size: 17px; } }
 </style>
@@ -106,9 +115,10 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-// A run's "kind" refines its logged status: the baseline and neutral keeps are keeps, an
-// unconfirmed keep is a discard that carries a note (the plugin re-measured and reverted it).
-const KIND_LABEL = { baseline: "baseline", keep: "kept", neutral: "kept (neutral)", discard: "discarded", unconfirmed: "not confirmed", crash: "crash", checks_failed: "checks failed" };
+// A run's "kind" refines its logged status: the baseline and neutral keeps (simplifications:
+// kept for being simpler, not for a gain) are keeps, an unconfirmed keep is a discard that
+// carries a note (the plugin measured it against HEAD and reverted it).
+const KIND_LABEL = { baseline: "baseline", keep: "kept", neutral: "kept (simpler)", discard: "discarded", unconfirmed: "not confirmed", crash: "crash", checks_failed: "checks failed" };
 const KIND_VAR = { baseline: "--accent", keep: "--keep", neutral: "--keep", discard: "--discard", unconfirmed: "--discard", crash: "--crash", checks_failed: "--checks" };
 
 // ---------- helpers ----------
@@ -156,7 +166,27 @@ function gainText(g) {
 }
 const gainClass = (g) => (gainZero(g) ? "" : g > 0 ? "good" : "bad");
 const gainOf = (ratio, dir) => (dir === "higher" ? ratio - 1 : 1 - ratio);
-const levelText = (l) => (isNum(l) ? fmtPctNum(l * 100) : "—");
+// The other way round: a gain (fraction better) as the ratio candidate / HEAD.
+const ratioOf = (gain, dir) => (dir === "higher" ? 1 + gain : 1 - gain);
+// A level in words, in the metric's own direction: 0.81 → "19.0% lower", 1.21 → "21.0% higher"
+// (than the baseline). `worse` = the level is on the wrong side for the direction.
+function levelWords(level, dir) {
+  if (!isNum(level)) return { text: "—", worse: false };
+  if (gainZero(level - 1)) return { text: "no change", worse: false };
+  const lower = level < 1;
+  return { text: fmtPctNum((level - 1) * 100) + (lower ? " lower" : " higher"), worse: lower !== (dir !== "higher") };
+}
+// Levels sit close to 100%, so they always get one decimal ("81.0%", "104.4%", not "104%").
+const levelText = (l) => (isNum(l) ? (l * 100).toFixed(1) + "%" : "—");
+// p-values: "p = 0.004", "p = 0.21", "p < 0.001"; and the same in plain words.
+const pText = (p) => (p < 0.001 ? "p < 0.001" : "p = " + (p >= 0.1 ? p.toFixed(2) : p.toFixed(3)));
+function luckText(p) {
+  const how = p < 0.001 ? "under 0.1%" : p < 0.01 ? "under 1%" : "about " + Math.round(p * 100) + "%";
+  return "chance this is luck: " + how;
+}
+const SLOW_TAG = "no statistical check (slow mode)";
+const SLOW_TITLE = "Slow mode (repeat below 3): a keep is decided on a few HEAD/candidate pairs without a statistical test, so a kept change can be luck.";
+const isSlow = (config) => config.mode === "slow" || (isNum(config.repeat) && config.repeat < 3);
 function fmtX(c) {
   const t = Math.abs(c) >= 100 ? c.toFixed(0) : c.toFixed(1);
   return (Number(t) === 0 ? "0.0" : t) + "×"; // never "-0.0×"
@@ -176,6 +206,12 @@ function mmss(ms) {
 }
 const numList = (x) => (Array.isArray(x) ? x.filter(isNum) : []);
 const numSamples = (r) => numList(r.samples);
+// [[head, candidate], …] with two numbers each; anything else is dropped.
+const pairList = (x) => (Array.isArray(x) ? x.filter((q) => Array.isArray(q) && q.length === 2 && isNum(q[0]) && isNum(q[1])) : []);
+// One pair's result: how much better the candidate run was than the HEAD run next to it,
+// as a fraction of the HEAD run (the plugin's rule). null when HEAD measured 0.
+const pairGain = (q, dir) => (q[0] !== 0 ? (dir === "higher" ? q[1] - q[0] : q[0] - q[1]) / Math.abs(q[0]) : null);
+const pairGains = (pairs, dir) => pairs.map((q) => pairGain(q, dir)).filter(isNum);
 function median(xs) {
   const s = [...xs].sort((a, b) => a - b), mid = s.length >> 1;
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
@@ -258,19 +294,34 @@ function requestRender() {
 
 // Everything the views need to know about one segment's runs.
 //   baseline = the run flagged baseline (old logs: the first keep with a metric)
-//   current  = the last keep (it describes HEAD); NOT the best value: a neutral keep may be slightly worse
+//   current  = the last keep (it describes HEAD); NOT the best value: a simplification may be slightly worse
 //   kind     = refined status per run
 //
 // Machine speed drifts within minutes, so values logged at different times are NOT comparable.
-// Progress therefore comes only from paired results (the same rule as compaction.ts, analyze()):
-//   pair     = per run { cand, ref, refKind, ratio, gain }
-//              cand = the run's metric; ref = `vs`, else the median of `current_samples`, else
-//              (entries from before v0.2) the metric of the keep before it
-//              refKind = "paired" (HEAD re-measured right alongside), "logged" (v0.2.0: current's
-//              logged value) or "previous"; gain = fraction better, direction-aware
-//   level    = product of cand / ref over the keeps, baseline excluded; 1 = the baseline's level
+// Progress therefore comes only from paired results (the same rules as compaction.ts, analyze()):
+//   pair     = per run, what it was compared with.
+//              v0.2.2 entries (they carry `gain` or `pairs`): refKind "pairs",
+//                gain = `gain`, the median relative difference of the HEAD/candidate pairs
+//                measured back to back (recomputed from `pairs` when missing), p = `p`,
+//                diffs / lookDiffs = each pair's difference (decision pairs / first look)
+//              older entries: { cand, ref, refKind, ratio, gain } with cand = the run's metric,
+//                ref = `vs`, else the median of `current_samples`, else (before v0.2) the metric
+//                of the keep before it; refKind = "paired" (HEAD re-measured alongside),
+//                "logged" (v0.2.0: current's logged value) or "previous"
+//              gain is always a fraction, positive = better in the segment's direction
+//   level    = the product of r over the confirmed keeps, r = candidate / HEAD of each keep
+//              (lower is better: 1 − gain, the gain being the reduction; higher is better:
+//              1 + gain; older keeps: cand / ref). 1 = the baseline, and the level is in the
+//              METRIC'S OWN DIRECTION: two 10 % reductions of a lower-is-better metric give
+//              0.81 ("19 % lower", the line goes DOWN), two 10 % increases of a
+//              higher-is-better one 1.21. (The product of 1 + gain said 21 % for both.)
+//              The same rule as compoundedLevel() in state.ts and analyze() in compaction.ts.
+//              The baseline is no change, and a simplification keep counts as no change (it
+//              was kept for being simpler; its measured difference is noise).
+//   gain     = the level as a fraction better than the baseline (for the colour only)
 //   levelAt  = level before a run; levelAfter = level after a keep
-//   kept     = keeps without the baseline
+//   kept     = keeps without the baseline; measured = those that went into the level;
+//   simpler  = simplification keeps
 function analyze(seg) {
   const { config, runs } = seg;
   const dir = config.direction === "higher" ? "higher" : "lower";
@@ -279,7 +330,9 @@ function analyze(seg) {
   const curRun = keeps.length ? keeps[keeps.length - 1] : null;
   const kind = new Map(), pair = new Map(), levelAt = new Map(), levelAfter = new Map();
   let state = null; // metric of the last keep seen so far
-  let level = 1, kept = 0, measured = 0;
+  let product = 1; // of each confirmed keep's ratio candidate / HEAD
+  let kept = 0, measured = 0, simpler = 0;
+  const levelNow = () => product;
   for (const r of runs) {
     const isKeep = r.status === "keep" && isNum(r.metric);
     let k = String(r.status);
@@ -287,56 +340,88 @@ function analyze(seg) {
     else if (r.status === "keep" && r.neutral === true) k = "neutral";
     else if (r.status === "discard" && r.note) k = "unconfirmed";
     kind.set(r, k);
-    levelAt.set(r, level);
+    levelAt.set(r, levelNow());
     if (r !== baseRun && r.status !== "crash") {
-      const sm = numSamples(r), cs = numList(r.current_samples);
-      const cand = isNum(r.metric) ? r.metric : sm.length ? median(sm) : null;
-      let ref = null, refKind = "previous";
-      if (cs.length) { ref = isNum(r.vs) ? r.vs : median(cs); refKind = "paired"; }
-      else if (isNum(r.vs)) { ref = r.vs; refKind = "logged"; }
-      else if (isKeep) ref = state;
-      // A ratio needs two positive numbers; anything else counts as "no comparison".
-      if (isNum(cand) && cand > 0 && isNum(ref) && ref > 0) pair.set(r, { cand, ref, refKind, ratio: cand / ref, gain: gainOf(cand / ref, dir) });
+      const pairs = pairList(r.pairs);
+      if (isNum(r.gain) || pairs.length) {
+        const diffs = pairGains(pairs, dir);
+        const gain = isNum(r.gain) ? r.gain : diffs.length ? median(diffs) : null;
+        if (gain != null) pair.set(r, {
+          refKind: "pairs", gain, ratio: ratioOf(gain, dir), p: isNum(r.p) ? r.p : null, n: pairs.length, pairs, diffs,
+          look: pairList(r.look_pairs), lookDiffs: pairGains(pairList(r.look_pairs), dir),
+        });
+      } else {
+        const sm = numSamples(r), cs = numList(r.current_samples);
+        const cand = isNum(r.metric) ? r.metric : sm.length ? median(sm) : null;
+        let ref = null, refKind = "previous";
+        if (cs.length) { ref = isNum(r.vs) ? r.vs : median(cs); refKind = "paired"; }
+        else if (isNum(r.vs)) { ref = r.vs; refKind = "logged"; }
+        else if (isKeep) ref = state;
+        // A ratio needs two positive numbers; anything else counts as "no comparison".
+        if (isNum(cand) && cand > 0 && isNum(ref) && ref > 0) pair.set(r, { cand, ref, refKind, ratio: cand / ref, gain: gainOf(cand / ref, dir) });
+      }
     }
     if (isKeep) {
       if (r !== baseRun) {
         kept++;
         const p = pair.get(r);
-        if (p) { level *= p.ratio; measured++; }
+        if (k === "neutral") simpler++;
+        else if (p && isNum(p.ratio) && p.ratio > 0) {
+          product *= p.ratio;
+          measured++;
+        }
       }
       state = r.metric;
-      levelAfter.set(r, level);
+      levelAfter.set(r, levelNow());
     }
   }
   // Improvement of the segment: null while nothing is kept or nothing could be compared.
+  const level = levelNow();
   const gain = kept && measured ? gainOf(level, dir) : null;
-  return { config, runs, baseRun, curRun, kind, pair, levelAt, levelAfter, level, kept, measured, gain, dir };
+  return { config, runs, baseRun, curRun, kind, pair, levelAt, levelAfter, level, kept, measured, simpler, gain, dir, slow: isSlow(config) };
 }
-const REF_LABEL = { paired: "HEAD alongside", logged: "current as logged", previous: "the keep before" };
+const REF_LABEL = { pairs: "HEAD alongside", paired: "HEAD alongside", logged: "current as logged", previous: "the keep before" };
 // The paired result is shown for keeps and for keeps the plugin did not confirm.
 function shownPair(r, a) {
   const k = a.kind.get(r), p = a.pair.get(r);
   if (!p) return null;
   if (k === "keep" || k === "neutral") return p;
-  return k === "unconfirmed" && p.refKind === "paired" ? p : null;
+  return k === "unconfirmed" && (p.refKind === "paired" || p.refKind === "pairs") ? p : null;
 }
+const pairsText = (n) => (n ? `${n} pair${n === 1 ? "" : "s"}` : "");
 
-// Confidence of ONE run against HEAD measured alongside it (never cumulative): the gain divided
-// by the measurement noise. Whether that was enough is the plugin's decision and is read from
-// the status (keep = confirmed), not from a threshold here. null = not applicable.
-// Unconfirmed keeps carry it too (v0.2.1), for auditing.
-// Logs written before v0.2 stored a cumulative figure in `confidence`; that one is not shown.
+// How the plugin's decision on ONE run is shown: { text, cls, title } or null (not a decision).
+// Whether a result was enough is the plugin's decision and is read from the status
+// (keep = confirmed), never from a threshold here.
+//
+// v0.2.2 entries: "confirmed · p = 0.004". p is the exact one-sided p-value of the paired
+// test; the title says it in plain words ("chance this is luck: under 1%"). Slow mode has
+// no test, and says so. A simplification is never worded as a gain.
+// Older entries: `confidence` (gain ÷ noise, v0.2.0 and v0.2.1), as before. Logs written
+// before v0.2 stored a cumulative figure in `confidence`; that one is not shown.
 function confInfo(r, a) {
-  const k = a.kind.get(r);
+  const k = a.kind.get(r), p = a.pair.get(r);
+  if (k !== "keep" && k !== "neutral" && k !== "unconfirmed") return null;
+  if (p && p.refKind === "pairs") {
+    const tested = p.p != null;
+    const luck = tested ? luckText(p.p) : SLOW_TITLE;
+    if (k === "neutral") return {
+      text: "kept (simpler, no measurable loss)", cls: "",
+      title: "A simplification: kept because the code got simpler and the candidate was not measurably worse than HEAD. It counts as no change, not as a gain." + (tested ? "" : " " + SLOW_TITLE),
+    };
+    if (k === "unconfirmed") return { text: "not confirmed · " + (tested ? pText(p.p) : SLOW_TAG), cls: "warn", title: luck, luck: tested ? luck : null };
+    return tested
+      ? { text: "confirmed · " + pText(p.p), cls: "good", title: luck, luck }
+      : { text: "kept · " + SLOW_TAG, cls: "warn", title: SLOW_TITLE };
+  }
   if (k === "unconfirmed") return { text: (isNum(r.confidence) ? fmtX(r.confidence) + " · " : "") + "not confirmed", cls: "warn" };
-  if (k !== "keep" && k !== "neutral") return null;
   // (v0.1 runs had `samples` as a count, never a list, and no `vs` / `first_metric`.)
   const isNew = Array.isArray(r.samples) || isNum(r.vs) || isNum(r.first_metric);
   if (!isNew) return { text: "—", cls: "" };
   const tail = k === "neutral" ? " · neutral" : "";
   if (isNum(r.confidence)) {
     if (k === "neutral") return { text: fmtX(r.confidence) + tail, cls: "" }; // only has to be "not worse"
-    return { text: fmtX(r.confidence) + " confirmed", cls: "good" };
+    return { text: fmtX(r.confidence) + " confirmed", cls: "good", title: "this run's gain ÷ measurement noise (how the plugin decided before v0.2.2)" };
   }
   const sm = numSamples(r), n = sm.length || (isNum(a.config.repeat) ? a.config.repeat : 0);
   if (n < 3) return { text: "no noise estimate" + tail, cls: "" };
@@ -374,6 +459,7 @@ function render() {
   const mi = $("metricinfo");
   mi.replaceChildren(info.join(" · "));
   if (bench) mi.append(" · benchmark ", h("span", { class: "mono", id: "bench", title: benchTitle }, bench));
+  if (a.slow) mi.append(" ", h("span", { class: "tag", id: "slowtag", title: SLOW_TITLE }, SLOW_TAG));
 
   if (!seg.runs.length) {
     content.append(h("div", { class: "card empty" }, "No experiments yet"));
@@ -402,7 +488,8 @@ function renderSegNote(segments, seg, latest) {
     return h("button", {
       type: "button", "aria-pressed": String(s === seg), "data-seg": String(i + 1),
       onclick: () => { selectedSeg = s === latest ? null : s.config.segment; rerender(); },
-    }, `Segment ${i + 1}` + (s === latest ? " (current)" : ""), hash ? " · " : null, hash ? h("code", {}, hash) : null);
+    }, `Segment ${i + 1}` + (s === latest ? " (current)" : ""), hash ? " · " : null, hash ? h("code", {}, hash) : null,
+      isSlow(s.config) ? h("span", { class: "warn", title: SLOW_TITLE }, " · slow mode") : null);
   });
   el.append(h("span", { id: "segtext" }, text), h("span", { class: "segs" }, buttons));
 }
@@ -419,23 +506,32 @@ function renderStats(a) {
   const count = (k) => runs.filter((r) => kind.get(r) === k).length;
   const neutral = count("neutral"), unconf = count("unconfirmed"), disc = count("discard") + unconf;
   // "kept" never includes the baseline: it is a measurement, not a change.
-  const breakdown = `${a.kept} kept${neutral ? ` (${neutral} neutral)` : ""} · ${disc} discarded${unconf ? ` (${unconf} not confirmed)` : ""} · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
+  const breakdown = `${a.kept} kept${neutral ? ` (${neutral} simpler)` : ""} · ${disc} discarded${unconf ? ` (${unconf} not confirmed)` : ""} · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
 
-  // Improvement = the kept runs' gains compounded, each against HEAD measured alongside it.
-  const impSub = !a.kept ? "no kept change yet" : !a.measured ? "kept runs carry no comparison" : `${a.kept} confirmed gain${a.kept > 1 ? "s" : ""}, compounded`;
-  const impTitle = "Compounded gain of the confirmed keeps: each kept run's gain over HEAD measured right alongside it, multiplied together. Not current ÷ baseline: raw numbers from different times aren't comparable.";
+  // Improvement = the level against the baseline, in the metric's own direction ("19.0% lower"):
+  // the confirmed keeps compounded, each against HEAD measured alongside it.
+  // Simplification keeps are not in it.
+  const lw = a.gain == null ? { text: "—", worse: false } : levelWords(a.level, a.dir);
+  const than = lw.text === "no change" ? "from the baseline" : "than the baseline" + (lw.worse ? " (worse)" : "");
+  const simplerText = a.simpler ? `${a.simpler} simplification${a.simpler > 1 ? "s" : ""} not counted` : "";
+  const impSub = !a.kept ? "no kept change yet"
+    : !a.measured ? (a.simpler === a.kept ? "simplifications only: no gain counted" : "kept runs carry no comparison")
+    : `${than} · ${a.measured} confirmed keep${a.measured > 1 ? "s" : ""}, compounded` + (simplerText ? " · " + simplerText : "");
+  const impTitle = `Compounded result of the confirmed keeps: each kept run's ratio to HEAD measured right alongside it (candidate ÷ HEAD), multiplied together, so two 10% reductions read 19% lower. ${a.dir === "higher" ? "Higher" : "Lower"} is better for this metric. A simplification keep counts as no change. Not current ÷ baseline: raw numbers from different times aren't comparable.`;
 
-  // Last keep: that keep's own gain over HEAD measured alongside it, with its own confidence.
+  // Last keep: that keep's own result against HEAD measured alongside it.
   const last = curRun && curRun !== baseRun ? curRun : null;
   let lastCard;
   if (last) {
-    const p = a.pair.get(last), c = confInfo(last, a);
-    lastCard = stat("Last keep", gainText(p ? p.gain : null), `run #${last.run} vs ${p ? REF_LABEL[p.refKind] : "previous state"} · ${c ? c.text : "—"}`, last.neutral === true || !p ? "" : gainClass(p.gain));
+    const p = a.pair.get(last), c = confInfo(last, a), simple = kind.get(last) === "neutral";
+    lastCard = simple
+      ? stat("Last keep", "simpler", `run #${last.run} · no measurable loss · not counted as a gain`, "", c && c.title)
+      : stat("Last keep", gainText(p ? p.gain : null), `run #${last.run} vs ${p ? REF_LABEL[p.refKind] : "previous state"} · ${c ? c.text : "—"}`, p ? gainClass(p.gain) : "", c && c.title);
   } else {
     lastCard = stat("Last keep", "—", baseRun ? "no keep since the baseline" : "no kept run yet");
   }
   return h("div", { class: "stats" },
-    stat("Improvement", gainText(a.gain), impSub, gainClass(a.gain), impTitle),
+    stat("Improvement", lw.text, impSub, gainClass(a.gain), impTitle),
     stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), baseRun ? `run #${baseRun.run} · as measured then` : "no kept run yet", "", THEN),
     stat("Current", fmt(current) + (current != null ? unit : ""), !curRun ? " " : (curRun === baseRun ? "baseline" : "run #" + curRun.run) + (a.isLatest ? " · HEAD" : " · end of segment") + " · as measured then", "", THEN),
     stat("Runs", String(runs.length), breakdown, "", "kept doesn't count the baseline"),
@@ -472,11 +568,13 @@ function renderChartCard(a) {
   };
   const line = (style, label) => h("span", {}, h("span", { style: "display:inline-block;" + style }), label);
   const points = chartPoints(a);
+  const better = a.dir === "higher" ? "higher is better" : "lower is better";
   const legend = h("div", { class: "legend" },
     ...["baseline", "keep", "neutral", "unconfirmed", "discard", "crash", "checks_failed"].map(item),
-    line("width:14px;border-top:2px solid var(--keep)", level ? "current level" : "current"),
+    line("width:14px;border-top:2px solid var(--keep)", level ? `current level (${better})` : "current"),
     line("width:14px;border-top:1px dashed var(--muted)", level ? "baseline (100%)" : "baseline level"),
     points.some((p) => p.sp) ? line("height:12px;border-left:2px solid var(--muted)", "sample range (min–max)") : null,
+    points.some((p) => p.dots) ? line("width:5px;height:5px;border-radius:50%;background:var(--muted);opacity:.45", "one HEAD/candidate pair") : null,
     level && points.some((p) => p.small) ? h("span", { id: "smallnote" }, "small marker = not measured against HEAD, placed on the current level") : null);
   const mode = (m, label, title) => h("button", {
     type: "button", "aria-pressed": String(chartMode === m), "data-mode": m, title,
@@ -484,10 +582,10 @@ function renderChartCard(a) {
   }, label);
   const head = h("div", { class: "charthead" },
     h("span", { class: "sub", id: "chartcap" }, level
-      ? `Level relative to the baseline (100%), from the gains measured against HEAD alongside · ${a.dir} is better`
+      ? `Level = the metric in % of the baseline (100%): each confirmed keep multiplies it by candidate ÷ HEAD measured alongside. ${better[0].toUpperCase() + better.slice(1)}.`
       : "Values as measured at the time. Machine speed drifts, so runs far apart aren't comparable."),
     h("span", { class: "segs", id: "chartmode" },
-      mode("level", "Relative level", "baseline = 100%; each confirmed keep multiplies it by its ratio to HEAD measured alongside"),
+      mode("level", "Relative level", `baseline = 100%; each confirmed keep multiplies it by its ratio to HEAD measured alongside (candidate ÷ HEAD), so the line moves in the metric's own direction: ${a.dir === "higher" ? "up" : "down"} when the code gets better. Simplification keeps leave it unchanged. ${better[0].toUpperCase() + better.slice(1)}.`),
       mode("raw", "Measured values", "the raw medians and sample ranges, as logged")));
   return h("div", { class: "card" }, head, h("div", { id: "chart" }, h("div", { id: "tip" })), legend);
 }
@@ -495,40 +593,47 @@ function renderChartCard(a) {
 // What the chart plots, per mode. One entry per run:
 //   y     = its value on the Y axis (null = pinned to the bottom edge, raw mode only)
 //   sp    = [lo, hi] of its samples on the same axis, or null
+//   dots  = level mode, v0.2.2 entries: one value per decision pair, so the spread shows
 //   small = level mode: the run has no level of its own and sits on the current line
-// Level mode is in percent of the baseline: a keep sits at the level after it, a run measured
-// against HEAD alongside (an unconfirmed keep) at current level × its own ratio to that HEAD.
+// Level mode is in percent of the baseline, in the metric's own direction (a lower-is-better
+// segment goes DOWN from 100%): a keep sits at the level after it, an unconfirmed keep at
+// the level before it × its own ratio (candidate ÷ HEAD), and every pair of either at the
+// level before × that pair's ratio. A simplification keep stays
+// on the line (it doesn't move the level); its pairs show how flat it really was.
+// Raw mode plots the medians and sample ranges as logged, whatever the entry's version.
 function chartPoints(a) {
   const level = chartMode === "level";
   const out = [];
   for (const r of a.runs) {
     if (!isNum(r.run)) continue;
     const sm = numSamples(r);
-    let y = null, scale = null, small = false;
+    let y = null, sp = null, dots = null, small = false, toY = null;
     if (level) {
-      const p = a.pair.get(r);
-      if (a.levelAfter.has(r)) {
+      const p = a.pair.get(r), before = a.levelAt.get(r) * 100;
+      if (p && p.refKind === "pairs" && r !== a.baseRun) {
+        y = a.levelAfter.has(r) ? a.levelAfter.get(r) * 100 : before * p.ratio;
+        if (p.diffs.length) dots = p.diffs.map((d) => before * ratioOf(d, a.dir));
+      } else if (a.levelAfter.has(r)) {
         y = a.levelAfter.get(r) * 100;
-        if (p && r !== a.baseRun) scale = (a.levelAt.get(r) * 100) / p.ref; // samples → level
+        if (p && r !== a.baseRun) toY = (v) => before * (v / p.ref); // samples → level
       } else if (p && p.refKind === "paired") {
-        scale = (a.levelAt.get(r) * 100) / p.ref;
-        y = p.cand * scale;
+        toY = (v) => before * (v / p.ref);
+        y = toY(p.cand);
       } else {
-        y = a.levelAt.get(r) * 100;
+        y = before;
         small = true;
       }
     } else if (r.status !== "crash" && isNum(r.metric)) {
       // Crashes carry no usable metric (or a placeholder), and so does any run without a number
       // (e.g. checks_failed with metric null): they sit on the bottom edge and don't shape the Y range.
       y = r.metric;
-      scale = 1;
+      toY = (v) => v;
     }
-    let sp = null;
-    if (y != null && scale != null && sm.length > 1) {
-      const lo = Math.min(...sm) * scale, hi = Math.max(...sm) * scale;
+    if (y != null && toY && sm.length > 1) {
+      const e = [toY(Math.min(...sm)), toY(Math.max(...sm))], lo = Math.min(...e), hi = Math.max(...e);
       if (hi > lo) sp = [lo, hi];
     }
-    out.push({ r, k: a.kind.get(r), y, sp, small });
+    out.push({ r, k: a.kind.get(r), y, sp, dots, small });
   }
   return out;
 }
@@ -569,8 +674,16 @@ function drawChart(a) {
   // Sample ranges widen the Y range, but by at most one metric span per side, so one wild
   // sample can't flatten the whole chart; longer whiskers are cut at the plot edge.
   const mlo = lo, mhi = hi, span = hi - lo;
-  for (const p of pts) if (p.sp) { lo = Math.min(lo, p.sp[0]); hi = Math.max(hi, p.sp[1]); }
-  if (span > 0) { lo = Math.max(lo, mlo - span); hi = Math.min(hi, mhi + span); }
+  for (const p of pts) {
+    if (p.sp) { lo = Math.min(lo, p.sp[0]); hi = Math.max(hi, p.sp[1]); }
+    if (p.dots) { lo = Math.min(lo, ...p.dots); hi = Math.max(hi, ...p.dots); }
+  }
+  // (Level mode with nothing kept yet has no span of its own: then the pairs set the range.)
+  // The pairs of a noisy segment spread far wider than its keeps move the level, and that
+  // spread is what they are there to show: in level mode they may widen the range by 15
+  // points per side. Anything beyond is drawn on the plot's edge, never dropped.
+  const reach = level ? Math.max(span, 15) : span;
+  if (span > 0 || level) { lo = Math.max(lo, mlo - reach); hi = Math.min(hi, mhi + reach); }
   if (hi === lo) { const pad = Math.abs(lo) * 0.05 || 1; lo -= pad; hi += pad; }
   const padY = (hi - lo) * 0.08; lo -= padY; hi += padY;
   const nums = pts.map((p) => p.r.run);
@@ -580,7 +693,7 @@ function drawChart(a) {
   const Y = (v) => m.t + (1 - (v - lo) / (hi - lo)) * ph;
   const clampY = (y) => Math.min(m.t + ph, Math.max(m.t, y));
 
-  const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "data-mode": chartMode, "aria-label": level ? "level relative to the baseline per run" : "measured value per run" });
+  const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "data-mode": chartMode, "aria-label": level ? `level in percent of the baseline per run, ${a.dir === "higher" ? "higher" : "lower"} is better` : "measured value per run" });
   for (const t of ticks(lo, hi, H < 220 ? 4 : 5)) {
     s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: "var(--line)" }));
     const tx = svg("text", { x: m.l - 6, y: Y(t) + 4, "text-anchor": "end" }); tx.textContent = fmt(t) + (level ? "%" : ""); s.append(tx);
@@ -614,6 +727,19 @@ function drawChart(a) {
     s.append(svg("path", { class: "whisker", d, stroke: color, "stroke-width": 1.2, "stroke-opacity": ".8", fill: "none" }));
   }
 
+  // Each decision pair of a run as a faint dot beside its marker (level mode): where that
+  // one pair alone would have put the level. A pair beyond the plot sits on its edge.
+  for (const p of pts) {
+    if (!p.dots) continue;
+    const cx = X(p.r.run), color = `var(${KIND_VAR[p.k] || "--discard"})`, n = p.dots.length;
+    p.dots.forEach((v, i) => {
+      const y = clampY(Y(v));
+      // Spread sideways in measurement order, so dots at the same height stay countable.
+      const dx = n > 1 ? (i / (n - 1) - 0.5) * Math.min(14, 2.2 * n) : 0;
+      s.append(svg("circle", { class: "pairdot", cx: cx + dx, cy: y, r: 2, fill: color, "fill-opacity": ".38" }));
+    });
+  }
+
   const tip = $("tip");
   const unit = config.metric_unit ? " " + config.metric_unit : "";
   for (const p of pts) {
@@ -629,10 +755,14 @@ function drawChart(a) {
       // filter: replaceChildren() would print a null as the text "null"
       tip.replaceChildren(...[
         h("div", {}, h("b", {}, "#" + r.run), " · ", KIND_LABEL[k] || k, real ? " · " : null, real ? h("b", {}, fmt(r.metric) + unit) : null),
-        sp ? h("div", {}, `vs ${REF_LABEL[sp.refKind]} ${fmt(sp.ref)}${unit}: ${gainText(sp.gain)}`) : null,
+        !sp ? null
+          : sp.refKind !== "pairs" ? h("div", {}, `vs ${REF_LABEL[sp.refKind]} ${fmt(sp.ref)}${unit}: ${gainText(sp.gain)}`)
+          : k === "neutral" ? h("div", {}, "not measurably worse than HEAD alongside" + (sp.n ? ` (${pairsText(sp.n)})` : ""))
+          : h("div", {}, `${gainText(sp.gain)} than HEAD alongside` + (sp.n ? ` · median of ${pairsText(sp.n)}` : "")),
         a.levelAfter.has(r) ? h("div", {}, "level after this run: " + levelText(a.levelAfter.get(r))) : null,
-        sm.length > 1 ? h("div", {}, `samples ${fmt(Math.min(...sm))} – ${fmt(Math.max(...sm))} (${sm.length})`) : null,
-        c && c.text !== "—" ? h("div", {}, "confidence: " + c.text) : null,
+        sm.length > 1 && !(sp && sp.refKind === "pairs") ? h("div", {}, `samples ${fmt(Math.min(...sm))} – ${fmt(Math.max(...sm))} (${sm.length})`) : null,
+        c && c.text !== "—" ? h("div", { class: "tipconf" }, c.text) : null,
+        c && c.luck ? h("div", { class: "tipluck" }, c.luck) : null,
         h("div", {}, String(r.description ?? "")),
         r.note ? h("div", {}, String(r.note)) : null].filter(Boolean));
       tip.style.display = "block";
@@ -659,19 +789,26 @@ function renderTable(a) {
     const real = r.status !== "crash" && isNum(r.metric); // crashes may carry a placeholder metric
     const p = shownPair(r, a); // keeps and unconfirmed keeps: candidate against HEAD measured alongside
     const c = confInfo(r, a);
-    const vsCell = p
-      ? h("td", { class: "num vs" },
-          // A neutral keep isn't judged on gain, so it gets no colour.
-          h("div", { class: k === "neutral" ? "" : gainClass(p.gain) }, gainText(p.gain)),
-          h("div", { class: "cmp" }, `${fmt(p.cand)} vs ${fmt(p.ref)}` + (p.refKind === "paired" ? "" : ` (${REF_LABEL[p.refKind]})`)))
-      : h("td", { class: "num vs" }, "—");
+    let vsCell;
+    if (!p) vsCell = h("td", { class: "num vs" }, "—");
+    else if (p.refKind === "pairs") {
+      // v0.2.2: the median difference of the pairs. A simplification is not shown as a gain.
+      vsCell = k === "neutral"
+        ? h("td", { class: "num vs" }, h("div", {}, "no measurable loss"), h("div", { class: "cmp" }, pairsText(p.n)))
+        : h("td", { class: "num vs" }, h("div", { class: gainClass(p.gain) }, gainText(p.gain)), h("div", { class: "cmp" }, p.n ? "median of " + pairsText(p.n) : ""));
+    } else {
+      vsCell = h("td", { class: "num vs" },
+        // A neutral keep isn't judged on gain, so it gets no colour.
+        h("div", { class: k === "neutral" ? "" : gainClass(p.gain) }, gainText(p.gain)),
+        h("div", { class: "cmp" }, `${fmt(p.cand)} vs ${fmt(p.ref)}` + (p.refKind === "paired" ? "" : ` (${REF_LABEL[p.refKind]})`)));
+    }
     const row = h("tr", { class: "row" + (open ? " open" : ""), "data-run": String(r.run) },
       h("td", { class: "num" }, h("span", { class: "tog" }, "▸"), " ", String(r.run)),
       h("td", {}, h("span", { class: "badge s-" + k }, KIND_LABEL[k] || k)),
       h("td", { class: "num" }, real ? fmt(r.metric) : "—"),
       vsCell,
       h("td", { class: "num level" }, a.levelAfter.has(r) ? levelText(a.levelAfter.get(r)) : "—"), // only kept runs move the level
-      h("td", { class: "num conf " + (c ? c.cls : "") }, c ? c.text : "—"),
+      h("td", { class: "num conf " + (c ? c.cls : ""), title: c && c.title }, c ? c.text : "—"),
       h("td", { class: "desc" }, String(r.description ?? ""), k === "unconfirmed" ? h("div", { class: "rownote" }, String(r.note)) : null),
       h("td", { class: "commit" }, r.commit ? String(r.commit) : "—"));
     const detail = h("tr", { class: "detail" }, h("td", { colspan: 8 }, renderDetail(r, a)));
@@ -686,17 +823,30 @@ function renderTable(a) {
   const head = h("thead", {}, h("tr", {},
     h("th", { class: "num" }, "#"), h("th", {}, "Status"),
     h("th", { class: "num", title: "median of the run's samples, as measured at the time; not comparable between runs far apart" }, "Metric"),
-    h("th", { class: "num", title: "kept and not-confirmed runs: the candidate against HEAD measured right alongside it (candidate median vs HEAD median)" }, "vs HEAD alongside"),
-    h("th", { class: "num", title: "level after this run: baseline = 100%, each kept run multiplies it by its ratio to HEAD measured alongside" }, "Level"),
-    h("th", { class: "num", title: "this run's gain ÷ measurement noise, against HEAD measured alongside; the plugin decides what counts as confirmed" }, "Confidence"),
+    h("th", { class: "num", title: "kept and not-confirmed runs: the candidate against HEAD measured right alongside it, as the median difference of the HEAD/candidate pairs (older entries: candidate median vs HEAD median)" }, "vs HEAD alongside"),
+    h("th", { class: "num", title: `level after this run: the metric in % of the baseline (100%); each confirmed keep multiplies it by candidate ÷ HEAD measured alongside. ${a.dir === "higher" ? "Higher" : "Lower"} is better. Simplifications don't move it.` }, "Level"),
+    h("th", { class: "num", title: "the plugin's decision. p = the chance of a result this clear if the change did nothing (exact paired test); small is good. Hover a cell for plain words. Older entries show gain ÷ noise." }, "Confirmed?"),
     h("th", {}, "Description"), h("th", {}, "Commit")));
-  return h("div", { class: "card tablewrap" }, h("table", {}, head, tbody));
+  return h("div", { class: "card tablewrap" }, h("table", { class: "runs" }, head, tbody));
 }
 
 function kvList(obj, round) {
   const dl = h("dl", { class: "kv" });
   for (const [k, v] of Object.entries(obj)) dl.append(h("dt", {}, k), h("dd", {}, valText(v, round)));
   return dl;
+}
+// The pairs of one run as a small table: HEAD, candidate, difference per pair, in
+// measurement order, and their median. `pairs` are [head, candidate].
+function pairTable(pairs, a, id) {
+  const diffs = pairs.map((q) => pairGain(q, a.dir));
+  const usable = diffs.filter(isNum);
+  const body = h("tbody", {}, pairs.map((q, i) => h("tr", {},
+    h("td", { class: "num" }, String(i + 1)), h("td", { class: "num" }, fmt(q[0])), h("td", { class: "num" }, fmt(q[1])),
+    h("td", { class: "num " + gainClass(diffs[i]) }, gainText(diffs[i])))));
+  if (usable.length > 1) body.append(h("tr", { class: "med" }, h("td", { colspan: 3 }, "median difference"), h("td", { class: "num" }, gainText(median(usable)))));
+  return h("div", { class: "pairwrap" }, h("table", { class: "pairs", id },
+    h("thead", {}, h("tr", {}, h("th", { class: "num" }, "pair"), h("th", { class: "num" }, "HEAD"), h("th", { class: "num" }, "candidate"), h("th", { class: "num" }, "difference"))),
+    body));
 }
 function renderDetail(r, a) {
   const wrap = h("div");
@@ -707,22 +857,50 @@ function renderDetail(r, a) {
   // Measurement: what the plugin measured for this run.
   const meas = {};
   const sm = numSamples(r), cs = numList(r.current_samples);
-  const p = a.pair.get(r);
-  if (isNum(r.first_metric)) meas["first measurement"] = fmt(r.first_metric) + unit;
-  if (sm.length) meas[cs.length ? "candidate samples" : "samples"] = sm.map(fmt).join(", ") + unit;
-  if (cs.length) meas["HEAD alongside samples"] = cs.map(fmt).join(", ") + unit;
-  // For an unconfirmed keep (logged as discard) the second measurement did not confirm anything.
-  if ((isNum(r.first_metric) || cs.length) && isNum(r.metric)) meas[r.status === "keep" ? "confirmed value" : "re-measured value"] = fmt(r.metric) + unit + " (median)";
-  if (p && (r.status === "keep" || p.refKind !== "previous")) {
-    const what = { paired: "HEAD measured alongside, median", logged: "current as logged at that time", previous: "the keep before" }[p.refKind];
-    meas["compared with"] = `${fmt(p.ref)}${unit} (${what})`;
-    meas.result = gainText(p.gain);
+  const p = a.pair.get(r), k = a.kind.get(r);
+  const c = confInfo(r, a);
+  const decided = k === "keep" || k === "neutral" || k === "unconfirmed";
+  const pairs = p && p.refKind === "pairs" ? p : null;
+  if (pairs) {
+    // v0.2.2: the paired result first; the absolute medians are only "as measured then".
+    if (decided) {
+      meas.result = k === "neutral"
+        ? `kept as a simplification: not measurably worse than HEAD (median difference ${gainText(p.gain)}; counted as no change)`
+        : `${gainText(p.gain)} than HEAD measured alongside` + (p.n ? ` (median of ${pairsText(p.n)})` : "");
+      if (p.p != null) meas.test = `${pText(p.p)} (exact one-sided paired test) · ${luckText(p.p)}`;
+      else meas.test = SLOW_TAG;
+      if (c && k !== "neutral") meas.decision = c.text;
+    }
+    if (isNum(r.metric)) meas["candidate, median"] = fmt(r.metric) + unit;
+    if (isNum(r.vs)) meas["HEAD alongside, median"] = fmt(r.vs) + unit;
+  } else {
+    if (isNum(r.first_metric)) meas["first measurement"] = fmt(r.first_metric) + unit;
+    if (sm.length) meas[cs.length ? "candidate samples" : "samples"] = sm.map(fmt).join(", ") + unit;
+    if (cs.length) meas["HEAD alongside samples"] = cs.map(fmt).join(", ") + unit;
+    // For an unconfirmed keep (logged as discard) the second measurement did not confirm anything.
+    if ((isNum(r.first_metric) || cs.length) && isNum(r.metric)) meas[r.status === "keep" ? "confirmed value" : "re-measured value"] = fmt(r.metric) + unit + " (median)";
+    if (p && (r.status === "keep" || p.refKind !== "previous")) {
+      const what = { paired: "HEAD measured alongside, median", logged: "current as logged at that time", previous: "the keep before" }[p.refKind];
+      meas["compared with"] = `${fmt(p.ref)}${unit} (${what})`;
+      meas.result = gainText(p.gain);
+    }
   }
   if (a.levelAfter.has(r) && r !== a.baseRun) meas["level after"] = levelText(a.levelAfter.get(r)) + " of the baseline";
   if (isNum(r.noise)) meas.noise = fmt(r.noise);
-  const c = confInfo(r, a);
-  if (c && c.text !== "—") meas.confidence = c.text;
+  if (!pairs && c && c.text !== "—") meas.confidence = c.text;
   if (Object.keys(meas).length) wrap.append(h("div", { class: "kvh" }, "Measurement"), kvList(meas));
+  if (pairs) {
+    if (p.pairs.length) wrap.append(
+      h("div", { class: "kvh" }, `Pairs the decision was made on (${a.config.metric_unit ? a.config.metric_unit + ", " : ""}in measurement order)`),
+      pairTable(p.pairs, a, "pairs-" + r.run));
+    if (p.look.length) wrap.append(
+      h("div", { class: "kvh", title: "The rough first look from autoresearch_run. These pairs led to the keep proposal, so they are never part of the decision." }, "First look (not part of the decision)"),
+      pairTable(p.look, a, "look-" + r.run));
+  } else {
+    // A run that was only looked at (a plain discard) still carries its first-look pairs.
+    const look = pairList(r.look_pairs);
+    if (look.length) wrap.append(h("div", { class: "kvh" }, "First look (HEAD/candidate pairs)"), pairTable(look, a, "look-" + r.run));
+  }
   if (metrics && Object.keys(metrics).length) wrap.append(h("div", { class: "kvh" }, "Metrics"), kvList(metrics, true));
   if (asi && Object.keys(asi).length) wrap.append(h("div", { class: "kvh" }, "Notes"), kvList(asi));
   if (r.timestamp) wrap.append(h("div", { class: "kvh" }, String(r.timestamp)));

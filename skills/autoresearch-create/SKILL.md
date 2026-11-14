@@ -1,13 +1,13 @@
 ---
 name: autoresearch-create
-description: Set up and run an autonomous experiment loop for any measurable target (test speed, bundle size, build time, training loss…). Gathers what to optimize, writes the .auto/ session files, then loops - change, measure, log - while the plugin confirms and commits real gains and reverts the rest. Use when asked to "run autoresearch", "optimize X in a loop", or "start experiments".
+description: Set up and run an autonomous experiment loop for any measurable target (test speed, bundle size, build time, training loss…). Gathers what to optimize, writes the .auto/ session files, then loops - change, look, propose - while the plugin measures each change against the last commit in back-to-back pairs, commits what an exact test confirms and reverts the rest. Use when asked to "run autoresearch", "optimize X in a loop", or "start experiments".
 ---
 
 # Autoresearch
 
-An experiment loop: change the code, measure it, keep what is confirmed to be better, revert the rest, repeat.
+An experiment loop: change the code, take a first look, propose what looks better; the plugin keeps what it can confirm and reverts the rest. Repeat.
 
-**You propose, the plugin decides.** You choose what to try and say what you think the result means. The plugin measures, decides whether a gain is real, and does every commit and revert. You can't type in a result or pick the benchmark command. The tools reject arguments they don't have (`command`, `repeat`, `metric`…) with an error.
+**You propose, the plugin decides.** You choose what to try and which changes to propose. The plugin measures, decides whether a gain is real, and does every commit and revert. You can't type in a result or pick the benchmark command. The tools reject arguments they don't have (`command`, `repeat`, `metric`…) with an error.
 
 Based on pi-autoresearch (https://github.com/davebcn87/pi-autoresearch).
 
@@ -15,10 +15,10 @@ Based on pi-autoresearch (https://github.com/davebcn87/pi-autoresearch).
 
 The tools only work while the user has the loop on (`/autoresearch <goal>`), and only on the experiment branch.
 
-- **`autoresearch_init`** `{ name, metric_name, metric_unit?, direction, repeat? }`: starts a *segment* of comparable runs and freezes how they're measured: `.auto/measure.sh`, `.auto/checks.sh` and every helper file under `.auto/` are hashed, and `repeat` (default 5) is fixed. Needs a branch that isn't main/master, a clean working tree, and an executable `.auto/measure.sh` that is committed (so is `checks.sh`, if there is one).
-- **`autoresearch_run`** `{ timeout_seconds?, checks_timeout_seconds? }`: runs `./.auto/measure.sh` `repeat` times, takes the median, then runs `./.auto/checks.sh` if it exists. It gives you a first look at how the result compares with *current* (the last kept state, as logged earlier) and tells you what to log. There is no `command` parameter.
+- **`autoresearch_init`** `{ name, metric_name, metric_unit?, direction, repeat? }`: starts a *segment* of comparable runs and freezes how they're measured: `.auto/measure.sh`, `.auto/checks.sh` and every helper file under `.auto/` are hashed, and `repeat` (default 5) fixes the mode: 3 or more is standard mode, 1–2 is slow mode (see "Modes"). Needs a branch that isn't main/master, a clean working tree, and an executable `.auto/measure.sh` that is committed (so is `checks.sh`, if there is one).
+- **`autoresearch_run`** `{ timeout_seconds?, checks_timeout_seconds? }`: the **first look** at your change. It measures 3 back-to-back *pairs* (one benchmark run of the last commit, one of your change), then runs `./.auto/checks.sh` if it exists, and tells you whether the change looks better, about equal or worse, and what to log. The first run of a segment measures the baseline instead: the unchanged code, `repeat` times. Without a code change it refuses: there is nothing to compare. There is no `command` parameter.
 - **`autoresearch_log`** `{ status, description, asi?, simplification? }`: records the last run. One log per run. The plugin fills in the numbers itself.
-  - `keep`: a proposal. The plugin measures the last commit and your change **back to back** (see "What a keep costs") and judges only those fresh numbers. Confirmed: it commits your change. Not confirmed: it reverts your change and logs a discard with a note.
+  - `keep`: a proposal. The plugin measures 8 fresh pairs (8 more when those are promising but not conclusive) and applies an exact statistical test to them. Confirmed: it commits your change. Not confirmed: it reverts your change and logs a discard with a note.
   - `discard`, `crash`, `checks_failed`: reverts the code to the last commit (staged, unstaged and untracked changes; `.auto/` is left alone) and logs it.
 - **`autoresearch_pause`** `{ reason }`: turns the loop off and shows the user your reason. This is how you stop.
 
@@ -34,7 +34,7 @@ If a tool answers with `ERROR`, nothing was logged or changed. Read the message;
 | anything else under `.auto/` | Helper files of the benchmark (a workload size, input data, a script it sources). Frozen per segment like the benchmark itself. |
 | `.auto/log.jsonl` | Every run, written by the tools. Don't edit. |
 | `.auto/ideas.md` | Ideas backlog (optional). |
-| `.auto/config.json` | Limits (optional): `{ "maxIterations": 50, "maxNoImprovement": 10, "minImprovement": 0.01 }`. These are the defaults. |
+| `.auto/config.json` | Limits (optional): `{ "maxIterations": 50, "maxNoImprovement": 10, "minImprovement": 0.01 }`. These are the defaults. `minImprovement` is the most a simplification may cost, and the gain a keep needs in slow mode. |
 
 Only `prompt.md`, `ideas.md` and `config.json` may change during a segment (and `log.jsonl`, by the tools). Every other file under `.auto/` is benchmark input: if one is added, edited or removed, `autoresearch_run` refuses.
 
@@ -47,7 +47,7 @@ Only `prompt.md`, `ideas.md` and `config.json` may change during a segment (and 
 3. Read the source. Understand the workload before writing anything.
 4. Write `.auto/prompt.md`, `.auto/measure.sh` and, if the project has tests, `.auto/checks.sh`. `chmod +x` both scripts. Helper files the benchmark reads go under `.auto/` too.
 5. Commit exactly those files (leave out `checks.sh` if you didn't create one, add your helper files): `git add .auto/prompt.md .auto/measure.sh .auto/checks.sh && git commit -m "autoresearch: session setup"`. `autoresearch_init` refuses while `measure.sh` or `checks.sh` have uncommitted changes, so the benchmark of every segment is in git for the user to review. Besides a later benchmark change (see "The benchmark is frozen"), this is the only commit you make yourself.
-6. `autoresearch_init`, then `autoresearch_run` (the baseline: unchanged code, with one uncounted warm-up run), then `autoresearch_log` with `keep`. Then start experimenting.
+6. `autoresearch_init`, then `autoresearch_run` (the baseline: unchanged code, with one uncounted warm-up run), then `autoresearch_log` with `keep`. Then start experimenting. The baseline's numbers are for orientation; no later decision uses them.
 
 ### `.auto/prompt.md`
 
@@ -93,9 +93,9 @@ The goal is to make the real thing better, not the number. Never:
 - **It must measure the real workload.** A benchmark that's fast because it does less is worthless.
 - **It must not write into the project, and not under `.auto/`.** Put output files in a gitignored path or outside the project (`"$TMPDIR"`). If the benchmark changes tracked or untracked project files, a keep is refused, because the committed code would differ from the measured code. If it writes under `.auto/`, it changes its own frozen inputs: the run says so, and neither a keep nor the next run is accepted.
 - **Anything it reads must be frozen or committed.** Workload sizes, input data and scripts it sources belong in the project (tracked) or under `.auto/`. Don't make it read gitignored files you could edit: that's the same cheat as editing the benchmark.
-- **It runs many times.** Each measurement is `repeat` runs, and every proposed keep costs about twice as many again. Keep one run short where the workload allows.
-- **It must run on the last commit too.** For a keep the plugin swaps the project's files to the last commit, measures, and swaps back, several times. A benchmark that builds must rebuild what changed (changed files get new timestamps, as after `git checkout`); build outputs belong in gitignored folders, which the swap leaves alone.
-- **Choose `repeat` at init.** 5 (the default) or more for anything under about a minute. With 3 or more runs the plugin estimates the noise from the spread, and a gain must clear it. Use 1 or 2 only when a single run takes minutes; then there's no noise estimate and a keep needs the change to be at least `minImprovement` (1 %) better than the last commit, measured back to back.
+- **Time only the workload.** If the script builds or compiles, do that first and start the clock afterwards. Between the two runs of every pair the plugin swaps the changed files (they get new timestamps, as after `git checkout`), so the run right after a swap would pay for the rebuild. A rebuild inside the timed part can't produce a false keep, but it hides every gain smaller than itself; `autoresearch_log` tells you when the pairs show that pattern.
+- **It runs many times, on the last commit too.** A first look is 6 benchmark runs and a proposed keep 16 to 32, half of them on the last commit. Keep one run short where the workload allows. Build outputs belong in gitignored folders, which the swap leaves alone.
+- **Choose `repeat` at init** (see "Modes"): leave the default 5 unless one run takes minutes.
 - Print anything that helps you decide what to try next (phase timings, counts); only `METRIC` lines are parsed.
 - **Print the `METRIC` lines last.** Only the last 1 MB of a run's output is kept, and you only see its last 80 lines.
 
@@ -107,35 +107,72 @@ If the project has no tests, say so to the user during setup and note it in prom
 
 ## The loop
 
-One experiment is: change code → `autoresearch_run` → `autoresearch_log`. Don't touch any file between run and log: a keep is refused when the code differs from what was measured.
+One experiment is: change code → `autoresearch_run` → `autoresearch_log`. Don't touch any file between run and log, or while either tool runs: a keep is refused when the code differs from what was measured.
 
-**What to log**
+### Why everything is measured in pairs
 
-- The run says "better" → log `keep`. Don't decide yourself whether it's real; the plugin measures again and judges. If it isn't confirmed, your change is reverted and logged as a discard. That's the system working, not a failure. Don't retry the same change hoping for a luckier draw.
-- Not better → log `discard`. (A `keep` on a first measurement that isn't better than current is refused.)
-- The change **removes more lines than it adds**, and performance is about equal → log `keep` with `simplification: true`. The plugin checks the diff: without a net deletion the flag is refused. It's kept when the back-to-back measurement shows it's not worse than the last commit beyond the noise, and not worse by more than `minImprovement` (1 %). It isn't a way to keep a performance change whose first measurement didn't look better; log that as `discard`.
+The same code measures differently minutes apart (10 % and more on a busy machine), so a number from the log, or from the baseline, says nothing about a number from now. The plugin therefore never compares across time. Every comparison is a **pair**: one benchmark run of the last commit and one of your change, back to back, with the order inside the pairs alternating (last commit first, then your change first, and so on). A load burst or a drift hits both runs of a pair alike. A pair's result is the relative difference of its two runs.
+
+To measure a pair the plugin swaps the project's files to the last commit and back (only the files your change touches; gitignored files and `.auto/` never). It checks the files after every swap and puts your change back whatever happens. If a measurement is cut off (a crash, a restart), the next tool call or `/autoresearch` puts your change back first and tells you. A file you edit while a tool runs is never overwritten, but the measurement fails and the loop pauses until the edit is out of the way.
+
+### The first look (`autoresearch_run`)
+
+3 pairs = 6 benchmark runs, then the checks. You get each pair's two numbers and the median difference, with one of three verdicts:
+
+- **Looks better** → propose it: log `keep`.
+- **Looks about equal** or **looks worse** → log `discard`. (A `keep` is refused when the look doesn't say better.)
+
+It is a rough look, not a result: the median of 3 pairs is often off by a few percent, in either direction.
+
+### The decision (`autoresearch_log` with `keep`)
+
+The plugin measures **8 fresh pairs** (16 benchmark runs) and applies an exact paired test (Wilcoxon signed-rank, one-sided) to their differences. The look's pairs are never reused: you proposed because of them, so they are biased.
+
+- Clearly better (p ≤ 0.005; with 8 pairs that means better in all 8) → confirmed, committed.
+- Clearly not (p > 0.25) → not confirmed: reverted and logged as a discard with a note.
+- In between → **8 more pairs** (16 more runs); all 16 are tested together and must reach p ≤ 0.005.
+
+A change that does nothing is kept at most 1 % of the time, whatever the noise looks like. The price is that small gains on a noisy benchmark are often not confirmed: with ±2 % noise per run a 3 % gain is practically always confirmed, a 1 % gain about one time in three. On a machine with heavy load bursts even larger gains can fail. That is the system working, not a failure. Don't retry the same change hoping for a luckier draw; if you believe in an idea, make the gain bigger.
+
+**When to propose.** Propose a `keep` whenever the look says better. Proposing costs benchmark time, never truth: the plugin decides on fresh numbers, and a proposal that isn't confirmed is logged as one discarded run, exactly like a discard you log yourself. So there is nothing to gain from being cautious on your own judgment, and nothing from proposing what the look calls equal or worse (it is refused). The one reason to hold back is time: when a single benchmark run is long and the look's gain is tiny with one pair pointing the other way, `discard` and move on.
+
+**What to log otherwise**
+
+- The change **removes more lines than it adds**, and the look says about equal → log `keep` with `simplification: true`. The plugin checks the diff: without a net deletion the flag is refused. It measures 8 pairs and keeps the change unless it is measurably worse than the last commit (the same test in the other direction, p ≤ 0.05) or its median is worse by more than `minImprovement` (1 %). A simplification is kept for being simpler; it counts as a kept experiment but adds nothing to the progress number. It isn't a way to keep a performance change whose look didn't say better; log that as `discard`.
 - The benchmark failed → fix it if the mistake is trivial and run again, otherwise log `crash`.
 - Checks failed → fix and run again, or log `checks_failed`.
+- The benchmark failed **on the last commit** (the tool says so; your change is put back and nothing is logged) → call the same tool again if the benchmark is flaky. If it really fails without your change, log `discard` and `autoresearch_pause`.
 
-**What a keep costs, and why**
+### What it costs, in benchmark runs
 
-The same code measures differently minutes apart (10 % and more on a busy machine), so a number from the log can't be compared with a number from now. For a proposed keep the plugin therefore measures both sides together:
+| | Standard mode | Slow mode (`repeat` 1–2) |
+|---|---|---|
+| Baseline (once per segment) | 1 warm-up + `repeat` | 1 warm-up + `repeat` |
+| First look | 6 (3 pairs) | 2 (1 pair) |
+| Proposed keep | 16 (8 pairs), or 32 when extended | 2 × `repeat` |
 
-1. it sets the project's files to the last commit and runs the benchmark half of `repeat` times (rounded up, and at least 3 when `repeat` is 3 or more),
-2. puts your change back (checked against what was measured) and runs it `repeat` times,
-3. sets the files to the last commit again for the same number of runs as in step 1, and puts your change back.
+Half of these runs are on the last commit. The checks run once per look, on your change.
 
-That's about `2 × repeat` more benchmark runs per proposed keep (9 with `repeat` 3, 11 with 5, 20 with 10), kept or not. Only these numbers decide: your change must be better than the last commit by at least 2.5 standard errors of the measured noise. The first measurement is only a first look, so it can say "better" and the keep still isn't confirmed, and that is usually right.
+### Modes
 
-While `autoresearch_log` runs, don't touch any file: the project is temporarily at the last commit. A file edited in that time is never overwritten, but the keep fails and the loop pauses until the edit is out of the way. Gitignored files (dependencies, build caches) and `.auto/` are never swapped. If the benchmark fails on the last commit, your change is put back, nothing is logged and the tool says so. If a confirmation is cut off (a crash, a restart), the next tool call or `/autoresearch` puts your change back first and tells you.
+- **Standard** (`repeat` 3 or more; the default is 5): everything above. Use it whenever one benchmark run takes less than about a minute.
+- **Slow** (`repeat` 1 or 2): only for benchmarks where one run takes minutes. A look is 1 pair; a proposed keep is decided on `repeat` fresh pairs and needs **every** pair better and a median gain of at least `minImprovement` (1 %). There is **no statistical check** in this mode: with so few runs a lucky draw can be kept. The tools and `/autoresearch status` say so. Tell the user when you choose it, and say it again when you report results.
 
-**Progress** is reported as the gain of the kept experiments multiplied together ("3 kept, 12.4% better overall"), each one measured back to back. The baseline and current values next to it were measured at different times; don't compute progress from them. "Kept" never counts the baseline.
+### Reporting progress
+
+After every log the tool gives you the sentence to use, for example:
+
+> 12.4% lower than the baseline, the compounded result of 3 confirmed keeps (not a ratio of raw numbers)
+
+(For a higher-is-better metric it says "higher". If the keeps net out worse, it says so: "… higher than the baseline (worse)".)
+
+Use that sentence, in those words, whenever you state how far the session has come (to the user, in prompt.md, in a summary). It is built from the kept experiments, each measured against HEAD in its own pairs: every keep multiplies the level by its candidate ÷ HEAD ratio, so two 10 % reductions read "19.0% lower", not 20 % or 21 %. **Never quote a ratio or a difference of absolute numbers measured at different times**, such as "baseline 4.2 s, now 3.6 s, so 14 % faster": the baseline was measured hours ago on a machine in a different state, and that calculation is wrong. The tools show the baseline and current values only for orientation, labelled as not comparable. "Kept" never counts the baseline, and simplifications don't add to the gain.
 
 **Always pass `asi`**: what you *learned*, not what you did, e.g. `{ "hypothesis": "...", "learned": "...", "next_focus": "..." }`. A reverted experiment leaves no code behind; the log is the only record it existed.
 
 **More rules**
 
-- Compare with *current*, which is the last keep and always equals the code at HEAD. There is no separate "best".
+- Every candidate is compared with *current*: the last keep, which always equals the code at the last commit, measured fresh next to it. There is no separate "best".
 - Git belongs to the plugin. After setup, never commit, stash, reset, check out or switch branches yourself (one exception: committing a benchmark change right before `autoresearch_init`, below). If the branch or HEAD changes underneath, the tools pause the loop.
 - Don't loop on one idea. Reverted three variants of it? Try something structurally different.
 - Update "What's Been Tried" in `.auto/prompt.md` every few runs. Put ideas for later in `.auto/ideas.md`. Don't commit these edits; the plugin leaves `.auto/` uncommitted on purpose and finalize deals with it.

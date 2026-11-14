@@ -188,3 +188,78 @@ Shows baseline → current, per-keep confidence, neutral keeps, baseline marker,
 - Drift between a keep and experiments hours later isn't corrected (current isn't re-measured).
 - The benchmark's own validity (overfitting to its input) can't be checked by code; the skill
   lists what counts as cheating, and benchmark edits are visible as new segments.
+
+---
+
+# v0.2.1: changes after the first live tests (these override the text above where they differ)
+
+Two live testers confirmed the guarantees hold, and found that comparing a candidate with
+current's LOGGED samples is wrong: machine speed drifts within minutes (10 %+ on a busy
+machine), which rejected sound changes, and an unluckily slow logged reference let a no-op
+through (~9 % per no-op in simulation). Logged numbers from different times are not comparable.
+
+## Paired confirmation (replaces "Confirmation" in autoresearch_log → keep)
+
+On a proposed keep, after the fingerprint check, the plugin measures HEAD and the candidate
+back to back, bracketing the candidate so linear drift cancels:
+
+1. swap the scope to HEAD → measure `ceil(repeat/2)` runs (at least 3 when repeat ≥ 3)
+2. swap back to the candidate (verify the tree hash equals the fingerprint) → measure `repeat` runs
+3. swap to HEAD → measure the other half → swap back to the candidate
+
+`judge(current = HEAD samples from 1+3, candidate = samples from 2)`. The logged current samples
+are never used for a decision. The first measurement only serves as a cheap filter (below).
+
+- The swap must preserve ignored/untracked-ignored state (node_modules, build caches) and restore
+  the candidate exactly (added, deleted, renamed files, modes). The candidate's tree object from
+  the fingerprint can be the source of truth. A swap in progress is recorded in plugin storage;
+  every tool call and loop start first restores an interrupted swap. If HEAD fails the benchmark
+  during the swap, restore the candidate and return an error (nothing logged).
+- Checks are not re-run on HEAD.
+- Run entry: `samples` = candidate samples (2), `current_samples` = HEAD samples (1+3),
+  `vs` = their median, `first_metric` as before. `metric` = median of `samples`.
+  Unconfirmed keeps record the same fields plus `confidence` (for auditing) and the note.
+- Pre-filter: a non-simplification keep is still refused when the first measurement wasn't
+  better than the logged current (no re-measure, nothing logged; the agent logs discard).
+- `simplification: true` is only accepted when the diff removes more lines than it adds
+  (net deletion; `git diff --numstat` against HEAD including untracked files). Otherwise refuse.
+  It is confirmed when the candidate is not worse than HEAD beyond the noise AND not worse by
+  more than `minImprovement` relative.
+- Baseline: unchanged (one measurement on a clean tree after a warm-up).
+- Cost: a confirmed or rejected keep costs about 3 × `repeat` benchmark runs in total.
+
+## Progress numbers
+
+Because absolute numbers from different times aren't comparable, "improvement" is the
+**compounded gain of the confirmed keeps** in the segment (product of each keep's ratio
+candidate/HEAD from its paired confirmation), not `current / baseline`. Status, tool output, the
+compaction summary and the dashboard all use it; the baseline and current absolute values are
+shown as "measured at the time". "kept" counts never include the baseline.
+`/autoresearch status` covers the whole session: one line per segment (name, runs, kept,
+compounded gain) plus totals.
+
+## Frozen benchmark inputs
+
+The segment hash and the run fingerprint cover every file under `.auto/` except `log.jsonl`,
+`ideas.md`, `config.json` and `prompt.md` (so helper files a benchmark reads are frozen too).
+`autoresearch_init` refuses when `.auto/measure.sh` or `.auto/checks.sh` differ from HEAD
+(uncommitted benchmark edits): the agent commits them first, so every segment's benchmark is in git.
+
+## Other fixes
+
+- Start-up continue: only for loops that were already active when the plugin instance started
+  (snapshot at setup), and only if still active when the timer fires.
+- Compaction input: `<skill_content …>…</skill_content>` blocks are removed from user messages
+  before they're read; the plugin prefix and the user-context label are found anywhere in a message.
+- Unknown tool arguments are rejected with an error naming them.
+- `/autoresearch` on trunk when `autoresearch/*` branches exist: say which branch to switch to
+  instead of starting a new setup.
+- Every git call the plugin makes passes `-c core.hooksPath=/dev/null`.
+- The pinned rule says "a permission error or rejection", not the literal words "Permission denied".
+- After a stop whose notice couldn't start a turn (interrupt, provider failure), the reason is
+  kept and shown by the next `/autoresearch` or `/autoresearch status`.
+- The "without improvement" counter shown to the agent says it counts since the last start.
+- judge(): keep the threshold at 2 standard errors unless a simulation of the paired design
+  (no-op experiments, uniform ±2 % noise, repeat 5, keep proposed when the first measurement
+  looks better) shows more than 3 % false keeps per no-op; then use 2.5. Record the simulated
+  rate in a test.

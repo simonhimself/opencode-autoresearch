@@ -90,6 +90,31 @@ The goal is to make the real thing better, not the number. Never:
 
 `#!/bin/bash` and `set -euo pipefail`. Run the workload, print `METRIC <name>=<number>` for the primary metric (and any secondary ones), exit non-zero on failure.
 
+Start from this shape: prepare first (untimed), then time only the workload, then print.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."            # the project folder
+
+# 1. Prepare: NOT timed. Build, compile, generate fixed input. Output to gitignored paths.
+npm run build >/dev/null 2>&1
+
+# 2. Measure: only the work you're optimizing, on the same input every run.
+start=$(python3 -c 'import time; print(time.perf_counter_ns())')
+node dist/process-orders.js fixtures/orders-10k.json >/dev/null
+end=$(python3 -c 'import time; print(time.perf_counter_ns())')
+
+# 3. Report.
+echo "METRIC total_ms=$(( (end - start) / 1000000 ))"
+```
+
+Adapt the commands to the project. If the workload is very short (a few ms), loop it inside step 2 so one run takes at least ~100 ms; otherwise the number is too coarse to see small gains.
+
+**Tell the user what is timed.** Before the first experiment, say in one sentence what step 2 measures and what step 1 prepares (e.g. "It builds once untimed, then times processing the 10k-order fixture"), so they can object before the loop starts.
+
+**If the baseline prints a BENCHMARK CHECK**, the identical baseline runs showed a problem: too much spread, a coarse number, or a much slower first run (a build or cache inside the timed part). Tell the user, fix `measure.sh` if you can (commit the fix, `autoresearch_init` again), and only then start experimenting. If the noise is in the nature of the workload, say so and continue.
+
 - **It must measure the real workload.** A benchmark that's fast because it does less is worthless.
 - **It must not write into the project, and not under `.auto/`.** Put output files in a gitignored path or outside the project (`"$TMPDIR"`). If the benchmark changes tracked or untracked project files, a keep is refused, because the committed code would differ from the measured code. If it writes under `.auto/`, it changes its own frozen inputs: the run says so, and neither a keep nor the next run is accepted.
 - **Anything it reads must be frozen or committed.** Workload sizes, input data and scripts it sources belong in the project (tracked) or under `.auto/`. Don't make it read gitignored files you could edit: that's the same cheat as editing the benchmark.

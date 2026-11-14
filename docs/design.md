@@ -359,3 +359,13 @@ the same rule.
   finally fail.
 - Dashboard and compaction show `gain` and "confirmed (p = …)" per keep; old entries with
   `confidence` still render.
+
+## Benchmark check (v0.2.3)
+
+The baseline's runs are identical code back to back, so they show the benchmark's own quality at
+no extra cost. `benchmarkCheck()` (stats.ts) warns, never blocks, when: the typical deviation
+from the median exceeds 5 %; the metric is a small integer (coarse steps); or the uncounted
+warm-up run was more than 20 % worse than the median (a cold-start cost, like a build, inside the
+timed part). The warnings appear in the baseline's tool output with an instruction to tell the
+user and fix `measure.sh` before experimenting. The setup skill gives a measure.sh template
+(prepare untimed → time the workload → print) and asks the agent to tell the user what is timed.

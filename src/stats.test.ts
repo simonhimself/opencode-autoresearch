@@ -6,6 +6,7 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test"
 import type { Direction, Pair } from "./state.ts"
 import {
   ALPHA_STAGE,
+  benchmarkCheck,
   CONFIRM_PAIRS,
   decide,
   EXTEND_BELOW,
@@ -384,5 +385,30 @@ describe("power: how often a real gain is confirmed (8 + 8 pairs)", () => {
     expect(rates["1 %"]).toBeGreaterThan(0.99)
     expect(rates["8 %"]).toBeLessThan(0.2)
     expect(rates["12 %"]).toBeLessThan(0.01)
+  })
+})
+
+describe("benchmarkCheck", () => {
+  test("a steady, fine-grained benchmark gets no warnings", () => {
+    expect(benchmarkCheck({ samples: [812, 805, 818, 809, 811], warmup: 830, direction: "lower" })).toEqual([])
+  })
+  test("large spread between identical runs is reported", () => {
+    const w = benchmarkCheck({ samples: [100, 120, 90, 130, 95], direction: "lower" })
+    expect(w).toHaveLength(1)
+    expect(w[0]).toContain("Identical runs differ")
+  })
+  test("a coarse small-integer metric is reported", () => {
+    const w = benchmarkCheck({ samples: [4, 5, 4, 4, 5], direction: "lower" })
+    expect(w.some((s) => s.includes("coarse"))).toBe(true)
+  })
+  test("a slow warm-up (cold-start cost inside the timed part) is reported, in the metric's direction", () => {
+    expect(benchmarkCheck({ samples: [100, 101, 99, 100, 100], warmup: 160, direction: "lower" })[0]).toContain("warm-up")
+    expect(benchmarkCheck({ samples: [100, 101, 99, 100, 100], warmup: 60, direction: "higher" })[0]).toContain("warm-up")
+    // a warm-up that's better than the rest is no warning
+    expect(benchmarkCheck({ samples: [100, 101, 99, 100, 100], warmup: 60, direction: "lower" })).toEqual([])
+  })
+  test("too few samples (slow mode) or a zero median: no verdict", () => {
+    expect(benchmarkCheck({ samples: [100, 160], warmup: 300, direction: "lower" })).toEqual([])
+    expect(benchmarkCheck({ samples: [0, 0, 0], direction: "lower" })).toEqual([])
   })
 })

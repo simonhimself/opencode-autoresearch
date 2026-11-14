@@ -289,3 +289,53 @@ export function swapOrderEffect(pairs: Pair[], direction: Direction): boolean {
   if (candidateAfterSwap.length < 3 || headAfterSwap.length < 3) return false
   return Math.max(...candidateAfterSwap) < Math.min(...headAfterSwap)
 }
+
+// ── Benchmark check at the baseline ───────────────────────
+
+/** Relative spread between identical runs above which small gains get hard to confirm. */
+export const SPREAD_WARN = 0.05
+/** A warm-up this much worse than the median suggests a cold-start cost inside the timed part. */
+export const WARMUP_WARN = 0.2
+
+/**
+ * Look at the baseline's runs (identical code, back to back) for signs of a benchmark that will
+ * make the loop slow or blind. Costs no extra runs: it reuses the warm-up and the baseline
+ * samples. Returns plain-language warnings for the agent to fix with the user before experimenting.
+ * Never blocks: some workloads are noisy by nature, and the test stays honest either way.
+ */
+export function benchmarkCheck(input: { samples: number[]; warmup?: number; direction: Direction }): string[] {
+  const { samples, warmup, direction } = input
+  const warnings: string[] = []
+  if (samples.length < 3) return warnings
+  const mid = median(samples)
+  if (mid === 0) return warnings
+  const spread = median(samples.map((v) => Math.abs(v - mid))) / Math.abs(mid)
+
+  if (spread > SPREAD_WARN) {
+    warnings.push(
+      `Identical runs differ by about ${(spread * 100).toFixed(0)} % (typical deviation from the median). ` +
+        "Gains smaller than that will rarely be confirmed. Usual causes: a build, install or cache fill inside the timed part; " +
+        "input that changes between runs; too little work per run; other load on the machine.",
+    )
+  }
+  // Coarse numbers: a small integer metric (e.g. whole milliseconds of a 4 ms workload) can only
+  // move in big relative steps, so pairs tie and small gains are invisible.
+  const distinct = new Set(samples).size
+  if (samples.every(Number.isInteger) && Math.abs(mid) < 50 && distinct > 1) {
+    warnings.push(
+      `The metric is coarse (whole numbers around ${mid}): one step is ${(100 / Math.abs(mid)).toFixed(0)} %. ` +
+        "Do more work per run (repeat the workload inside measure.sh) or report a finer unit.",
+    )
+  }
+  if (warmup !== undefined && Number.isFinite(warmup)) {
+    const worse = direction === "lower" ? (warmup - mid) / Math.abs(mid) : (mid - warmup) / Math.abs(mid)
+    if (worse > WARMUP_WARN) {
+      warnings.push(
+        `The first (warm-up) run was ${(worse * 100).toFixed(0)} % worse than the rest. Something in the timed part costs more ` +
+          "on a cold start, like a build, a compile or a cache fill. Experiments swap files before many runs, so that cost can " +
+          "come back and hide real gains. Do it before the clock starts.",
+      )
+    }
+  }
+  return warnings
+}

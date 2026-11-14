@@ -68,7 +68,7 @@ import {
   type RunStatus,
   type Settings,
 } from "./state.ts"
-import { ALPHA_STAGE, CONFIRM_PAIRS, decide, headFirst, isSlow, LOOK_PAIRS, lookPairs, stagePairs, swapOrderEffect } from "./stats.ts"
+import { benchmarkCheck, ALPHA_STAGE, CONFIRM_PAIRS, decide, headFirst, isSlow, LOOK_PAIRS, lookPairs, stagePairs, swapOrderEffect } from "./stats.ts"
 
 export const MEASURE_COMMAND = "./.auto/measure.sh"
 export const CHECKS_COMMAND = "./.auto/checks.sh"
@@ -811,13 +811,17 @@ async function runLocked(host: Host, input: unknown, context: ToolCtx, cwd: stri
     let wallMs = 0
     let look: PairBatch | undefined
     let checks: ShellResult | null = null
+    let warmupValue: number | undefined
     try {
       if (isBaseline) {
         // One uncounted run first: the very first run is often slower (cold caches, a
         // first build), and a slow baseline makes the absolute numbers look odd later.
         await context.progress?.({ status: "warm-up run" }).catch(() => {})
         host.setStatus(cwd, { running: true, command: "warm-up", startedAt: Date.now() })
-        await bash(MEASURE_COMMAND, cwd, timeoutSeconds * 1000, context.signal)
+        const warm = await bash(MEASURE_COMMAND, cwd, timeoutSeconds * 1000, context.signal)
+        // Kept (not counted) for the benchmark check: a much slower first run hints at a
+        // build or cache fill inside the timed part.
+        if (warm.code === 0 && !warm.timedOut) warmupValue = parseMetrics(warm.output)[config.metric_name]
         const result = await measure(host, cwd, config, config.repeat, timeoutSeconds, context, "measuring the baseline")
         ;({ samples, metrics, last, failure, wallMs } = result)
       } else {
@@ -921,6 +925,20 @@ async function runLocked(host: Host, input: unknown, context: ToolCtx, cwd: stri
           ` · wall ${(wallMs / 1000).toFixed(2)}s`,
       )
       if (samples.length > 1) lines.push(`samples: ${samples.map(fmt).join(", ")}`)
+      if (metric !== null) {
+        const warnings = benchmarkCheck({ samples, warmup: warmupValue, direction: config.direction })
+        if (warnings.length) {
+          lines.push(
+            "",
+            "BENCHMARK CHECK: the runs above were identical code, and they suggest the benchmark will make the loop slow or blind:",
+            ...warnings.map((w) => `- ${w}`),
+            "Before experimenting, tell the user this in a sentence or two and fix .auto/measure.sh if you can " +
+              "(commit the fix, then autoresearch_init again for a fresh baseline). If the noise is in the nature of the " +
+              "workload, say so and continue: results stay honest, small gains just won't be confirmed.",
+            "",
+          )
+        }
+      }
     } else {
       const n = look!.pairs.length
       lines.push(

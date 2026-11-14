@@ -124,7 +124,7 @@ What a step costs, in benchmark runs:
 
 Slow mode is for workloads where one run takes minutes: the agent sets `repeat` to 1 or 2 when the segment starts. It has no statistical guarantee: a keep needs every pair to be better and a median gain of at least `minImprovement`, and the plugin says so in its output.
 
-If the benchmark rebuilds the project on every run, that rebuild time can hide small gains (it can't cause a false keep). Build once in the setup and time only the workload.
+The benchmark script times itself and prints the number, so what it times matters: it should build or prepare first (untimed), then time only the work you're optimizing, on the same input every run. A build inside the timed part can't cause a false keep, but it hides small gains. The agent writes the script during setup from a template that does this, and tells you what it times before experimenting. The baseline then checks the benchmark for free: its runs are identical code, so if they swing too much, the number is too coarse, or the first run was much slower (a build or cache inside the timing), the agent is told to report and fix it first.
 
 ## Long sessions
 

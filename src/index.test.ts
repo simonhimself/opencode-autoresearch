@@ -443,6 +443,9 @@ describe("baseline", () => {
     expect(out).toContain("ms: 100")
     expect(out).toContain("samples: 100, 101, 99")
     expect(calls(dir)).toBe(4)
+    // the warm-up was 5× slower: the benchmark check says so (a cold-start cost inside the timing)
+    expect(out).toContain("BENCHMARK CHECK")
+    expect(out).toContain("warm-up")
     expect(await p.log("s", { status: "keep", description: "baseline" })).toContain("baseline")
     expect(head(dir)).toBe(before)
     expect(runsOf(dir)).toHaveLength(1)
@@ -456,6 +459,15 @@ describe("baseline", () => {
       run: 1,
       segment: 1,
     })
+  })
+
+  test("a steady baseline gets no benchmark check", async () => {
+    const { dir, p } = await started()
+    await p.init("s")
+    setQueue(dir, [102, 100, 101, 99])
+    const out = await p.run("s")
+    expect(out).toContain("This is the baseline")
+    expect(out).not.toContain("BENCHMARK CHECK")
   })
 
   test("a crashed baseline can be logged as crash; the next clean run is still the baseline", async () => {

@@ -33,13 +33,19 @@
   .pill.reconnecting .dot { background: var(--checks); }
   .pill.running { color: var(--fg); max-width: 100%; }
   .pill.running code { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; max-width: 38ch; }
-  .spin { width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; flex: none; }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  /* "Running" indicator: a dot that the 1 s timer tick dims and lights. No CSS animation on
+     purpose: a spinner animates every frame for hours, right while a benchmark is being timed. */
+  .beat { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .beat.dim { opacity: .35; }
+  /* Fixed width, so a new second never moves the header around it. */
+  #elapsed { display: inline-block; min-width: 5ch; text-align: right; contain: layout style; }
   .note { font-size: 12px; color: var(--muted); margin: -6px 0 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
   .segs { display: inline-flex; flex-wrap: wrap; gap: 4px; }
   .segs button { font: inherit; font-size: 12px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
   .segs button code { font-family: var(--mono); font-size: 11px; }
   .segs button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); background: var(--soft); }
+  .charthead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 8px 10px 0; }
+  .charthead .sub { font-size: 12px; }
   .mono { font-family: var(--mono); font-size: 12px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
   .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; min-width: 0; }
@@ -71,6 +77,7 @@
   .s-crash { color: var(--crash); } .s-checks_failed { color: var(--checks); }
   .s-neutral, .s-unconfirmed { border-style: dashed; }
   .rownote { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .cmp { color: var(--muted); font-size: 12px; }
   .commit { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   .desc { min-width: 220px; word-break: break-word; }
   dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; font-size: 12.5px; }
@@ -90,7 +97,7 @@
       <div class="sub" id="metricinfo"></div>
     </div>
     <div class="spacer"></div>
-    <span class="pill running" id="running" hidden><span class="spin"></span><code id="runcmd"></code><span class="num" id="elapsed">00:00</span></span>
+    <span class="pill running" id="running" hidden><span class="beat" id="beat"></span><code id="runcmd"></code><span class="num" id="elapsed">00:00</span></span>
     <span class="pill" id="conn"><span class="dot"></span><span id="conntext">connecting</span></span>
   </header>
   <div class="note" id="segnote" hidden></div>
@@ -128,22 +135,28 @@ function fmt(x) {
   if (Math.abs(x) >= 1e6) return String(Math.round(x));
   return String(Number(x.toPrecision(6)));
 }
-function pct(v, base) {
-  if (!isNum(v) || !isNum(base) || base === 0) return null;
-  return ((v - base) / Math.abs(base)) * 100;
+// Percentages are always shown without a sign: "12.5% better" / "3.1% worse" (gains) or a
+// plain level ("87.5%"). A signed delta reads differently for lower- and higher-is-better.
+function fmtPctNum(p) {
+  const abs = Math.abs(p);
+  // Fewer decimals for larger numbers (the limits are where rounding reaches 10 and 100, so
+  // 9.999… reads "10.0%", not "10.00%"). Then add decimals until the rounded text is no
+  // longer zero, so a small change never reads "0.00%".
+  let d = abs >= 99.95 ? 0 : abs >= 9.995 ? 1 : 2;
+  while (Number(abs.toFixed(d)) === 0 && d < 4) d++;
+  return abs.toFixed(d) + "%";
 }
-// Below this a change counts as zero: no sign, no colour.
-const pctZero = (p) => p == null || Math.abs(p) < 0.00005;
-function fmtPct(p) {
-  if (p == null) return "—";
-  if (pctZero(p)) return "0%";
-  // Add decimals until the rounded text is no longer zero, so a small change never reads "-0.0%".
-  let d = Math.abs(p) >= 100 ? 0 : Math.abs(p) >= 10 ? 1 : 2;
-  while (Number(p.toFixed(d)) === 0 && d < 4) d++;
-  return (p > 0 ? "+" : "") + p.toFixed(d) + "%";
+// Below this a gain counts as zero: no wording, no colour.
+const gainZero = (g) => g == null || Math.abs(g) < 0.0000005;
+// g = fraction better (negative = worse), already direction-aware.
+function gainText(g) {
+  if (g == null) return "—";
+  if (gainZero(g)) return "no change";
+  return fmtPctNum(g * 100) + (g > 0 ? " better" : " worse");
 }
-// A change is "good" when it moves in the configured direction.
-const pctClass = (p, dir) => (pctZero(p) ? "" : (dir === "higher" ? p > 0 : p < 0) ? "good" : "bad");
+const gainClass = (g) => (gainZero(g) ? "" : g > 0 ? "good" : "bad");
+const gainOf = (ratio, dir) => (dir === "higher" ? ratio - 1 : 1 - ratio);
+const levelText = (l) => (isNum(l) ? fmtPctNum(l * 100) : "—");
 function fmtX(c) {
   const t = Math.abs(c) >= 100 ? c.toFixed(0) : c.toFixed(1);
   return (Number(t) === 0 ? "0.0" : t) + "×"; // never "-0.0×"
@@ -161,14 +174,41 @@ function mmss(ms) {
   const p = (n) => String(n).padStart(2, "0");
   return (hh ? hh + ":" + p(mm) : p(mm)) + ":" + p(ss);
 }
-const shortHash = (x) => (typeof x === "string" && x ? x.slice(0, 7) : null);
-const numSamples = (r) => (Array.isArray(r.samples) ? r.samples.filter(isNum) : []);
+const numList = (x) => (Array.isArray(x) ? x.filter(isNum) : []);
+const numSamples = (r) => numList(r.samples);
+function median(xs) {
+  const s = [...xs].sort((a, b) => a - b), mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+// One short id for "the benchmark" of a segment: the first 7 characters of the hash of
+// .auto/measure.sh, plus (v0.2.1) "+" and the first 4 of inputs_hash, the hash over the other
+// frozen files under .auto/ (inputs_hash does not cover measure.sh or checks.sh).
+const hashStr = (x) => (typeof x === "string" && x ? x : null);
+function benchId(config) {
+  const m = hashStr(config.measure_hash), i = hashStr(config.inputs_hash);
+  if (!m && !i) return null;
+  return (m ? m.slice(0, 7) : "?") + (i ? "+" + i.slice(0, 4) : "");
+}
+// Different when any of the three hashes differs. Each is compared only when both segments
+// have it (a segment from before v0.2.1 has no inputs_hash), so "unknown" never reads as different.
+function sameBench(a, b) {
+  for (const k of ["measure_hash", "checks_hash", "inputs_hash"]) {
+    if (hashStr(a[k]) && hashStr(b[k]) && a[k] !== b[k]) return false;
+  }
+  // checks.sh added or removed (null on one side, a hash on the other) is a different benchmark too.
+  if ("checks_hash" in a && "checks_hash" in b && Boolean(hashStr(a.checks_hash)) !== Boolean(hashStr(b.checks_hash))) return false;
+  return true;
+}
 
 // ---------- state ----------
 let model = null;            // { segments: [{ config, runs }] } in log order; the last one is the live segment
 let selectedSeg = null;      // segment id the user picked; null = follow the latest segment
 const expanded = new Set();  // "segment:run" keys whose detail row is open (survives re-renders)
+let chartMode = "level";     // "level" (relative, the honest default) or "raw" (values as measured); survives re-renders
 let fetchSeq = 0;
+let logText = null;          // the log as last rendered: an unchanged log is not rendered again
+let dataVersion = 0;         // goes up whenever the model changes; part of the chart's draw key
+let renderPending = false;   // the log changed while the tab was hidden; render when it shows again
 
 function parseLog(text) {
   const segments = [], byId = new Map();
@@ -192,45 +232,103 @@ function parseLog(text) {
 
 async function loadLog() {
   const seq = ++fetchSeq;
+  let text = null;
   try {
     const res = await fetch("/log.jsonl", { cache: "no-store" });
-    const text = res.ok ? await res.text() : "";
-    if (seq !== fetchSeq) return; // a newer fetch started; drop this stale one
-    model = parseLog(text);
-  } catch {
-    if (seq !== fetchSeq) return;
-    if (!model) model = { segments: [] };
+    text = res.ok ? await res.text() : "";
+  } catch { /* keep what is shown */ }
+  if (seq !== fetchSeq) return; // a newer fetch started; drop this stale one
+  if (text === null) {
+    if (model) return;
+    text = "";
+  } else if (model && text === logText) {
+    return; // nothing new (every reconnect re-fetches): leave the page alone
   }
+  logText = text;
+  model = parseLog(text);
+  dataVersion++;
+  requestRender();
+}
+// A hidden tab does no rendering at all; it catches up when it is shown.
+function requestRender() {
+  if (document.hidden) { renderPending = true; return; }
+  renderPending = false;
   render();
 }
 
 // Everything the views need to know about one segment's runs.
 //   baseline = the run flagged baseline (old logs: the first keep with a metric)
 //   current  = the last keep (it describes HEAD); NOT the best value: a neutral keep may be slightly worse
-//   kind     = refined status per run; prev = metric of the state a keep was compared with
+//   kind     = refined status per run
+//
+// Machine speed drifts within minutes, so values logged at different times are NOT comparable.
+// Progress therefore comes only from paired results (the same rule as compaction.ts, analyze()):
+//   pair     = per run { cand, ref, refKind, ratio, gain }
+//              cand = the run's metric; ref = `vs`, else the median of `current_samples`, else
+//              (entries from before v0.2) the metric of the keep before it
+//              refKind = "paired" (HEAD re-measured right alongside), "logged" (v0.2.0: current's
+//              logged value) or "previous"; gain = fraction better, direction-aware
+//   level    = product of cand / ref over the keeps, baseline excluded; 1 = the baseline's level
+//   levelAt  = level before a run; levelAfter = level after a keep
+//   kept     = keeps without the baseline
 function analyze(seg) {
   const { config, runs } = seg;
+  const dir = config.direction === "higher" ? "higher" : "lower";
   const keeps = runs.filter((r) => r.status === "keep" && isNum(r.metric));
   const baseRun = keeps.find((r) => r.baseline === true) || keeps[0] || null;
   const curRun = keeps.length ? keeps[keeps.length - 1] : null;
-  const kind = new Map(), prev = new Map();
+  const kind = new Map(), pair = new Map(), levelAt = new Map(), levelAfter = new Map();
   let state = null; // metric of the last keep seen so far
+  let level = 1, kept = 0, measured = 0;
   for (const r of runs) {
+    const isKeep = r.status === "keep" && isNum(r.metric);
     let k = String(r.status);
     if (r === baseRun) k = "baseline";
     else if (r.status === "keep" && r.neutral === true) k = "neutral";
     else if (r.status === "discard" && r.note) k = "unconfirmed";
     kind.set(r, k);
-    prev.set(r, isNum(r.vs) ? r.vs : state);
-    if (r.status === "keep" && isNum(r.metric)) state = r.metric;
+    levelAt.set(r, level);
+    if (r !== baseRun && r.status !== "crash") {
+      const sm = numSamples(r), cs = numList(r.current_samples);
+      const cand = isNum(r.metric) ? r.metric : sm.length ? median(sm) : null;
+      let ref = null, refKind = "previous";
+      if (cs.length) { ref = isNum(r.vs) ? r.vs : median(cs); refKind = "paired"; }
+      else if (isNum(r.vs)) { ref = r.vs; refKind = "logged"; }
+      else if (isKeep) ref = state;
+      // A ratio needs two positive numbers; anything else counts as "no comparison".
+      if (isNum(cand) && cand > 0 && isNum(ref) && ref > 0) pair.set(r, { cand, ref, refKind, ratio: cand / ref, gain: gainOf(cand / ref, dir) });
+    }
+    if (isKeep) {
+      if (r !== baseRun) {
+        kept++;
+        const p = pair.get(r);
+        if (p) { level *= p.ratio; measured++; }
+      }
+      state = r.metric;
+      levelAfter.set(r, level);
+    }
   }
-  return { config, runs, baseRun, curRun, kind, prev, dir: config.direction === "higher" ? "higher" : "lower" };
+  // Improvement of the segment: null while nothing is kept or nothing could be compared.
+  const gain = kept && measured ? gainOf(level, dir) : null;
+  return { config, runs, baseRun, curRun, kind, pair, levelAt, levelAfter, level, kept, measured, gain, dir };
+}
+const REF_LABEL = { paired: "HEAD alongside", logged: "current as logged", previous: "the keep before" };
+// The paired result is shown for keeps and for keeps the plugin did not confirm.
+function shownPair(r, a) {
+  const k = a.kind.get(r), p = a.pair.get(r);
+  if (!p) return null;
+  if (k === "keep" || k === "neutral") return p;
+  return k === "unconfirmed" && p.refKind === "paired" ? p : null;
 }
 
-// Confidence of ONE keep against the state before it (never cumulative). null = not applicable.
+// Confidence of ONE run against HEAD measured alongside it (never cumulative): the gain divided
+// by the measurement noise. Whether that was enough is the plugin's decision and is read from
+// the status (keep = confirmed), not from a threshold here. null = not applicable.
+// Unconfirmed keeps carry it too (v0.2.1), for auditing.
 // Logs written before v0.2 stored a cumulative figure in `confidence`; that one is not shown.
 function confInfo(r, a) {
   const k = a.kind.get(r);
+  if (k === "unconfirmed") return { text: (isNum(r.confidence) ? fmtX(r.confidence) + " · " : "") + "not confirmed", cls: "warn" };
   if (k !== "keep" && k !== "neutral") return null;
   // (v0.1 runs had `samples` as a count, never a list, and no `vs` / `first_metric`.)
   const isNew = Array.isArray(r.samples) || isNum(r.vs) || isNum(r.first_metric);
@@ -238,7 +336,7 @@ function confInfo(r, a) {
   const tail = k === "neutral" ? " · neutral" : "";
   if (isNum(r.confidence)) {
     if (k === "neutral") return { text: fmtX(r.confidence) + tail, cls: "" }; // only has to be "not worse"
-    return r.confidence >= 2 ? { text: fmtX(r.confidence) + " confirmed", cls: "good" } : { text: fmtX(r.confidence), cls: "warn" };
+    return { text: fmtX(r.confidence) + " confirmed", cls: "good" };
   }
   const sm = numSamples(r), n = sm.length || (isNum(a.config.repeat) ? a.config.repeat : 0);
   if (n < 3) return { text: "no noise estimate" + tail, cls: "" };
@@ -269,10 +367,13 @@ function render() {
   document.title = (config.name || "autoresearch") + " · autoresearch";
   const info = [`${config.metric_name || "metric"}${config.metric_unit ? " (" + config.metric_unit + ")" : ""}`, `${a.dir} is better`];
   if (isNum(config.repeat)) info.push("repeat " + config.repeat);
-  const bench = shortHash(config.measure_hash);
+  const bench = benchId(config);
+  const benchTitle = hashStr(config.inputs_hash)
+    ? "hash of .auto/measure.sh (first 7 characters) + hash of the other frozen files under .auto/ (first 4): everything except log.jsonl, ideas.md, config.json and prompt.md. A different id = a different benchmark."
+    : "first 7 characters of the hash of .auto/measure.sh";
   const mi = $("metricinfo");
   mi.replaceChildren(info.join(" · "));
-  if (bench) mi.append(" · benchmark ", h("span", { class: "mono", id: "bench", title: "first 7 characters of the hash of .auto/measure.sh" }, bench));
+  if (bench) mi.append(" · benchmark ", h("span", { class: "mono", id: "bench", title: benchTitle }, bench));
 
   if (!seg.runs.length) {
     content.append(h("div", { class: "card empty" }, "No experiments yet"));
@@ -281,6 +382,8 @@ function render() {
   content.append(renderStats(a), renderChartCard(a), renderTable(a));
   drawChart(a);
 }
+// Clicking a segment button or the chart toggle.
+function rerender() { render(); }
 
 // "N earlier segments hidden" plus buttons to look at them. Segments are numbered by position in the log.
 function renderSegNote(segments, seg, latest) {
@@ -292,53 +395,62 @@ function renderSegNote(segments, seg, latest) {
   let text = `${n} earlier segment${n > 1 ? "s" : ""} hidden`;
   if (seg !== latest) {
     text = `Viewing earlier segment ${idx + 1} of ${segments.length} (not the current one)`;
-    const a = seg.config.measure_hash, b = latest.config.measure_hash;
-    if (a && b && a !== b) text += " · different benchmark, not comparable with the current segment";
+    if (!sameBench(seg.config, latest.config)) text += " · different benchmark, not comparable with the current segment";
   }
   const buttons = segments.map((s, i) => {
-    const hash = shortHash(s.config.measure_hash);
+    const hash = benchId(s.config);
     return h("button", {
       type: "button", "aria-pressed": String(s === seg), "data-seg": String(i + 1),
-      onclick: () => { selectedSeg = s === latest ? null : s.config.segment; render(); },
+      onclick: () => { selectedSeg = s === latest ? null : s.config.segment; rerender(); },
     }, `Segment ${i + 1}` + (s === latest ? " (current)" : ""), hash ? " · " : null, hash ? h("code", {}, hash) : null);
   });
   el.append(h("span", { id: "segtext" }, text), h("span", { class: "segs" }, buttons));
 }
 
-function stat(k, v, d, cls) {
-  return h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v " + (cls || "") }, v), h("div", { class: "d" }, d || " "));
+function stat(k, v, d, cls, title) {
+  return h("div", { class: "stat", title }, h("div", { class: "k" }, k), h("div", { class: "v " + (cls || "") }, v), h("div", { class: "d" }, d || " "));
 }
 
+const THEN = "As measured at the time. Machine speed drifts, so values from different times aren't comparable.";
 function renderStats(a) {
-  const { runs, baseRun, curRun, dir, config, kind } = a;
+  const { runs, baseRun, curRun, config, kind } = a;
   const unit = config.metric_unit ? " " + config.metric_unit : "";
   const baseline = baseRun ? baseRun.metric : null, current = curRun ? curRun.metric : null;
-  const imp = pct(current, baseline);
   const count = (k) => runs.filter((r) => kind.get(r) === k).length;
-  const kept = count("baseline") + count("keep") + count("neutral"), neutral = count("neutral");
-  const unconf = count("unconfirmed"), disc = count("discard") + unconf;
-  const breakdown = `${kept} kept${neutral ? ` (${neutral} neutral)` : ""} · ${disc} discarded${unconf ? ` (${unconf} not confirmed)` : ""} · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
+  const neutral = count("neutral"), unconf = count("unconfirmed"), disc = count("discard") + unconf;
+  // "kept" never includes the baseline: it is a measurement, not a change.
+  const breakdown = `${a.kept} kept${neutral ? ` (${neutral} neutral)` : ""} · ${disc} discarded${unconf ? ` (${unconf} not confirmed)` : ""} · ${count("crash")} crashed · ${count("checks_failed")} checks failed`;
 
-  // Last keep: that keep's own gain over the state before it, with its own confidence.
+  // Improvement = the kept runs' gains compounded, each against HEAD measured alongside it.
+  const impSub = !a.kept ? "no kept change yet" : !a.measured ? "kept runs carry no comparison" : `${a.kept} confirmed gain${a.kept > 1 ? "s" : ""}, compounded`;
+  const impTitle = "Compounded gain of the confirmed keeps: each kept run's gain over HEAD measured right alongside it, multiplied together. Not current ÷ baseline: raw numbers from different times aren't comparable.";
+
+  // Last keep: that keep's own gain over HEAD measured alongside it, with its own confidence.
   const last = curRun && curRun !== baseRun ? curRun : null;
   let lastCard;
   if (last) {
-    const g = pct(last.metric, a.prev.get(last)), c = confInfo(last, a);
-    lastCard = stat("Last keep", fmtPct(g), `run #${last.run} vs previous state · ${c ? c.text : "—"}`, last.neutral === true ? "" : pctClass(g, dir));
+    const p = a.pair.get(last), c = confInfo(last, a);
+    lastCard = stat("Last keep", gainText(p ? p.gain : null), `run #${last.run} vs ${p ? REF_LABEL[p.refKind] : "previous state"} · ${c ? c.text : "—"}`, last.neutral === true || !p ? "" : gainClass(p.gain));
   } else {
     lastCard = stat("Last keep", "—", baseRun ? "no keep since the baseline" : "no kept run yet");
   }
   return h("div", { class: "stats" },
-    stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), baseRun ? "run #" + baseRun.run : "no kept run yet"),
-    stat("Current", fmt(current) + (current != null ? unit : ""), !curRun ? " " : (curRun === baseRun ? "baseline" : "run #" + curRun.run) + (a.isLatest ? " · HEAD" : " · end of segment")),
-    stat("Improvement", fmtPct(imp), "current vs baseline", pctClass(imp, dir)),
-    stat("Runs", String(runs.length), breakdown),
+    stat("Improvement", gainText(a.gain), impSub, gainClass(a.gain), impTitle),
+    stat("Baseline", fmt(baseline) + (baseline != null ? unit : ""), baseRun ? `run #${baseRun.run} · as measured then` : "no kept run yet", "", THEN),
+    stat("Current", fmt(current) + (current != null ? unit : ""), !curRun ? " " : (curRun === baseRun ? "baseline" : "run #" + curRun.run) + (a.isLatest ? " · HEAD" : " · end of segment") + " · as measured then", "", THEN),
+    stat("Runs", String(runs.length), breakdown, "", "kept doesn't count the baseline"),
     lastCard,
   );
 }
 
 // One marker shape per kind, shared by the chart and its legend.
-function marker(kind, cx, cy) {
+function marker(kind, cx, cy, small) {
+  if (small) {
+    // A run without a measurement of its own level: same shape, smaller.
+    const g = svg("g", { transform: `translate(${cx},${cy}) scale(.7)` });
+    g.append(marker(kind, 0, 0));
+    return g;
+  }
   const c = `var(${KIND_VAR[kind] || "--discard"})`, panel = "var(--panel)";
   switch (kind) {
     case "baseline": return svg("path", { d: `M${cx},${cy - 6}L${cx + 6},${cy}L${cx},${cy + 6}L${cx - 6},${cy}Z`, fill: c, stroke: panel, "stroke-width": 1 });
@@ -352,18 +464,73 @@ function marker(kind, cx, cy) {
 }
 
 function renderChartCard(a) {
+  const level = chartMode === "level";
   const item = (kind) => {
     const s = svg("svg", { width: 14, height: 14, viewBox: "0 0 14 14", "aria-hidden": "true" });
     s.append(marker(kind, 7, 7));
     return h("span", {}, s, KIND_LABEL[kind]);
   };
   const line = (style, label) => h("span", {}, h("span", { style: "display:inline-block;" + style }), label);
+  const points = chartPoints(a);
   const legend = h("div", { class: "legend" },
     ...["baseline", "keep", "neutral", "unconfirmed", "discard", "crash", "checks_failed"].map(item),
-    line("width:14px;border-top:2px solid var(--keep)", "current"),
-    line("width:14px;border-top:1px dashed var(--muted)", "baseline level"),
-    a.runs.some((r) => numSamples(r).length > 1) ? line("height:12px;border-left:2px solid var(--muted)", "sample range (min–max)") : null);
-  return h("div", { class: "card" }, h("div", { id: "chart" }, h("div", { id: "tip" })), legend);
+    line("width:14px;border-top:2px solid var(--keep)", level ? "current level" : "current"),
+    line("width:14px;border-top:1px dashed var(--muted)", level ? "baseline (100%)" : "baseline level"),
+    points.some((p) => p.sp) ? line("height:12px;border-left:2px solid var(--muted)", "sample range (min–max)") : null,
+    level && points.some((p) => p.small) ? h("span", { id: "smallnote" }, "small marker = not measured against HEAD, placed on the current level") : null);
+  const mode = (m, label, title) => h("button", {
+    type: "button", "aria-pressed": String(chartMode === m), "data-mode": m, title,
+    onclick: () => { if (chartMode !== m) { chartMode = m; rerender(); } },
+  }, label);
+  const head = h("div", { class: "charthead" },
+    h("span", { class: "sub", id: "chartcap" }, level
+      ? `Level relative to the baseline (100%), from the gains measured against HEAD alongside · ${a.dir} is better`
+      : "Values as measured at the time. Machine speed drifts, so runs far apart aren't comparable."),
+    h("span", { class: "segs", id: "chartmode" },
+      mode("level", "Relative level", "baseline = 100%; each confirmed keep multiplies it by its ratio to HEAD measured alongside"),
+      mode("raw", "Measured values", "the raw medians and sample ranges, as logged")));
+  return h("div", { class: "card" }, head, h("div", { id: "chart" }, h("div", { id: "tip" })), legend);
+}
+
+// What the chart plots, per mode. One entry per run:
+//   y     = its value on the Y axis (null = pinned to the bottom edge, raw mode only)
+//   sp    = [lo, hi] of its samples on the same axis, or null
+//   small = level mode: the run has no level of its own and sits on the current line
+// Level mode is in percent of the baseline: a keep sits at the level after it, a run measured
+// against HEAD alongside (an unconfirmed keep) at current level × its own ratio to that HEAD.
+function chartPoints(a) {
+  const level = chartMode === "level";
+  const out = [];
+  for (const r of a.runs) {
+    if (!isNum(r.run)) continue;
+    const sm = numSamples(r);
+    let y = null, scale = null, small = false;
+    if (level) {
+      const p = a.pair.get(r);
+      if (a.levelAfter.has(r)) {
+        y = a.levelAfter.get(r) * 100;
+        if (p && r !== a.baseRun) scale = (a.levelAt.get(r) * 100) / p.ref; // samples → level
+      } else if (p && p.refKind === "paired") {
+        scale = (a.levelAt.get(r) * 100) / p.ref;
+        y = p.cand * scale;
+      } else {
+        y = a.levelAt.get(r) * 100;
+        small = true;
+      }
+    } else if (r.status !== "crash" && isNum(r.metric)) {
+      // Crashes carry no usable metric (or a placeholder), and so does any run without a number
+      // (e.g. checks_failed with metric null): they sit on the bottom edge and don't shape the Y range.
+      y = r.metric;
+      scale = 1;
+    }
+    let sp = null;
+    if (y != null && scale != null && sm.length > 1) {
+      const lo = Math.min(...sm) * scale, hi = Math.max(...sm) * scale;
+      if (hi > lo) sp = [lo, hi];
+    }
+    out.push({ r, k: a.kind.get(r), y, sp, small });
+  }
+  return out;
 }
 
 // "Nice" axis ticks (1, 2, 5 × 10^n).
@@ -376,52 +543,47 @@ function ticks(min, max, n) {
   return out;
 }
 
-let chartArg = null;
+let chartArg = null, chartKey = "";
+// Draws only when something it depends on changed (data, mode, segment or pixel width): a
+// resize callback or a repeated call with the same inputs costs nothing.
 function drawChart(a) {
   chartArg = a;
-  const { baseRun, dir, config, kind } = a;
-  const runs = a.runs.filter((r) => isNum(r.run));
-  const baseline = baseRun ? baseRun.metric : null;
   const box = $("chart");
-  if (!box || !runs.length) return;
-  box.querySelector("svg")?.remove();
+  if (!box) return;
   const W = Math.max(280, box.clientWidth - 16), H = W < 500 ? 200 : 260;
+  const key = [dataVersion, chartMode, a.config.segment, W].join("|");
+  if (key === chartKey && box.querySelector("svg")) return;
+  chartKey = key;
+  box.querySelector("svg")?.remove();
+  const { baseRun, config } = a;
+  const level = chartMode === "level";
+  const pts = chartPoints(a);
+  if (!pts.length) return;
+  const baseline = level ? (baseRun ? 100 : null) : baseRun ? baseRun.metric : null;
   const m = { l: 56, r: 12, t: 10, b: 26 };
   const pw = W - m.l - m.r, ph = H - m.t - m.b;
 
-  // Crashes carry no usable metric (or a placeholder), and so does any run without a number
-  // (e.g. checks_failed with metric null): they sit on the bottom edge and don't shape the Y range.
-  const pinned = (r) => r.status === "crash" || !isNum(r.metric);
-  const spread = (r) => {
-    const sm = numSamples(r);
-    if (pinned(r) || sm.length < 2) return null;
-    const lo = Math.min(...sm), hi = Math.max(...sm);
-    return hi > lo ? [lo, hi] : null;
-  };
-  const scaled = runs.filter((r) => !pinned(r)).map((r) => r.metric);
+  const scaled = pts.filter((p) => p.y != null).map((p) => p.y);
   if (!scaled.length && isNum(baseline)) scaled.push(baseline);
   let lo = scaled.length ? Math.min(...scaled) : 0, hi = scaled.length ? Math.max(...scaled) : 1;
   // Sample ranges widen the Y range, but by at most one metric span per side, so one wild
   // sample can't flatten the whole chart; longer whiskers are cut at the plot edge.
   const mlo = lo, mhi = hi, span = hi - lo;
-  for (const r of runs) {
-    const sp = spread(r);
-    if (sp) { lo = Math.min(lo, sp[0]); hi = Math.max(hi, sp[1]); }
-  }
+  for (const p of pts) if (p.sp) { lo = Math.min(lo, p.sp[0]); hi = Math.max(hi, p.sp[1]); }
   if (span > 0) { lo = Math.max(lo, mlo - span); hi = Math.min(hi, mhi + span); }
   if (hi === lo) { const pad = Math.abs(lo) * 0.05 || 1; lo -= pad; hi += pad; }
   const padY = (hi - lo) * 0.08; lo -= padY; hi += padY;
-  const nums = runs.map((r) => r.run);
+  const nums = pts.map((p) => p.r.run);
   let xlo = Math.min(...nums), xhi = Math.max(...nums);
   if (xhi === xlo) { xlo -= 1; xhi += 1; }
   const X = (v) => m.l + ((v - xlo) / (xhi - xlo)) * pw;
   const Y = (v) => m.t + (1 - (v - lo) / (hi - lo)) * ph;
   const clampY = (y) => Math.min(m.t + ph, Math.max(m.t, y));
 
-  const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "metric per run" });
+  const s = svg("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "data-mode": chartMode, "aria-label": level ? "level relative to the baseline per run" : "measured value per run" });
   for (const t of ticks(lo, hi, H < 220 ? 4 : 5)) {
     s.append(svg("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: "var(--line)" }));
-    const tx = svg("text", { x: m.l - 6, y: Y(t) + 4, "text-anchor": "end" }); tx.textContent = fmt(t); s.append(tx);
+    const tx = svg("text", { x: m.l - 6, y: Y(t) + 4, "text-anchor": "end" }); tx.textContent = fmt(t) + (level ? "%" : ""); s.append(tx);
   }
   const xt = ticks(xlo, xhi, Math.max(2, Math.floor(pw / 60))).filter((v) => Number.isInteger(v));
   for (const t of xt) {
@@ -432,21 +594,21 @@ function drawChart(a) {
 
   // Step line = current: starts at the baseline and moves at EVERY later keep, also when a
   // neutral keep is slightly worse (current is the last keep, not the best value).
-  if (baseRun && isNum(baseRun.run)) {
+  const basePt = pts.find((p) => p.r === baseRun);
+  if (basePt) {
     let d = `M${X(baseRun.run)},${Y(baseline)}`;
-    for (const r of runs.slice(runs.indexOf(baseRun) + 1)) {
-      if (r.status === "keep" && isNum(r.metric)) d += `H${X(r.run)}V${Y(r.metric)}`;
+    for (const p of pts.slice(pts.indexOf(basePt) + 1)) {
+      if (p.r.status === "keep" && isNum(p.r.metric)) d += `H${X(p.r.run)}V${Y(p.y)}`;
     }
-    d += `H${X(runs[runs.length - 1].run)}`;
+    d += `H${X(pts[pts.length - 1].r.run)}`;
     s.append(svg("path", { id: "curline", d, fill: "none", stroke: "var(--keep)", "stroke-width": 2, "stroke-opacity": ".75" }));
   }
 
   // Whiskers (min–max of the samples) go under the markers.
-  for (const r of runs) {
-    const sp = spread(r);
-    if (!sp) continue;
-    const cx = X(r.run), t1 = Y(sp[1]), t2 = Y(sp[0]), y1 = clampY(t1), y2 = clampY(t2);
-    const color = `var(${KIND_VAR[kind.get(r)] || "--discard"})`;
+  for (const p of pts) {
+    if (!p.sp) continue;
+    const cx = X(p.r.run), t1 = Y(p.sp[1]), t2 = Y(p.sp[0]), y1 = clampY(t1), y2 = clampY(t2);
+    const color = `var(${KIND_VAR[p.k] || "--discard"})`;
     // An end cut at the plot edge gets no cap, so it doesn't read as the real min/max.
     const d = `M${cx},${y1}V${y2}` + (y1 === t1 ? `M${cx - 3},${y1}h6` : "") + (y2 === t2 ? `M${cx - 3},${y2}h6` : "");
     s.append(svg("path", { class: "whisker", d, stroke: color, "stroke-width": 1.2, "stroke-opacity": ".8", fill: "none" }));
@@ -454,18 +616,22 @@ function drawChart(a) {
 
   const tip = $("tip");
   const unit = config.metric_unit ? " " + config.metric_unit : "";
-  for (const r of runs) {
-    const k = kind.get(r), pin = pinned(r);
-    const cx = X(r.run), cy = pin ? m.t + ph : Y(r.metric);
-    const dot = marker(k, cx, cy);
+  for (const p of pts) {
+    const { r, k } = p, pin = p.y == null;
+    const real = r.status !== "crash" && isNum(r.metric);
+    const cx = X(r.run), cy = pin ? m.t + ph : clampY(Y(p.y));
+    const dot = marker(k, cx, cy, p.small);
     dot.setAttribute("data-kind", k);
+    if (p.small) dot.setAttribute("data-small", "1");
     const hit = svg("circle", { class: "hit", cx, cy, r: 9, fill: "transparent", style: "cursor:pointer" });
     const show = () => {
-      const sp = spread(r), c = confInfo(r, a);
+      const sm = numSamples(r), c = confInfo(r, a), sp = shownPair(r, a);
       // filter: replaceChildren() would print a null as the text "null"
       tip.replaceChildren(...[
-        h("div", {}, h("b", {}, "#" + r.run), " · ", KIND_LABEL[k] || k, pin ? null : " · ", pin ? null : h("b", {}, fmt(r.metric) + unit)),
-        sp ? h("div", {}, `samples ${fmt(sp[0])} – ${fmt(sp[1])} (${numSamples(r).length})`) : null,
+        h("div", {}, h("b", {}, "#" + r.run), " · ", KIND_LABEL[k] || k, real ? " · " : null, real ? h("b", {}, fmt(r.metric) + unit) : null),
+        sp ? h("div", {}, `vs ${REF_LABEL[sp.refKind]} ${fmt(sp.ref)}${unit}: ${gainText(sp.gain)}`) : null,
+        a.levelAfter.has(r) ? h("div", {}, "level after this run: " + levelText(a.levelAfter.get(r))) : null,
+        sm.length > 1 ? h("div", {}, `samples ${fmt(Math.min(...sm))} – ${fmt(Math.max(...sm))} (${sm.length})`) : null,
         c && c.text !== "—" ? h("div", {}, "confidence: " + c.text) : null,
         h("div", {}, String(r.description ?? "")),
         r.note ? h("div", {}, String(r.note)) : null].filter(Boolean));
@@ -484,24 +650,28 @@ function drawChart(a) {
 }
 
 function renderTable(a) {
-  const { runs, baseRun, dir, kind } = a;
-  const baseline = baseRun ? baseRun.metric : null;
+  const { runs, baseRun, kind } = a;
   const tbody = h("tbody");
   for (const r of [...runs].reverse()) {
     const key = r.segment + ":" + r.run; // run numbers restart in each segment
     const open = expanded.has(key);
-    const k = kind.get(r), isKeep = k === "keep" || k === "neutral";
+    const k = kind.get(r);
     const real = r.status !== "crash" && isNum(r.metric); // crashes may carry a placeholder metric
-    const pb = real && r !== baseRun ? pct(r.metric, baseline) : null;
-    const pp = isKeep ? pct(r.metric, a.prev.get(r)) : null; // this keep vs the state before it
+    const p = shownPair(r, a); // keeps and unconfirmed keeps: candidate against HEAD measured alongside
     const c = confInfo(r, a);
+    const vsCell = p
+      ? h("td", { class: "num vs" },
+          // A neutral keep isn't judged on gain, so it gets no colour.
+          h("div", { class: k === "neutral" ? "" : gainClass(p.gain) }, gainText(p.gain)),
+          h("div", { class: "cmp" }, `${fmt(p.cand)} vs ${fmt(p.ref)}` + (p.refKind === "paired" ? "" : ` (${REF_LABEL[p.refKind]})`)))
+      : h("td", { class: "num vs" }, "—");
     const row = h("tr", { class: "row" + (open ? " open" : ""), "data-run": String(r.run) },
       h("td", { class: "num" }, h("span", { class: "tog" }, "▸"), " ", String(r.run)),
       h("td", {}, h("span", { class: "badge s-" + k }, KIND_LABEL[k] || k)),
       h("td", { class: "num" }, real ? fmt(r.metric) : "—"),
-      h("td", { class: "num " + (isKeep ? pctClass(pb, dir) : "") }, fmtPct(pb)), // only kept runs are wins or losses
-      h("td", { class: "num " + (k === "neutral" ? "" : pctClass(pp, dir)) }, fmtPct(pp)), // a neutral keep isn't judged on gain
-      h("td", { class: "num " + (c ? c.cls : "") }, c ? c.text : "—"),
+      vsCell,
+      h("td", { class: "num level" }, a.levelAfter.has(r) ? levelText(a.levelAfter.get(r)) : "—"), // only kept runs move the level
+      h("td", { class: "num conf " + (c ? c.cls : "") }, c ? c.text : "—"),
       h("td", { class: "desc" }, String(r.description ?? ""), k === "unconfirmed" ? h("div", { class: "rownote" }, String(r.note)) : null),
       h("td", { class: "commit" }, r.commit ? String(r.commit) : "—"));
     const detail = h("tr", { class: "detail" }, h("td", { colspan: 8 }, renderDetail(r, a)));
@@ -514,10 +684,11 @@ function renderTable(a) {
     tbody.append(row, detail);
   }
   const head = h("thead", {}, h("tr", {},
-    h("th", { class: "num" }, "#"), h("th", {}, "Status"), h("th", { class: "num" }, "Metric"),
-    h("th", { class: "num", title: "change against the baseline" }, "Δ base"),
-    h("th", { class: "num", title: "kept runs: change against the state they were compared with" }, "Δ prev"),
-    h("th", { class: "num", title: "this keep's gain ÷ measurement noise; 2× or more is confirmed" }, "Confidence"),
+    h("th", { class: "num" }, "#"), h("th", {}, "Status"),
+    h("th", { class: "num", title: "median of the run's samples, as measured at the time; not comparable between runs far apart" }, "Metric"),
+    h("th", { class: "num", title: "kept and not-confirmed runs: the candidate against HEAD measured right alongside it (candidate median vs HEAD median)" }, "vs HEAD alongside"),
+    h("th", { class: "num", title: "level after this run: baseline = 100%, each kept run multiplies it by its ratio to HEAD measured alongside" }, "Level"),
+    h("th", { class: "num", title: "this run's gain ÷ measurement noise, against HEAD measured alongside; the plugin decides what counts as confirmed" }, "Confidence"),
     h("th", {}, "Description"), h("th", {}, "Commit")));
   return h("div", { class: "card tablewrap" }, h("table", {}, head, tbody));
 }
@@ -535,16 +706,19 @@ function renderDetail(r, a) {
   if (r.note) wrap.append(h("div", { class: "kvh" }, "Note"), h("div", { class: "notetext", style: "white-space:pre-wrap;word-break:break-word" }, String(r.note)));
   // Measurement: what the plugin measured for this run.
   const meas = {};
-  const sm = numSamples(r);
-  if (sm.length) meas.samples = sm.map(fmt).join(", ") + unit;
-  if (isNum(r.first_metric)) {
-    meas["first measurement"] = fmt(r.first_metric) + unit;
-    // For an unconfirmed keep (logged as discard) the second measurement did not confirm anything.
-    if (isNum(r.metric)) meas[r.status === "keep" ? "confirmed value" : "re-measured value"] = fmt(r.metric) + unit;
+  const sm = numSamples(r), cs = numList(r.current_samples);
+  const p = a.pair.get(r);
+  if (isNum(r.first_metric)) meas["first measurement"] = fmt(r.first_metric) + unit;
+  if (sm.length) meas[cs.length ? "candidate samples" : "samples"] = sm.map(fmt).join(", ") + unit;
+  if (cs.length) meas["HEAD alongside samples"] = cs.map(fmt).join(", ") + unit;
+  // For an unconfirmed keep (logged as discard) the second measurement did not confirm anything.
+  if ((isNum(r.first_metric) || cs.length) && isNum(r.metric)) meas[r.status === "keep" ? "confirmed value" : "re-measured value"] = fmt(r.metric) + unit + " (median)";
+  if (p && (r.status === "keep" || p.refKind !== "previous")) {
+    const what = { paired: "HEAD measured alongside, median", logged: "current as logged at that time", previous: "the keep before" }[p.refKind];
+    meas["compared with"] = `${fmt(p.ref)}${unit} (${what})`;
+    meas.result = gainText(p.gain);
   }
-  const prev = a.prev.get(r);
-  if (isNum(r.vs)) meas["compared with"] = fmt(r.vs) + unit + " (current at that time)";
-  else if (r.status === "keep" && r !== a.baseRun && isNum(prev)) meas["compared with"] = fmt(prev) + unit + " (previous keep)";
+  if (a.levelAfter.has(r) && r !== a.baseRun) meas["level after"] = levelText(a.levelAfter.get(r)) + " of the baseline";
   if (isNum(r.noise)) meas.noise = fmt(r.noise);
   const c = confInfo(r, a);
   if (c && c.text !== "—") meas.confidence = c.text;
@@ -557,19 +731,41 @@ function renderDetail(r, a) {
 }
 
 // ---------- live connection ----------
-let tickTimer = null;
-function setStatus(st) {
-  const el = $("running");
+// The running indicator costs one small text + class update per second, and nothing at all
+// while the tab is hidden (a tester suspected the page of adding load during benchmarks).
+let tickTimer = null, runStart = null, shownElapsed = "";
+function tick() {
+  const secs = Math.max(0, Math.floor((Date.now() - runStart) / 1000));
+  const text = mmss(secs * 1000);
+  if (text === shownElapsed) return; // the timer fired twice within one second: nothing to do
+  shownElapsed = text;
+  $("elapsed").textContent = text;
+  $("beat").classList.toggle("dim", secs % 2 === 1);
+}
+function syncTicker() {
   clearInterval(tickTimer); tickTimer = null;
-  if (!st || !st.running) { el.hidden = true; return; }
-  el.hidden = false;
-  $("runcmd").textContent = st.command ? String(st.command) : "running";
-  $("runcmd").title = st.command ? String(st.command) : "";
-  const start = isNum(st.startedAt) ? st.startedAt : Date.now();
-  const tick = () => { $("elapsed").textContent = mmss(Date.now() - start); };
+  if (runStart === null || document.hidden) return;
   tick();
   tickTimer = setInterval(tick, 1000);
 }
+function setStatus(st) {
+  const el = $("running");
+  const running = Boolean(st && st.running);
+  el.hidden = !running;
+  runStart = running ? (isNum(st.startedAt) ? st.startedAt : Date.now()) : null;
+  if (running) {
+    $("runcmd").textContent = st.command ? String(st.command) : "running";
+    $("runcmd").title = st.command ? String(st.command) : "";
+  }
+  shownElapsed = "";
+  syncTicker();
+}
+document.addEventListener("visibilitychange", () => {
+  syncTicker();
+  if (document.hidden) return;
+  if (renderPending) requestRender();
+  else if (chartArg && $("chart")) drawChart(chartArg); // the window may have been resized meanwhile
+});
 function setConn(state) {
   $("conn").className = "pill " + state;
   $("conntext").textContent = state;
@@ -589,13 +785,10 @@ function connect() {
   });
 }
 
-// Redraw the chart at the real pixel width (not a scaled viewBox) so tick labels stay readable; ignore height-only changes.
-let lastWidth = 0;
-new ResizeObserver(([e]) => {
-  const w = Math.round(e.contentRect.width);
-  if (w === lastWidth) return;
-  lastWidth = w;
-  if (chartArg && $("chart")) drawChart(chartArg);
+// Redraw the chart at the real pixel width (not a scaled viewBox) so tick labels stay readable.
+// drawChart() itself ignores calls where neither the width nor the data changed.
+new ResizeObserver(() => {
+  if (chartArg && $("chart") && !document.hidden) drawChart(chartArg);
 }).observe(document.querySelector("main"));
 loadLog();
 connect();

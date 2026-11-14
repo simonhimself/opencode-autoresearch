@@ -3,12 +3,22 @@
 
 import { describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   bash,
+  benchmarkScriptStatus,
+  changedInputs,
   commitKeep,
+  diffLineCounts,
+  frozenInputs,
+  GIT_ADD,
+  GIT_CLEAN,
+  GIT_RESTORE,
+  GIT_SWAP,
+  sessionBranches,
+  swapScope,
   currentBranch,
   fileHash,
   git,
@@ -233,13 +243,11 @@ describe("bash runner", () => {
 describe("git timeout", () => {
   test("a git command that hangs is stopped with SIGTERM: the error says so and no index.lock is left", async () => {
     const dir = repo()
-    const hook = join(dir, ".git", "hooks", "pre-commit")
-    writeFileSync(hook, "#!/bin/sh\nsleep 30\n")
-    chmodSync(hook, 0o755)
     writeFileSync(join(dir, "code.txt"), "v2\n")
     g(dir, "add", "code.txt")
-    // Without --no-verify, so the sleeping hook holds git while it has the index locked.
-    const res = await git(["commit", "-q", "-m", "slow"], dir, { timeoutMs: 1_000 })
+    // No message, so git waits for the "editor" while it has the index locked. (A sleeping
+    // hook did this job before the plugin's git calls ran with hooks off.)
+    const res = await git(["commit", "-q"], dir, { timeoutMs: 1_000, env: { GIT_EDITOR: "sh -c 'sleep 30'" } })
     expect(res.timedOut).toBe(true)
     expect(res.output).toContain("git commit timed out after 1 s")
     expect(res.durationMs).toBeLessThan(5_000)
@@ -363,7 +371,7 @@ describe("repo questions", () => {
 
   test("the commit command skips hooks and signing", () => {
     expect(GIT_COMMIT).toContain("--no-verify")
-    expect(GIT_COMMIT.slice(0, 4)).toEqual(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
+    expect(GIT_COMMIT.slice(0, 4)).toEqual(["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"])
   })
 })
 
@@ -383,5 +391,205 @@ describe("output cap", () => {
 
   test("tailLines keeps the last lines", () => {
     expect(tailLines("a\nb\nc\n", 2)).toBe("b\nc")
+  })
+})
+
+// ── v0.2.1 ────────────────────────────────────────────────
+
+describe("swapScope (the paired confirmation's swap)", () => {
+  const tree = async (dir: string) => {
+    const res = await scopeTreeHash(dir)
+    if (!res.ok) throw new Error(res.error)
+    return res.tree
+  }
+
+  test("to HEAD and back: only changed files are rewritten; ignored files, .auto and the real index stay", async () => {
+    const dir = repo()
+    writeFileSync(join(dir, "same.txt"), "untouched by the experiment\n")
+    g(dir, "add", "same.txt")
+    g(dir, "commit", "-qm", "same")
+    const head = (await headTree(dir))!
+    writeFileSync(join(dir, "code.txt"), "v2\n")
+    rmSync(join(dir, "gone.txt"))
+    mkdirSync(join(dir, "sub"))
+    writeFileSync(join(dir, "sub", "new.txt"), "n\n")
+    writeFileSync(join(dir, "ignored.txt"), "a build cache\n")
+    writeFileSync(join(dir, ".auto", "prompt.md"), "rules, edited\n")
+    g(dir, "add", "code.txt") // something staged in the real index
+    const staged = g(dir, "diff", "--cached", "--name-only")
+    const candidate = await tree(dir)
+    const mtime = statSync(join(dir, "same.txt")).mtimeMs
+
+    expect(await swapScope(dir, head)).toMatchObject({ ok: true, from: candidate })
+    expect(readFileSync(join(dir, "code.txt"), "utf8")).toBe("v1\n")
+    expect(existsSync(join(dir, "gone.txt"))).toBe(true)
+    expect(existsSync(join(dir, "sub"))).toBe(false) // the new folder is gone with its file
+    expect(readFileSync(join(dir, "ignored.txt"), "utf8")).toBe("a build cache\n")
+    expect(readFileSync(join(dir, ".auto", "prompt.md"), "utf8")).toBe("rules, edited\n")
+
+    expect(await swapScope(dir, candidate)).toMatchObject({ ok: true, from: head })
+    expect(await tree(dir)).toBe(candidate)
+    expect(readFileSync(join(dir, "code.txt"), "utf8")).toBe("v2\n")
+    expect(existsSync(join(dir, "gone.txt"))).toBe(false)
+    expect(readFileSync(join(dir, "sub", "new.txt"), "utf8")).toBe("n\n")
+    // A file the experiment didn't touch was never rewritten (no needless rebuilds)…
+    expect(statSync(join(dir, "same.txt")).mtimeMs).toBe(mtime)
+    // …and the user's index is as it was.
+    expect(g(dir, "diff", "--cached", "--name-only")).toBe(staged)
+    expect(existsSync(join(dir, ".git", "index.lock"))).toBe(false)
+  })
+
+  test("refuses, without changing anything, when the target needs a path an ignored file occupies", async () => {
+    // git's read-tree overwrites ignored files without asking, so swapScope looks first.
+    const dir = repo()
+    const head = (await headTree(dir))!
+    // The experiment stops ignoring ignored.txt and adds it as a real file.
+    writeFileSync(join(dir, ".gitignore"), "")
+    writeFileSync(join(dir, "ignored.txt"), "the candidate's file\n")
+    mkdirSync(join(dir, "dir"))
+    writeFileSync(join(dir, "dir", "file.txt"), "the candidate's file\n")
+    const candidate = await tree(dir)
+    expect((await swapScope(dir, head)).ok).toBe(true)
+    expect(existsSync(join(dir, "ignored.txt"))).toBe(false)
+    // Under HEAD's .gitignore the name is ignored again, and something writes it.
+    writeFileSync(join(dir, "ignored.txt"), "a build output\n")
+    const res = await swapScope(dir, candidate)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toContain("ignored.txt")
+    expect(readFileSync(join(dir, "ignored.txt"), "utf8")).toBe("a build output\n")
+    expect(existsSync(join(dir, "dir"))).toBe(false) // nothing else was changed either
+    expect(await tree(dir)).toBe(head)
+    rmSync(join(dir, "ignored.txt"))
+    expect((await swapScope(dir, candidate)).ok).toBe(true)
+    expect(readFileSync(join(dir, "ignored.txt"), "utf8")).toBe("the candidate's file\n")
+  })
+
+  test("expected origin: a half-done swap is completed by recovery; a file at neither version is never overwritten", async () => {
+    const dir = repo()
+    const head = (await headTree(dir))!
+    writeFileSync(join(dir, "code.txt"), "v2\n")
+    writeFileSync(join(dir, "new.txt"), "n\n")
+    const candidate = await tree(dir)
+    // Half-done: one file back at HEAD's version, the other still the candidate's.
+    writeFileSync(join(dir, "code.txt"), "v1\n")
+    // A confirmation's own steps want the files exactly where it left them: refused.
+    expect(await swapScope(dir, head, { exactly: candidate })).toMatchObject({ ok: false, untouched: true })
+    expect(existsSync(join(dir, "new.txt"))).toBe(true)
+    // Recovery accepts any mix of the two versions.
+    expect((await swapScope(dir, candidate, { oneOf: [head] })).ok).toBe(true)
+    expect(await tree(dir)).toBe(candidate)
+
+    expect((await swapScope(dir, head, { exactly: candidate })).ok).toBe(true)
+    writeFileSync(join(dir, "gone.txt"), "edited by someone since\n")
+    const res = await swapScope(dir, candidate, { oneOf: [head] })
+    expect(res).toMatchObject({ ok: false, untouched: true })
+    if (!res.ok) expect(res.error).toContain("gone.txt")
+    expect(readFileSync(join(dir, "gone.txt"), "utf8")).toBe("edited by someone since\n")
+    expect(existsSync(join(dir, "new.txt"))).toBe(false) // nothing was restored on top of the edit
+  })
+})
+
+describe("frozen benchmark inputs", () => {
+  test("covers every file under .auto/ except the session files and the two scripts", async () => {
+    const dir = repo()
+    const auto = join(dir, ".auto")
+    for (const f of ["log.jsonl", "ideas.md", "config.json", "measure.sh", "checks.sh"]) writeFileSync(join(auto, f), "x\n")
+    const empty = await frozenInputs(auto)
+    expect(empty.files).toEqual({})
+    writeFileSync(join(auto, "prompt.md"), "edited\n")
+    writeFileSync(join(auto, "log.jsonl"), "more\n")
+    expect((await frozenInputs(auto)).hash).toBe(empty.hash)
+
+    writeFileSync(join(auto, "scale"), "1000\n")
+    mkdirSync(join(auto, "data"))
+    writeFileSync(join(auto, "data", "prompt.md"), "a helper that only shares a session file's name\n")
+    symlinkSync("../code.txt", join(auto, "link"))
+    const a = await frozenInputs(auto)
+    expect(Object.keys(a.files).sort()).toEqual(["data/prompt.md", "link", "scale"])
+    expect(a.hash).not.toBe(empty.hash)
+    writeFileSync(join(auto, "scale"), "10\n")
+    const b = await frozenInputs(auto)
+    expect(b.hash).not.toBe(a.hash)
+    expect(changedInputs(a.files, b.files)).toEqual(["scale"])
+    rmSync(join(auto, "link"))
+    expect(changedInputs(b.files, (await frozenInputs(auto)).files)).toEqual(["link"])
+    expect((await frozenInputs(join(dir, "no-such-dir"))).files).toEqual({})
+  })
+
+  test("benchmarkScriptStatus: clean only when measure.sh and checks.sh are exactly as committed", async () => {
+    const dir = repo()
+    const status = async () => {
+      const res = await benchmarkScriptStatus(dir)
+      return res.ok ? res.status : `error: ${res.error}`
+    }
+    expect(await status()).toBe("") // neither exists: nothing to commit (init asks for measure.sh separately)
+    writeFileSync(join(dir, ".auto", "measure.sh"), "#!/bin/bash\n")
+    expect(await status()).toContain("?? .auto/measure.sh") // not in git yet
+    g(dir, "add", ".auto/measure.sh")
+    expect(await status()).toContain("A  .auto/measure.sh") // staged isn't committed
+    g(dir, "commit", "-qm", "benchmark")
+    expect(await status()).toBe("")
+    writeFileSync(join(dir, ".auto", "ideas.md"), "other .auto files don't matter\n")
+    expect(await status()).toBe("")
+    chmodSync(join(dir, ".auto", "measure.sh"), 0o755)
+    expect(await status()).toContain(".auto/measure.sh") // a mode change counts
+    g(dir, "commit", "-qam", "chmod")
+    writeFileSync(join(dir, ".auto", "checks.sh"), "#!/bin/bash\n")
+    expect(await status()).toContain("?? .auto/checks.sh")
+    // A gitignored .auto/: the scripts can't be in git by accident.
+    const ignored = repo()
+    writeFileSync(join(ignored, ".gitignore"), ".auto/\n")
+    g(ignored, "rm", "-rq", "--cached", ".auto")
+    g(ignored, "commit", "-qam", "ignore .auto")
+    writeFileSync(join(ignored, ".auto", "measure.sh"), "#!/bin/bash\n")
+    expect((await benchmarkScriptStatus(ignored)) as any).toMatchObject({ ok: true, status: expect.stringContaining("!!") })
+  })
+})
+
+describe("v0.2.1 helpers", () => {
+  test("diffLineCounts: the experiment's size, new files included", async () => {
+    const dir = repo()
+    writeFileSync(join(dir, "big.txt"), "1\n2\n3\n4\n")
+    g(dir, "add", "-A")
+    g(dir, "commit", "-qm", "big")
+    const head = (await headTree(dir))!
+    writeFileSync(join(dir, "big.txt"), "1\n")
+    writeFileSync(join(dir, "new.txt"), "a\nb\n")
+    const res = await scopeTreeHash(dir)
+    if (!res.ok) throw new Error(res.error)
+    expect(await diffLineCounts(dir, head, res.tree)).toEqual({ added: 2, removed: 3 })
+  })
+
+  test("sessionBranches: autoresearch/* branches that hold this folder's session, also for a subfolder", async () => {
+    const dir = repo() // main has .auto/prompt.md
+    g(dir, "branch", "autoresearch/with-session")
+    g(dir, "rm", "-rq", ".auto")
+    mkdirSync(join(dir, "pkg", ".auto"), { recursive: true })
+    writeFileSync(join(dir, "pkg", ".auto", "prompt.md"), "pkg session\n")
+    g(dir, "add", "-A")
+    g(dir, "commit", "-qm", "session moved into pkg")
+    g(dir, "branch", "autoresearch/pkg-session")
+    g(dir, "branch", "feature/with-session", "autoresearch/with-session")
+    expect(await sessionBranches(dir)).toEqual(["autoresearch/with-session"])
+    expect(await sessionBranches(join(dir, "pkg"))).toEqual(["autoresearch/pkg-session"])
+  })
+
+  test("every git call runs with hooks off, and the exported commands say so", async () => {
+    const dir = repo()
+    const hook = join(dir, ".git", "hooks", "post-index-change")
+    writeFileSync(hook, "#!/bin/sh\ntouch HOOK_RAN\n")
+    chmodSync(hook, 0o755)
+    g(dir, "reset", "-q")
+    expect(existsSync(join(dir, "HOOK_RAN"))).toBe(true) // the hook works when git is called plainly
+    rmSync(join(dir, "HOOK_RAN"))
+    writeFileSync(join(dir, "code.txt"), "v2\n")
+    await scopeTreeHash(dir)
+    await git(["add", "-A"], dir)
+    await git(["reset", "-q"], dir)
+    expect((await revertToHead(dir)).ok).toBe(true)
+    expect(existsSync(join(dir, "HOOK_RAN"))).toBe(false)
+    for (const command of [GIT_ADD, GIT_COMMIT, GIT_RESTORE, GIT_CLEAN, GIT_SWAP]) {
+      expect(command.slice(0, 2)).toEqual(["-c", "core.hooksPath=/dev/null"])
+    }
   })
 })

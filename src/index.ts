@@ -16,12 +16,14 @@ import { Plugin, Skill } from "@opencode/plugin"
 import { buildCompactionSummary, PLUGIN_PROMPT_PREFIX, USER_CONTEXT_LABEL } from "./compaction.ts"
 import { Dashboards, logExists, openInBrowser } from "./dashboard.ts"
 import {
-  changeText,
+  benchmarkDrift,
   fmt,
   initExperiment,
   limitReached,
   logExperiment,
   pauseLoop,
+  progressText,
+  recoverInterruptedSwap,
   runExperiment,
   runKey,
   type ActiveState,
@@ -30,9 +32,11 @@ import {
   type ToolCtx,
 } from "./experiment.ts"
 import { timing } from "./timing.ts"
-import { currentBranch, fileHash, git, headSha, isTrunk, scopeStatus, tailLines } from "./shell.ts"
+import { currentBranch, fileHash, frozenInputs, git, headSha, isTrunk, scopeStatus, sessionBranches, tailLines } from "./shell.ts"
 import {
+  autoDir,
   checksPath,
+  confirmationRuns,
   countRuns,
   currentSegment,
   measurePath,
@@ -40,7 +44,7 @@ import {
   promptPath,
   readLog,
   readSettings,
-  summarize,
+  segmentSummaries,
 } from "./state.ts"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
@@ -52,7 +56,7 @@ const MAX_STALLS = 3
 const HELP_TEXT = [
   "Commands:",
   "  /autoresearch <goal>          start a session (or resume it if .auto/prompt.md exists)",
-  "  /autoresearch status          is the loop on? runs, baseline → current, limits, warnings",
+  "  /autoresearch status          is the loop on? every segment's runs, kept experiments and gain; limits, warnings",
   "  /autoresearch off             stop the loop; the log is kept (also: stop, pause)",
   "  /autoresearch dashboard       open the live results page in your browser",
   "  /autoresearch dashboard off   close the dashboard's local web server",
@@ -78,15 +82,17 @@ const ACTIVE_INSTRUCTION = [
   "During setup (until autoresearch_init has run) follow the autoresearch-create skill: create the branch, write and commit the session files.",
   "",
   "Rules once autoresearch_init has run:",
-  "- One experiment = change code, autoresearch_run, autoresearch_log. Don't edit files between run and log.",
-  "- The plugin decides keeps. When the measurement looks better, log `keep`: the plugin re-measures and commits only a confirmed gain; otherwise it reverts and logs a discard. Not better: log `discard`. Less or simpler code at equal performance: `keep` with `simplification: true`.",
-  "- The benchmark is frozen: don't touch .auto/measure.sh or .auto/checks.sh during experiments. A legitimate change means: revert code changes, edit the file, call autoresearch_init (a new segment, visible to the user).",
+  "- One experiment = change code, autoresearch_run, autoresearch_log. Don't edit files between run and log, or while autoresearch_log runs.",
+  "- The plugin decides keeps. When the measurement looks better, log `keep`: the plugin measures the last commit and your change back to back and commits only a confirmed gain; otherwise it reverts and logs a discard. Not better: log `discard`. A change that removes more lines than it adds, at about equal performance: `keep` with `simplification: true`.",
+  "- The benchmark is frozen: don't touch .auto/measure.sh, .auto/checks.sh or any helper file under .auto/ during experiments (only prompt.md, ideas.md and config.json may change). A legitimate change means: revert code changes, edit the file, commit that edit, call autoresearch_init (a new segment, visible to the user).",
   "- No cheating: don't shrink or special-case the workload, edit the benchmark to print better numbers, cache results between runs, remove or weaken tests or checks, or hard-code benchmark inputs.",
-  "- Never commit, stash, reset, or switch branches yourself. The plugin does all git changes.",
+  "- Never commit, stash, reset, or switch branches yourself; the plugin does all git changes. The one exception: committing an edit of the benchmark files under .auto/ right before autoresearch_init.",
   "",
   "At all times:",
   "- Don't ask whether to continue; the plugin continues the loop after each turn.",
-  "- To stop (out of promising ideas, you need the user, or a tool says \"Permission denied\"), call autoresearch_pause with the reason. Don't run filler experiments, and don't retry or work around a denied permission.",
+  // "a permission error or rejection": a rejected permission can carry the user's own
+  // message, without the words "Permission denied" this rule used to key on.
+  "- To stop (out of promising ideas, you need the user, or a tool call ends in a permission error or rejection), call autoresearch_pause with the reason. Don't run filler experiments, and don't retry or work around a refused permission.",
 ].join("\n")
 
 // Must start with PLUGIN_PROMPT_PREFIX so the compaction summary can tell it apart from the user's messages.
@@ -136,7 +142,7 @@ export default Plugin.define({
     // instructions (see ACTIVE_INSTRUCTION). Instruction entries are an experimental
     // OpenCode API, so failures are only logged.
     const activate = async (sessionID: string, state: ActiveState) => {
-      await saveLoopState(sessionID, state)
+      await saveLoopState(sessionID, { ...state, since: new Date().toISOString() })
       await ctx.session.instructions.entry
         .put({ sessionID: sessionID as never, key: INSTRUCTION_KEY as never, value: ACTIVE_INSTRUCTION })
         .catch((err) => console.error("[autoresearch] couldn't pin instructions:", err))
@@ -176,10 +182,16 @@ export default Plugin.define({
      * call (a turn is running) the notice rides along with that turn; between turns it
      * starts a short one so it's visible right away.
      */
-    const stopLoop = async (sessionID: string, reason: string, how: "notify" | "tell" = "notify") => {
+    const stopLoop = async (sessionID: string, reason: string, how: "notify" | "tell" | "silent" = "notify") => {
       await deactivate(sessionID)
-      // Kept for `/autoresearch status`, in case the notice below isn't seen.
-      await ctx.storage.set(stoppedKey(sessionID), { reason, at: new Date().toISOString() } as never)
+      // Kept for `/autoresearch status`. "silent" stops (an interrupt, a failed provider)
+      // post a notice that starts no turn, so nobody may ever see it; those are marked and
+      // the next `/autoresearch` repeats the reason.
+      await ctx.storage.set(stoppedKey(sessionID), {
+        reason,
+        at: new Date().toISOString(),
+        ...(how === "silent" ? { unseen: true } : {}),
+      } as never)
       await (how === "tell" ? tell(sessionID, reason) : notify(sessionID, reason))
     }
 
@@ -197,6 +209,11 @@ export default Plugin.define({
       } while (after)
       return found
     }
+
+    // The loops that were on when this copy of the plugin started, for the start-up continue
+    // at the end of setup. Taken now, before any command can run: a loop that is turned on
+    // later was started by its own prompt and must not get a second one from the timer.
+    const loopsAtStart = new Map((await loopsIn(ctx.location.directory)).map(({ sessionID, state }) => [sessionID, state.since]))
 
     const dashboards = new Dashboards(join(ROOT, "src", "dashboard.html"))
 
@@ -273,9 +290,9 @@ export default Plugin.define({
         options: { namespace: "autoresearch" },
         description:
           "Start a segment of comparable runs: name, primary metric, unit, direction and how often each measurement repeats. " +
-          "Freezes the benchmark (.auto/measure.sh and .auto/checks.sh are hashed). Needs: the loop on, a branch that isn't " +
-          "main/master, a clean working tree, an executable .auto/measure.sh. Call again only when the goal or the benchmark " +
-          "legitimately changes; that starts a new segment with a fresh baseline.",
+          "Freezes the benchmark (.auto/measure.sh, .auto/checks.sh and every helper file under .auto/ are hashed). Needs: the loop " +
+          "on, a branch that isn't main/master, a clean working tree, an executable .auto/measure.sh, and measure.sh/checks.sh " +
+          "committed. Call again only when the goal or the benchmark legitimately changes; that starts a new segment with a fresh baseline.",
         input: {
           type: "object",
           properties: {
@@ -289,6 +306,7 @@ export default Plugin.define({
               maximum: 50,
               description:
                 "Benchmark runs per measurement, fixed for the segment (default 5). The median is used and the spread gives the noise. " +
+                "A proposed keep costs about twice as many runs again (the last commit and the change, back to back). " +
                 "Use 1–2 only when one run takes minutes; then a keep needs a fixed minimum gain instead.",
             },
           },
@@ -304,7 +322,7 @@ export default Plugin.define({
         description:
           "Measure the current code: runs ./.auto/measure.sh as often as the segment's `repeat` says, parses `METRIC name=value` " +
           "lines, then runs ./.auto/checks.sh if it exists. Tells you how the result compares with current and what to log. " +
-          "Doesn't log; call autoresearch_log next, without changing files in between.",
+          "Doesn't log; call autoresearch_log next, without changing files in between. Takes no command: the benchmark is fixed.",
         input: {
           type: "object",
           properties: {
@@ -321,8 +339,9 @@ export default Plugin.define({
         options: { namespace: "autoresearch" },
         description:
           "Record the last autoresearch_run (each run is logged once; the plugin records the measured numbers itself). " +
-          "`keep` proposes to keep the change: the plugin re-measures, and commits if the gain is confirmed, otherwise reverts and " +
-          "logs a discard. `discard`, `crash` and `checks_failed` revert the code to the last commit (.auto/ is preserved). " +
+          "`keep` proposes to keep the change: the plugin measures the last commit and the change back to back (it swaps the files " +
+          "itself and puts them back), and commits if the gain is confirmed, otherwise reverts and logs a discard. " +
+          "`discard`, `crash` and `checks_failed` revert the code to the last commit (.auto/ is preserved). " +
           "Always include `asi` notes: what you learned, so a future agent doesn't repeat dead ends.",
         input: {
           type: "object",
@@ -337,8 +356,8 @@ export default Plugin.define({
             simplification: {
               type: "boolean",
               description:
-                "With status keep: the change removes or simplifies code and isn't meant to be faster. It's kept when the " +
-                "re-measurement shows it's not worse than current beyond the noise.",
+                "With status keep: the change removes more lines than it adds (checked) and isn't meant to be faster. It's kept " +
+                "when the back-to-back measurement shows it's not worse than the last commit beyond the noise, nor by more than minImprovement.",
             },
           },
           required: ["status", "description"],
@@ -352,7 +371,7 @@ export default Plugin.define({
         options: { namespace: "autoresearch" },
         description:
           "Stop the loop and tell the user why. Use it when you're out of promising ideas, need the user's input or decision, " +
-          "or a tool reports \"Permission denied\". Better than filler experiments.",
+          "or a tool call ends in a permission error or rejection. Better than filler experiments.",
         input: {
           type: "object",
           properties: {
@@ -392,9 +411,24 @@ export default Plugin.define({
           (resume ? " (If they're leftovers of an interrupted experiment, `git stash -u` is the safe way to clear them.)" : "")
         )
       }
+      const branch = await currentBranch(cwd)
+      const onTrunk = !branch || (await isTrunk(cwd, branch))
+      if (!resume && onTrunk) {
+        // No session files here, but they are committed on the experiment branch: this is
+        // a resume from the wrong branch, not a new setup. (It used to start a second
+        // setup on main while the session sat one `git switch` away.)
+        const branches = await sessionBranches(cwd)
+        if (branches.length) {
+          return (
+            `Not started: there are no session files on ${branch ? `\`${branch}\`` : "this detached HEAD"}, but an autoresearch session for this folder ` +
+            `exists on \`${branches[0]}\`${branches.length > 1 ? ` (also: ${branches.slice(1).join(", ")})` : ""}. ` +
+            `To continue it: \`git switch ${branches[0]}\`, then \`/autoresearch\` again. ` +
+            "To start a separate new session instead: create its branch first (`git switch -c autoresearch/<goal>-<date>`) and run `/autoresearch <goal>` there."
+          )
+        }
+      }
       if (resume) {
-        const branch = await currentBranch(cwd)
-        if (!branch || (await isTrunk(cwd, branch))) {
+        if (onTrunk) {
           const list = await git(["branch", "--list", "autoresearch/*", "--format=%(refname:short)"], cwd)
           const branches = list.code === 0 ? list.output.split("\n").filter(Boolean) : []
           return (
@@ -424,6 +458,13 @@ export default Plugin.define({
             return
           }
 
+          // A keep's confirmation that was cut off (crash, restart) leaves the project's
+          // files at the last commit and the experiment's files in git. Put them back before
+          // anything below looks at the working tree; a clean-looking tree would be a lie.
+          // (Nothing happens while a confirmation is running right now.)
+          const recovery = sub.startsWith("dashboard") ? null : await recoverInterruptedSwap(host, await cwdOf(sessionID))
+          const recoveryNote = recovery?.failed ?? recovery?.note
+
           // "stop", "pause"… mean off. (They used to be taken as a goal and resumed the loop.)
           if (OFF_WORDS.has(sub)) {
             const state = await loopState(sessionID)
@@ -444,6 +485,7 @@ export default Plugin.define({
             const status = state ? await scopeStatus(state.directory) : undefined
             await say(
               "Loop turned off. .auto/log.jsonl is kept; `/autoresearch` resumes." +
+                (recoveryNote ? ` ${recoveryNote}` : "") +
                 (status?.ok && status.status
                   ? " The working tree has uncommitted changes (an unfinished experiment); `/autoresearch` won't resume until " +
                     "they're committed, stashed (`git stash -u`) or reverted."
@@ -453,7 +495,7 @@ export default Plugin.define({
           }
 
           if (sub === "status") {
-            await say(await statusText(sessionID))
+            await say((await statusText(sessionID)) + (recoveryNote ? `\nWarning: ${recoveryNote}` : ""))
             return
           }
 
@@ -470,6 +512,12 @@ export default Plugin.define({
             if (!wasOpen) openInBrowser(url) // don't open another tab every time
             const note = (await logExists(cwd)) ? "" : " No experiments yet; it fills in as they run."
             await say(`Live dashboard: ${url}${note}`)
+            return
+          }
+
+          // Starting, resuming or finalizing on files that aren't the ones they seem: don't.
+          if (recovery?.failed) {
+            await say(`Not started: ${recovery.failed}`)
             return
           }
 
@@ -511,7 +559,8 @@ export default Plugin.define({
           const setup = !existsSync(promptPath(cwd))
           const problem = await preflight(cwd, !setup)
           if (problem) {
-            await say(problem)
+            // E.g. "uncommitted changes": if those are the experiment that was just put back, say so.
+            await say(problem + (recovery?.note ? `\n${recovery.note}` : ""))
             return
           }
           const entries = await readLog(cwd)
@@ -540,6 +589,7 @@ export default Plugin.define({
           // A measurement from before this start describes a tree that's gone (the tree is
           // clean now); it must not be logged.
           await ctx.storage.remove(runKey(sessionID))
+          const stopped = (await ctx.storage.get(stoppedKey(sessionID))) as { reason?: string; at?: string; unseen?: boolean } | undefined
           await ctx.storage.remove(stoppedKey(sessionID))
           const state: ActiveState = {
             directory: cwd,
@@ -554,6 +604,11 @@ export default Plugin.define({
                 { branch: (await currentBranch(cwd))!, head: (await headSha(cwd))! }),
           }
           await activate(sessionID, state)
+          // Delivered with the turn the prompt below starts.
+          if (recovery?.note) await notify(sessionID, recovery.note)
+          if (stopped?.unseen && stopped.reason) {
+            await notify(sessionID, `For the record, why the loop had stopped before this start (${stopped.at ?? "?"}): ${stopped.reason}`)
+          }
 
           // The skill is attached on resume too: it explains the rules, and a resumed
           // session (or one whose context was compacted) may never have seen it.
@@ -571,12 +626,15 @@ export default Plugin.define({
       })
     })
 
-    /** `/autoresearch status`: where things stand, the limits, and anything that needs attention. */
+    /**
+     * `/autoresearch status`: the whole session (one line per segment, then totals), the
+     * limits, and anything that needs attention.
+     */
     const statusText = async (sessionID: string) => {
       const cwd = await cwdOf(sessionID)
       const state = await loopState(sessionID)
       const entries = await readLog(cwd)
-      const { config, runs } = currentSegment(entries)
+      const { config } = currentSegment(entries)
       const settings = await readSettings(cwd)
       const warnings = [...settings.warnings]
       const lines = [
@@ -584,21 +642,38 @@ export default Plugin.define({
           (state?.branch ? ` · branch ${state.branch}` : ""),
       ]
       if (config) {
-        const { baseline, current } = summarize(runs)
-        const unit = config.metric_unit ? ` ${config.metric_unit}` : ""
+        const segments = segmentSummaries(entries)
+        const repeat = config.repeat ?? 1
         lines.push(
-          `Session: ${config.name} · ${config.metric_name} (${config.direction} is better) · ${config.repeat ?? 1} benchmark run${(config.repeat ?? 1) > 1 ? "s" : ""} per measurement`,
-          `Result: baseline ${fmt(baseline)}${unit} → current ${fmt(current)}${unit}${changeText(baseline, current)}`,
-          `Runs: ${countRuns(entries)}/${settings.maxIterations} in total (${runs.length} in segment ${config.segment}; ` +
-            `${runs.filter((r) => r.status === "keep" && !r.baseline).length} kept)`,
-          `Limits: maxIterations ${settings.maxIterations} · maxNoImprovement ${settings.maxNoImprovement}` +
-            (state ? ` (now ${noImprovementStreak(entries, state.startRunCount)} in a row)` : "") +
-            ` · minImprovement ${settings.minImprovement * 100}% (used when a measurement has fewer than 3 runs)`,
+          `Session: ${config.name} · ${config.metric_name} (${config.direction} is better) · ${repeat} benchmark run${repeat > 1 ? "s" : ""} per measurement, ` +
+            `${confirmationRuns(repeat)} more to confirm a keep`,
         )
-        const measure = await fileHash(measurePath(cwd))
-        const checks = await fileHash(checksPath(cwd))
-        if (measure !== config.measure_hash || checks !== (config.checks_hash ?? null)) {
-          warnings.push("The benchmark files (.auto/measure.sh or checks.sh) differ from what this segment was started with; the next run will be refused until autoresearch_init starts a new segment.")
+        // Every segment, not only the current one: after a benchmark change the earlier
+        // segments' kept experiments are still in the branch, and showing only the last
+        // segment made a session look like it had achieved nothing.
+        for (const seg of segments) {
+          lines.push(
+            `Segment ${seg.config.segment} "${seg.config.name}"${seg.config.segment === config.segment ? " (current)" : ""}: ` +
+              `${seg.runs} run${seg.runs === 1 ? "" : "s"}, ${progressText(seg)}`,
+          )
+        }
+        const kept = segments.reduce((sum, seg) => sum + seg.kept, 0)
+        lines.push(
+          `Runs: ${countRuns(entries)}/${settings.maxIterations} in total · ${kept} kept experiment${kept === 1 ? "" : "s"}` +
+            (segments.length > 1 ? ` in ${segments.length} segments (gains of different segments aren't combined: their benchmarks differ)` : ""),
+          `Limits: maxIterations ${settings.maxIterations} · maxNoImprovement ${settings.maxNoImprovement}` +
+            (state ? ` (now ${noImprovementStreak(entries, state.startRunCount)} runs without a keep since the loop was last started)` : "") +
+            ` · minImprovement ${settings.minImprovement * 100}% (the gain a keep needs when a measurement has fewer than 3 runs, and the most a simplification may cost)`,
+        )
+        const inputs = await frozenInputs(autoDir(cwd))
+        const drift = benchmarkDrift(config, {
+          measure: await fileHash(measurePath(cwd)),
+          checks: await fileHash(checksPath(cwd)),
+          inputs: inputs.hash,
+          inputFiles: inputs.files,
+        })
+        if (drift) {
+          warnings.push(`The benchmark files differ from what this segment was started with (${drift}); the next run will be refused until autoresearch_init starts a new segment.`)
         }
         if (!config.checks_hash) warnings.push("No .auto/checks.sh: kept experiments aren't checked for correctness.")
       } else {
@@ -752,6 +827,7 @@ export default Plugin.define({
           sessionID,
           `Loop paused: ${failures} turns in a row failed${message ? ` (last error: ${message.slice(0, 300)})` : ""}. ` +
             "Check the provider or model, then `/autoresearch` resumes.",
+          "silent",
         )
         return
       }
@@ -786,7 +862,7 @@ export default Plugin.define({
             const state = await loopState(sessionID)
             if (!state || !ownsSession(state)) continue
             // The user pressed stop: respect it and turn the loop off.
-            await stopLoop(sessionID, "Loop turned off because the session was stopped. `/autoresearch` resumes it.")
+            await stopLoop(sessionID, "Loop turned off because the session was stopped. `/autoresearch` resumes it.", "silent")
           }
         }
       } catch (err) {
@@ -798,12 +874,26 @@ export default Plugin.define({
     // next continue: the loop would sit "on" and silent. Send one continue for each loop
     // this copy owns. Queued, so if a turn is in fact still running it's handled after it.
     // Loops in setup are skipped: there the agent may be waiting for the user.
+    //
+    // Only loops that were on when this copy started (loopsAtStart), and only if the same
+    // activation is still on when the timer fires. In a freshly loaded project the command
+    // turned the loop on moments after the plugin loaded; the timer then sent a second
+    // continue, which arrived after the agent had paused: "The loop is ON now" on a paused loop.
     const startup = setTimeout(() => {
       void (async () => {
-        for (const { sessionID, state } of await loopsIn(ctx.location.directory)) {
+        // A restart may have cut off a keep's confirmation: put the experiment's files back
+        // first, or the agent would be told to carry on over a tree that only looks clean.
+        const recovery = await recoverInterruptedSwap(host, ctx.location.directory)
+        for (const [sessionID, since] of loopsAtStart) {
           if (controller.signal.aborted) return
+          const state = await loopState(sessionID)
+          if (!state || !ownsSession(state) || state.since !== since) continue
+          if (recovery?.failed) {
+            await stopLoop(sessionID, `Loop paused: ${recovery.failed}`, "tell")
+            continue
+          }
           if (state.setup || state.stopping) continue
-          await sendContinue(sessionID)
+          await sendContinue(sessionID, recovery?.note ? `${CONTINUE_PROMPT}\n\n${recovery.note}` : CONTINUE_PROMPT)
         }
       })().catch((err) => console.error("[autoresearch] couldn't continue loops after start:", err))
     }, timing.startupDelayMs)

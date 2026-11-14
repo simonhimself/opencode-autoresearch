@@ -10,9 +10,9 @@ An OpenCode v2 plugin. The idea and parts of the skills come from [pi-autoresear
 
 Benchmarks give slightly different numbers on every run. An agent that keeps "whatever looked better" collects lucky runs and reports them as progress. So here **the agent proposes and the plugin decides**:
 
-- **Every keep is re-measured.** When the agent proposes a keep, the plugin runs the benchmark again and compares those fresh numbers with the last kept state. A gain that doesn't clearly beat the noise is reverted and logged as "not confirmed".
+- **Every keep is re-measured, side by side.** When the agent proposes a keep, the plugin measures the current state, then the candidate, then the current state again, back to back. Machine speed changes within minutes, so numbers taken at different times are never compared. A gain that doesn't clearly beat the noise is reverted and logged as "not confirmed".
 - **The measured code is the committed code.** The plugin fingerprints the files when it measures. If anything changed before the keep, it refuses.
-- **The benchmark is locked.** `.auto/measure.sh` and `.auto/checks.sh` are fingerprinted per *segment*. Changing them means starting a new segment with a new baseline, which shows in the log and the dashboard. The agent can't swap in another command or type in a number.
+- **The benchmark is locked.** `.auto/measure.sh`, `.auto/checks.sh` and any helper files next to them are fingerprinted per *segment*. Changing them means starting a new segment with a new baseline, which shows in the log and the dashboard. The agent can't swap in another command or type in a number.
 - **Final numbers are measured again.** At the end, each branch is measured on its own, next to your main branch, and those numbers go into the commit message.
 
 ## Install
@@ -67,7 +67,7 @@ To steer it mid-run, type a message ("try caching next", "don't touch the e2e fo
 /autoresearch dashboard
 ```
 
-A local page (127.0.0.1 only) showing baseline → current, each run with its sample spread, which keeps were confirmed and by how much, which were not confirmed, and the agent's notes. It updates live. `/autoresearch dashboard off` closes it. `/autoresearch status` gives a text summary in the chat.
+A local page (127.0.0.1 only) showing the level relative to the baseline (built from confirmed gains only), each run with its sample spread, which keeps were confirmed and by how much, which were not confirmed, and the agent's notes. It updates live. `/autoresearch dashboard off` closes it. `/autoresearch status` gives a text summary in the chat.
 
 ### 4. Finish
 
@@ -115,7 +115,7 @@ Only the setup commit contains `.auto/` files. Later changes to them stay uncomm
 
 Invalid values are reported in `/autoresearch status` and the defaults apply.
 
-How often the benchmark runs per measurement (`repeat`, default 5) is fixed when a segment starts. A confirmed keep therefore costs about `2 × repeat` benchmark runs. For slow workloads the agent can choose a lower `repeat`; below 3 there is no noise estimate, and a keep needs `minImprovement` in both measurements.
+How often the benchmark runs per measurement (`repeat`, default 5) is fixed when a segment starts. A proposed keep therefore costs about `3 × repeat` benchmark runs in total (the first measurement, then the current state and the candidate side by side). For slow workloads the agent can choose a lower `repeat`; below 3 there is no noise estimate, a keep needs a gain of at least `minImprovement`, and false keeps are much more likely (roughly 1 in 10 for a change that does nothing). Use 3 or more whenever the workload allows.
 
 ## Long sessions
 
@@ -125,12 +125,14 @@ When a session nears the model's context limit, OpenCode replaces older conversa
 
 - **Discards delete uncommitted work in the project folder.** That's how a failed experiment is undone, and why the plugin insists on a clean tree and its own branch. Don't edit files there while the loop runs.
 - **Experiment commits skip your git hooks and commit signing.** Hooks that prompt or run long would hang an unattended loop. They still apply when you merge the final branches.
-- **Your permission rules apply.** The benchmark, the checks and the plugin's git commands are checked as `shell` actions. With allow-all the loop runs unattended; an `ask` rule on them pauses every experiment until you answer.
+- **Your permission rules apply.** The benchmark, the checks and the plugin's git commands are checked as `shell` actions (the git ones look like `git -c core.hooksPath=/dev/null …`). With allow-all the loop runs unattended; an `ask` rule on them pauses every experiment until you answer.
+- **The benchmark must not write files into the project or into `.auto/`.** A run that does can't be kept (the files would change what was measured). Write to a temp folder instead.
+- **`.auto/` must not be gitignored as a whole**: the setup commit needs `prompt.md` and the benchmark scripts in git.
 - **One loop per project.** Starting it in a second session turns it off in the first.
 - **Command answers cost a short model reply.** OpenCode's plugin API has no way to show text only to you.
 - **Known limits.**
-  - A keep is compared with the previous keep's measurement, which may be hours old. If the machine's speed drifts in between, that isn't corrected.
-  - The confirmation makes a false keep rare per experiment (about 1 % at typical noise), not impossible over a long session. The per-branch measurement at finalize is the final check.
+  - The confirmation makes a false keep unlikely, not impossible: in simulation about 3 % of proposed keeps that change nothing get through (at 2 % noise and 5 runs per measurement). Over a long session that can add up to one or two small false gains. The per-branch measurement at finalize is the final check.
+  - Progress is reported as the compounded gain of the confirmed keeps. The absolute baseline and current values are shown as measured at the time and aren't comparable with each other.
   - No code can tell whether a benchmark represents real use. The setup skill lists what counts as cheating (shrinking the workload, special-casing its input, weakening tests), and benchmark changes are visible as new segments.
   - At finalize, branches are measured in a clean checkout. If the benchmark needs untracked files (installed dependencies, build output), the per-branch numbers read "could not be measured".
 

@@ -15,6 +15,12 @@
 // This file reads .auto/log.jsonl itself and validates every field where it is used
 // (old entries lack the newer fields; a hand-edited log can hold anything), so it has
 // no dependency on state.ts.
+//
+// Numbers (v0.2.1): machine speed drifts within minutes, so absolute values logged at
+// different times are NOT comparable. Progress is therefore the compounded gain of the
+// kept runs, each one's candidate against HEAD measured right alongside it (`samples`
+// vs `current_samples`), never current / baseline. dashboard.html uses the same rule;
+// keep the two in step (see "Paired results" below).
 
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
@@ -29,7 +35,10 @@ export const PLUGIN_PROMPT_PREFIX = "[autoresearch]"
 /** Marks the user's text inside a plugin prompt (`/autoresearch <text>` on resume), so it can be kept. */
 export const USER_CONTEXT_LABEL = "Additional context from the user:"
 
+// Don't reword: earlier summaries are parsed by this heading (carriedNotes).
 const USER_NOTES_HEADING = "## What the user said in this session"
+/** What `/autoresearch <goal>` sends on a fresh start (index.ts); the goal is the user's own text. */
+const SETUP_GOAL = /Set up and start an autoresearch session\.\s*Goal:([\s\S]*)/
 
 // Budgets. Every piece of the fixed sections is capped, which is what makes the cap hold:
 // fixed sections stay under ~14k, prompt + ideas under ~16.5k, the rest goes to runs.
@@ -46,6 +55,8 @@ const MAX_ASI_KEY_CHARS = 40
 const MAX_ASI_VALUE_CHARS = 200
 const MAX_ASI_CHARS = 600
 const MAX_RUN_LINE_CHARS = 1_400
+/** With many segments only the latest are listed, one line each. */
+const MAX_SEGMENT_LINES = 8
 /** prompt.md / ideas.md budgets, tried in order; the smaller ones are only a safety net. */
 const FILE_BUDGETS: [prompt: number, ideas: number][] = [
   [12_000, 4_000],
@@ -82,11 +93,28 @@ interface Run {
   baseline: boolean
   neutral: boolean
   note: string
+  /** The candidate's samples (v0.1 stored a count here: then null). */
+  samples: number[] | null
+  /** HEAD re-measured right around the candidate (v0.2.1 keeps and unconfirmed keeps). */
+  currentSamples: number[] | null
+  /** What the run was compared with: the median of `currentSamples` (v0.2.0: current's logged metric). */
+  vs: number | null
 }
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null)
 const str = (v: unknown): string => (typeof v === "string" ? v : "")
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v)
+/** A non-empty list of finite numbers, or null. */
+const numList = (v: unknown): number[] | null => {
+  if (!Array.isArray(v)) return null
+  const xs = v.filter((x): x is number => num(x) !== null)
+  return xs.length ? xs : null
+}
+function median(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b)
+  const mid = s.length >> 1
+  return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2
+}
 
 async function readLog(cwd: string): Promise<{ configs: Config[]; runs: Run[] }> {
   const raw = await readFile(join(cwd, ".auto", "log.jsonl"), "utf8").catch(() => "")
@@ -123,6 +151,9 @@ async function readLog(cwd: string): Promise<{ configs: Config[]; runs: Run[] }>
         baseline: p.baseline === true,
         neutral: p.neutral === true,
         note: str(p.note),
+        samples: numList(p.samples),
+        currentSamples: numList(p.current_samples),
+        vs: num(p.vs),
       })
     }
     // Other entry types are ignored.
@@ -130,18 +161,128 @@ async function readLog(cwd: string): Promise<{ configs: Config[]; runs: Run[] }>
   return { configs, runs }
 }
 
-/** Baseline of a segment: the run marked `baseline`, or (old logs) its first keep. */
-function baselineOf(runs: Run[], segment: number): number | null {
-  const inSegment = runs.filter((r) => r.segment === segment && r.status === "keep" && r.metric !== null)
-  return (inSegment.find((r) => r.baseline) ?? inSegment[0])?.metric ?? null
+// ── Paired results ───────────────────────────────────────
+//
+// The same rule as in dashboard.html (analyze()):
+//   candidate = the run's metric (else the median of its samples)
+//   reference = `vs`, else the median of `current_samples`, else (entries from before
+//               v0.2) the metric of the keep before it
+//   gain      = how much better the candidate is than the reference, as a fraction,
+//               positive = better in the segment's direction
+//   level     = product of candidate / reference over the segment's keeps, baseline excluded
+// A keep whose two values aren't both positive numbers counts as factor 1.
+
+/** Where a run's reference value comes from, best first. */
+type RefKind = "paired" | "logged" | "previous"
+const REF_LABEL: Record<RefKind, string> = {
+  paired: "HEAD alongside",
+  logged: "current as logged",
+  previous: "the keep before",
+}
+
+interface Paired {
+  candidate: number
+  reference: number
+  kind: RefKind
+  /** Fraction better than the reference (negative = worse). */
+  gain: number
+}
+
+interface SegmentStats {
+  segment: number
+  config: Config | undefined
+  runs: Run[]
+  baseline: Run | null
+  /** The last keep: it describes HEAD. */
+  current: Run | null
+  /** Keeps without the baseline. */
+  kept: number
+  /** Product of candidate / reference over those keeps (1 = unchanged). */
+  level: number
+  /** How many of them had a usable ratio. */
+  measured: number
+  /** How many of those were measured against HEAD alongside (v0.2.1 entries). */
+  alongside: number
+}
+
+const usable = (n: number | null): n is number => n !== null && n > 0
+const gainOf = (ratio: number, direction: string) => (direction === "higher" ? ratio - 1 : 1 - ratio)
+const valueOf = (r: Run): number | null => r.metric ?? (r.samples ? median(r.samples) : null)
+
+/** Segments in log order (a later config for the same id replaces the earlier one), and each run's paired result. */
+function analyze(configs: Config[], runs: Run[]): { segments: SegmentStats[]; paired: Map<Run, Paired> } {
+  const byId = new Map<number, SegmentStats>()
+  const stats = (segment: number) => {
+    let s = byId.get(segment)
+    if (!s) byId.set(segment, (s = { segment, config: undefined, runs: [], baseline: null, current: null, kept: 0, level: 1, measured: 0, alongside: 0 }))
+    return s
+  }
+  for (const c of configs) {
+    byId.delete(c.segment) // re-insert, so the order follows the latest config
+    stats(c.segment).config = c
+  }
+  for (const r of runs) stats(r.segment).runs.push(r)
+
+  const paired = new Map<Run, Paired>()
+  for (const s of byId.values()) {
+    const direction = s.config?.direction ?? "lower"
+    const keeps = s.runs.filter((r) => r.status === "keep" && r.metric !== null)
+    // Baseline: the run marked `baseline`, or (old logs) the segment's first keep.
+    s.baseline = keeps.find((r) => r.baseline) ?? keeps[0] ?? null
+    s.current = keeps.at(-1) ?? null
+    let previous: number | null = null // metric of the last keep seen so far
+    for (const r of s.runs) {
+      const isKeep = r.status === "keep" && r.metric !== null
+      if (r !== s.baseline && r.status !== "crash") {
+        const candidate = valueOf(r)
+        const reference: [number | null, RefKind] = r.currentSamples
+          ? [r.vs ?? median(r.currentSamples), "paired"]
+          : r.vs !== null
+            ? [r.vs, "logged"]
+            : [isKeep ? previous : null, "previous"]
+        if (usable(candidate) && usable(reference[0])) {
+          paired.set(r, { candidate, reference: reference[0], kind: reference[1], gain: gainOf(candidate / reference[0], direction) })
+        }
+      }
+      if (isKeep) {
+        if (r !== s.baseline) {
+          s.kept++
+          const p = paired.get(r)
+          if (p) {
+            s.level *= p.candidate / p.reference
+            s.measured++
+            if (p.kind === "paired") s.alongside++
+          }
+        }
+        previous = r.metric
+      }
+    }
+  }
+  return { segments: [...byId.values()], paired }
+}
+
+/** "12.5 % better" / "3.1 % worse": the same wording everywhere, no signs to misread. */
+function betterWorse(gain: number): string {
+  const pct = Math.abs(gain) * 100
+  if (pct < 0.00005) return "no change"
+  return `${pct >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))} % ${gain > 0 ? "better" : "worse"}`
+}
+
+/** A segment's progress in words. */
+function improvement(s: SegmentStats): string {
+  if (!s.kept) return "no kept change yet"
+  if (!s.measured) return "not known (the kept runs carry no comparison)"
+  return betterWorse(gainOf(s.level, s.config?.direction ?? "lower"))
 }
 
 // ── Summary ──────────────────────────────────────────────
 
 export async function buildCompactionSummary(cwd: string, userMessages: string[], live?: LiveState): Promise<string> {
   const { configs, runs } = await readLog(cwd)
+  const { segments, paired } = analyze(configs, runs)
   const config = configs.at(-1)
-  const segmentRuns = config ? runs.filter((r) => r.segment === config.segment) : []
+  const segment = config ? segments.find((s) => s.segment === config.segment) : undefined
+  const segmentRuns = segment?.runs ?? []
   const liveText = liveSection(live)
 
   const before = [
@@ -151,7 +292,7 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
       "Older conversation was replaced by this summary, built from the persisted session files in `.auto/`.",
       "Those files are the source of truth. Continue the experiment loop from here.",
     ].join("\n"),
-    sessionSection(config, segmentRuns, runs),
+    sessionSection(segment, segments, runs.length),
     liveText,
     userSection(userMessages),
     RULES_SECTION,
@@ -161,10 +302,8 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
   // With several segments, run numbers repeat; label them s<segment>#<run>.
   // Decided from the whole log (configs too: right after a new init the old runs are the
   // only ones, and that's when their numbers stop being comparable), not from what fits.
-  const multi = new Set([...configs, ...runs].map((e) => e.segment)).size > 1
-  const baselines = new Map<number, number | null>()
-  for (const r of runs) if (!baselines.has(r.segment)) baselines.set(r.segment, baselineOf(runs, r.segment))
-  const runLines = runs.map((r) => runLine(r, multi, baselines.get(r.segment) ?? null)).reverse() // newest first
+  const multi = segments.length > 1
+  const runLines = runs.map((r) => runLine(r, multi, paired.get(r))).reverse() // newest first
 
   const promptRaw = await readAutoFile(cwd, "prompt.md")
   const ideasRaw = await readAutoFile(cwd, "ideas.md")
@@ -195,8 +334,9 @@ export async function buildCompactionSummary(cwd: string, userMessages: string[]
 
 const join2 = (sections: string[]) => sections.filter(Boolean).join("\n\n")
 
-function sessionSection(config: Config | undefined, segmentRuns: Run[], allRuns: Run[]): string {
-  if (!config) return "## Session\n\nNo `autoresearch_init` yet. Finish setup per `.auto/prompt.md`."
+function sessionSection(segment: SegmentStats | undefined, segments: SegmentStats[], totalRuns: number): string {
+  const config = segment?.config
+  if (!segment || !config) return "## Session\n\nNo `autoresearch_init` yet. Finish setup per `.auto/prompt.md`."
   const unit = config.unit
   const lines = [
     "## Session",
@@ -207,28 +347,49 @@ function sessionSection(config: Config | undefined, segmentRuns: Run[], allRuns:
   if (config.repeat !== null)
     lines.push(`Repeat: each measurement is the median of ${config.repeat} benchmark run(s), fixed for this segment`)
 
-  const keeps = segmentRuns.filter((r) => r.status === "keep" && r.metric !== null)
-  const baseline = baselineOf(segmentRuns, config.segment)
-  const current = keeps.at(-1)?.metric ?? null
-  if (baseline === null || current === null) {
+  const { baseline, current } = segment
+  const at = (r: Run) => `${fmt(r.metric!)}${unit} (run #${r.run ?? "?"})`
+  if (!baseline || !current) {
     lines.push("Baseline: none yet. The first run of a segment is the baseline, measured on a clean tree.")
-  } else if (keeps.length === 1) {
-    lines.push(`Baseline → current: ${fmt(baseline)}${unit} (the baseline is still current: no other keep yet)`)
   } else {
     lines.push(
-      `Baseline → current: ${fmt(baseline)}${unit} → ${fmt(current)}${unit}${delta(current, baseline)}` +
-        " (current = the last keep = HEAD; candidates are compared with it)",
+      !segment.kept
+        ? "Improvement: none yet (no kept change since the baseline)."
+        : !segment.measured
+          ? `Improvement: ${improvement(segment)}.`
+          : `Improvement: ${improvement(segment)} than the baseline. This is the compounded gain of the ${segment.kept} kept change(s), ` +
+            (segment.alongside === segment.measured
+              ? "each measured against HEAD right alongside it."
+              : "each against its own reference (HEAD measured alongside it; older entries: the value logged before it)."),
+      current === baseline
+        ? `Baseline: ${at(baseline)}, still current = HEAD. As measured at the time.`
+        : `Baseline: ${at(baseline)} · current (the last keep = HEAD): ${at(current)}. Each as measured at the time.`,
+      "Values measured at different times aren't comparable (machine speed drifts), so don't compute progress from them.",
     )
   }
 
-  const count = (s: string) => segmentRuns.filter((r) => r.status === s).length
+  const count = (s: string) => segment.runs.filter((r) => r.status === s).length
   const known = ["keep", "discard", "crash", "checks_failed"]
-  const other = segmentRuns.filter((r) => !known.includes(r.status)).length
-  const counts = known.map((s) => `${count(s)} ${s}`).concat(other ? [`${other} other`] : [])
+  const other = segment.runs.filter((r) => !known.includes(r.status)).length
+  const counts = [`${segment.kept} kept, the baseline not counted`]
+    .concat(known.slice(1).map((s) => `${count(s)} ${s}`))
+    .concat(other ? [`${other} other`] : [])
   lines.push(
-    `Total runs, all segments (what maxIterations counts): ${allRuns.length}`,
-    `Runs in segment ${config.segment}: ${segmentRuns.length} (${counts.join(" · ")})`,
+    `Runs in segment ${config.segment}: ${segment.runs.length} (${counts.join(" · ")})`,
+    `Total runs, all segments (what maxIterations counts): ${totalRuns}`,
   )
+
+  if (segments.length > 1) {
+    const shown = segments.slice(-MAX_SEGMENT_LINES)
+    lines.push("", "Segments (each has its own benchmark and baseline; numbers of different segments aren't comparable):")
+    if (shown.length < segments.length) lines.push(`- ${segments.length - shown.length} earlier segment(s) not listed`)
+    for (const s of shown) {
+      const name = s.config ? oneLine(s.config.name, 80) : "no config entry"
+      lines.push(
+        `- segment ${s.segment}${s === segment ? " (current)" : ""}: ${name} · ${s.runs.length} run(s) · ${s.kept} kept · ${improvement(s)}`,
+      )
+    }
+  }
   return lines.join("\n")
 }
 
@@ -262,15 +423,53 @@ function liveSection(live: LiveState | undefined): string {
   return parts.join("\n\n")
 }
 
-/** The user's own words in a message: [] for a plugin prompt, the carried notes for an earlier summary. */
+/**
+ * Remove attached skills. With a skill attached, a user message arrives as
+ * `<skill_content name="…">…</skill_content>` followed by the real text; left in, the
+ * skill's text was listed as the user's note and pushed the real notes out.
+ *
+ * A block without its end tag (text cut somewhere) has no known end: then only text that
+ * certainly isn't the skill's is kept, i.e. from the plugin prefix or the setup sentence
+ * on; without either, everything from the tag on is dropped.
+ */
+function stripSkillBlocks(text: string): string {
+  const t = text.replace(/<skill_content\b[^>]*>[\s\S]*?<\/skill_content\s*>/gi, "\n")
+  const open = t.search(/<skill_content\b/i)
+  if (open === -1) return t
+  const rest = t.slice(open)
+  const marks = [rest.indexOf(PLUGIN_PROMPT_PREFIX), rest.search(SETUP_GOAL)].filter((i) => i !== -1)
+  return t.slice(0, open) + (marks.length ? "\n" + rest.slice(Math.min(...marks)) : "")
+}
+
+/** The user's own words in a message: nothing for a plain plugin prompt, the carried notes for an earlier summary. */
 function userNotes(message: string): string[] {
-  const m = message.trim()
   // An earlier compaction summary isn't something the user said. But the notes it carried
   // are, and the messages they came from may be gone by now, so take those over.
+  // (Checked before and after stripping: a summary can quote a skill tag in its own text.)
+  if (message.trim().startsWith(SUMMARY_HEADER)) return carriedNotes(message.trim())
+  const m = stripSkillBlocks(message).trim()
   if (m.startsWith(SUMMARY_HEADER)) return carriedNotes(m)
-  if (!m.startsWith(PLUGIN_PROMPT_PREFIX)) return [m]
-  const i = m.indexOf(USER_CONTEXT_LABEL)
-  return i === -1 ? [] : [m.slice(i + USER_CONTEXT_LABEL.length)]
+
+  const notes: string[] = []
+  // Our own prompts can sit anywhere (after a skill block, after other text). What comes
+  // before the prefix isn't ours, so it stays; of the prompt itself only the text the
+  // user gave with `/autoresearch <text>` is theirs.
+  const prefix = m.indexOf(PLUGIN_PROMPT_PREFIX)
+  const own = prefix === -1 ? m : m.slice(0, prefix)
+  const goal = SETUP_GOAL.exec(own)
+  if (goal) {
+    notes.push(own.slice(0, goal.index))
+    // "(ask me)" is what the plugin fills in when the user gave no goal.
+    const text = goal[1]!.trim()
+    if (text && text !== "(ask me)") notes.push(`Goal given at the start: ${text}`)
+  } else {
+    notes.push(own)
+  }
+  if (prefix !== -1) {
+    const label = m.indexOf(USER_CONTEXT_LABEL, prefix)
+    if (label !== -1) notes.push(m.slice(label + USER_CONTEXT_LABEL.length))
+  }
+  return notes
 }
 
 function carriedNotes(summary: string): string[] {
@@ -282,7 +481,9 @@ function carriedNotes(summary: string): string[] {
     if (line.startsWith("- ")) notes.push(line.slice(2))
     else if (line.trim()) break // the next section
   }
-  return notes
+  // Summaries written before v0.2.1 could carry an attached skill's text as a note
+  // (cut short, so without its end tag): don't carry that on forever.
+  return notes.map(stripSkillBlocks)
 }
 
 /** The user's own messages: steering like "focus on X" or "don't touch Y" must survive compaction. */
@@ -304,8 +505,9 @@ const RULES_SECTION = [
   "",
   "- Tools: `autoresearch_init`, `autoresearch_run`, `autoresearch_log`, `autoresearch_pause` (in Code Mode: `tools.autoresearch.*`).",
   "- One experiment = edit, `autoresearch_run`, then `autoresearch_log` with `keep`, `discard`, `crash` or `checks_failed`.",
-  "- You propose a keep; the plugin decides. It measures again and commits only if the gain is confirmed, otherwise it reverts and logs a discard.",
-  "- The benchmark (`.auto/measure.sh`) and the checks (`.auto/checks.sh`) are frozen for the segment. Changing either needs `autoresearch_init`, which starts a new segment with a new baseline.",
+  "- You propose a keep; the plugin decides. It re-measures HEAD and your candidate back to back and commits only if the gain is confirmed against that fresh HEAD measurement; otherwise it reverts and logs a discard.",
+  "- `simplification: true` is only for a change that removes more lines than it adds; it is kept when it isn't worse than HEAD.",
+  "- Every file under `.auto/` except `log.jsonl`, `ideas.md`, `config.json` and `prompt.md` is frozen for the segment (`measure.sh`, `checks.sh` and whatever they read). Changing one needs a commit and `autoresearch_init`, which starts a new segment with a new baseline.",
   "- Don't game the metric: no special-casing the benchmark's input, no skipping the work it measures, no weakening the checks.",
   "- Out of ideas, blocked, or need the user: call `autoresearch_pause` with the reason. No filler experiments.",
 ].join("\n")
@@ -335,14 +537,24 @@ function headAndTail(content: string, max: number, file: string): string {
   return content.slice(0, headEnd).trimEnd() + marker + content.slice(tailStart).trimStart()
 }
 
-function runLine(r: Run, multi: boolean, baseline: number | null): string {
+function runLine(r: Run, multi: boolean, paired: Paired | undefined): string {
   const label = `${multi ? `s${r.segment}` : ""}#${r.run ?? "?"}`
   // A crash's metric is a placeholder, not a measurement.
-  const value = r.status === "crash" || r.metric === null ? "—" : fmt(r.metric) + delta(r.metric, baseline)
+  const value = r.status === "crash" || r.metric === null ? "—" : fmt(r.metric)
   const head = [label, oneLine(r.status, 20), value]
+  // A keep the plugin re-measured and didn't confirm is logged as a discard with a note.
+  const unconfirmed = r.status === "discard" && Boolean(r.note.trim()) && paired?.kind === "paired"
+  // Only a result measured against a reference gets a comparison. A rejected run's single
+  // measurement is shown bare: set against a baseline from another time it misleads.
+  if (paired && (r.status === "keep" || unconfirmed)) {
+    head.push(`vs ${REF_LABEL[paired.kind]} ${fmt(paired.reference)}: ${betterWorse(paired.gain)}`)
+    if (r.confidence !== null) head[head.length - 1] += `, conf ${fmt(Number(r.confidence.toFixed(1)))}`
+  } else if (r.status === "keep" && r.confidence !== null) {
+    head.push(`conf ${fmt(Number(r.confidence.toFixed(1)))}`)
+  }
   if (r.baseline) head.push("[baseline]")
   if (r.neutral) head.push("[neutral]")
-  if (r.confidence !== null) head.push(`conf ${fmt(Number(r.confidence.toFixed(1)))}`)
+  if (unconfirmed) head.push("[keep not confirmed]")
   const parts = [
     head.join(" "),
     // e.g. a keep the plugin didn't confirm, logged as a discard.
@@ -371,7 +583,8 @@ function asiText(asi: Record<string, unknown>): string {
   return truncate(parts.join(" | "), MAX_ASI_CHARS)
 }
 
-const RUNS_HEADING = "## Runs (newest first; deltas are vs the baseline of the run's segment)"
+const RUNS_HEADING =
+  "## Runs (newest first; a keep shows candidate vs HEAD measured alongside it; other values are single measurements, not comparable over time)"
 const runsFooter = (omitted: number) =>
   omitted > 0
     ? `${omitted} older run(s) left out to fit (the oldest were dropped first). All runs are in .auto/log.jsonl.`
@@ -424,12 +637,6 @@ function nextStepSection(inFlight: boolean, hasConfig: boolean, hasRuns: boolean
 
 // Exact for integers and short decimals; long ones cut to 8 significant digits.
 const fmt = (n: number) => (Number.isInteger(n) || String(n).length <= 12 ? String(n) : String(Number(n.toPrecision(8))))
-
-function delta(value: number, baseline: number | null): string {
-  if (baseline === null || baseline === 0 || value === baseline) return ""
-  const pct = ((value - baseline) / Math.abs(baseline)) * 100
-  return ` (${pct > 0 ? "+" : ""}${Math.abs(pct) >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))}%)`
-}
 
 const isHigh = (code: number) => code >= 0xd800 && code <= 0xdbff
 const isLow = (code: number) => code >= 0xdc00 && code <= 0xdfff

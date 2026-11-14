@@ -1,25 +1,32 @@
 // The experiment tools: autoresearch_init, _run, _log and _pause.
 //
 // Rule of thumb for everything here: the plugin decides, the agent proposes. The agent
-// can't choose what is measured (always ./.auto/measure.sh, frozen per segment by hash),
-// can't type in a result (the plugin records what it measured), and can't decide a keep
-// (the plugin re-measures and judges). What it can do: change code, ask for a
+// can't choose what is measured (always ./.auto/measure.sh, frozen per segment by hash,
+// together with every helper file under .auto/), can't type in a result (the plugin
+// records what it measured), and can't decide a keep (the plugin measures the last commit
+// and the candidate back to back and judges). What it can do: change code, ask for a
 // measurement, and say what it thinks the result means.
 //
 // The logic talks to OpenCode only through `Host`, so the tests can drive it against real
 // git repos with a small fake.
 
+import { createHash } from "node:crypto"
 import { accessSync, constants, existsSync } from "node:fs"
 import {
   bash,
+  benchmarkScriptStatus,
   changedBetween,
+  changedInputs,
   commitKeep,
   currentBranch,
+  diffLineCounts,
   fileHash,
+  frozenInputs,
   GIT_ADD,
   GIT_CLEAN,
   GIT_COMMIT,
   GIT_RESTORE,
+  GIT_SWAP,
   gitCommandLine,
   headSha,
   headTree,
@@ -28,15 +35,20 @@ import {
   scopeHasTrackedFiles,
   scopeStatus,
   scopeTreeHash,
+  swapScope,
   tailLines,
   type ShellResult,
 } from "./shell.ts"
 import {
   appendLog,
+  autoDir,
   checksPath,
+  confirmationRuns,
   countRuns,
   currentRun,
   currentSegment,
+  gainText,
+  halfRuns,
   isBetter,
   judge,
   mad,
@@ -47,8 +59,10 @@ import {
   promptPath,
   readLog,
   readSettings,
+  relativeGain,
   sampleList,
-  summarize,
+  segmentSummaries,
+  type SegmentSummary,
   type ConfigEntry,
   type Direction,
   type LogEntry,
@@ -86,6 +100,11 @@ export interface ActiveState {
   /** Config entries in the log when setup started; a higher count means init has run. */
   setupConfigs?: number
   /**
+   * When the loop was turned on (ISO time). The start-up continue uses it to tell the loop
+   * it saw at plugin start from one that was stopped and started again since.
+   */
+  since?: string
+  /**
    * Branch and HEAD the loop expects. Set by autoresearch_init and on resume, HEAD updated
    * after every log. If either differs when a tool runs, someone switched branches or
    * committed underneath, and reverting or committing would hit the wrong tree.
@@ -116,6 +135,9 @@ export interface Fingerprint {
   tree: string
   measure: string | null
   checks: string | null
+  /** frozenInputs(): the helper files under .auto/ (hash, and per file to name what changed). */
+  inputs: string
+  inputFiles: Record<string, string>
 }
 
 /**
@@ -135,14 +157,42 @@ export interface PendingRun {
   timeoutSeconds: number
   checksTimeoutSeconds: number
   fingerprint: Fingerprint
-  /** Files in the scope that the benchmark itself changed; such a run can't be kept. */
+  /** Files in the scope or under .auto/ that the benchmark itself changed; such a run can't be kept. */
   benchmarkWrites: string[]
   /**
-   * The confirmation measurement, stored as soon as it exists. If the commit or revert
-   * after it fails and the agent calls log again, the same samples are judged again;
-   * otherwise a failed git command would be a free second roll of the dice.
+   * The paired confirmation, stored as soon as it exists. If the commit or revert after it
+   * fails and the agent calls log again, the same samples are judged again; otherwise a
+   * failed git command would be a free second roll of the dice.
    */
-  confirmation?: { samples: number[]; metrics: Record<string, number>; failure?: string }
+  confirmation?: Confirmation
+}
+
+/** What a paired confirmation measured. */
+export interface Confirmation {
+  /** The candidate's samples. */
+  samples: number[]
+  /** HEAD's samples, measured right before and right after the candidate's. */
+  currentSamples: number[]
+  /** The candidate's secondary metrics (medians). */
+  metrics: Record<string, number>
+  /** Set when the candidate failed the benchmark during the confirmation. */
+  failure?: string
+}
+
+/**
+ * Persisted under swapKey(cwd) while a paired confirmation has the scope's files swapped
+ * to HEAD. If the process dies in that window, the working tree looks clean and the
+ * experiment's files exist only as git objects; this marker is how they come back.
+ */
+export interface SwapMarker {
+  directory: string
+  sessionID: string
+  /** The candidate: the fingerprint tree of the measured run. */
+  tree: string
+  /** HEAD and branch during the swap. Recovery only touches files while both still hold. */
+  head: string
+  branch: string
+  at: string
 }
 type StoredRun = PendingRun | { running: true }
 
@@ -169,19 +219,43 @@ export interface Host {
 }
 
 export const runKey = (sessionID: string) => `run/${sessionID}`
+/** Per folder, not per session: whichever session touches the project next must find it. */
+export const swapKey = (cwd: string) => `swap/${createHash("sha256").update(cwd).digest("hex").slice(0, 24)}`
 
 type ToolResult = { content: string }
 const error = (text: string): ToolResult => ({ content: `ERROR: ${text}` })
 
-/** One run or log at a time per project: they share the working tree, git's index and the run numbers. */
-const locks = new Map<string, Promise<unknown>>()
+/**
+ * Process-wide state, kept on globalThis so it survives a plugin reload (a reloaded copy
+ * of this module would otherwise start with empty maps while the old copy is still
+ * measuring):
+ * - locks: one run or log at a time per project; they share the working tree, git's index
+ *   and the run numbers.
+ * - swapping: folders where a paired confirmation is under way in THIS process. A swap
+ *   marker for such a folder is live, not left over from a crash, and must not be "recovered".
+ */
+const shared: { locks: Map<string, Promise<unknown>>; swapping: Set<string> } = ((globalThis as Record<symbol, unknown>)[
+  Symbol.for("opencode-autoresearch.shared")
+] ??= { locks: new Map(), swapping: new Set() }) as never
 function withLock<T>(key: string, task: () => Promise<T>): Promise<T> {
-  const next = (locks.get(key) ?? Promise.resolve()).then(task, task)
-  locks.set(
+  const next = (shared.locks.get(key) ?? Promise.resolve()).then(task, task)
+  shared.locks.set(
     key,
     next.catch(() => {}),
   )
   return next
+}
+
+/** Reject arguments the tool doesn't have, by name. They used to be dropped silently, so
+ * an agent passing `command` or `metric` believed it had chosen the benchmark or the result. */
+function unknownArguments(input: unknown, allowed: string[], tool: string, hint: string): ToolResult | null {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null
+  const unknown = Object.keys(input).filter((k) => !allowed.includes(k))
+  if (!unknown.length) return null
+  return error(
+    `Unknown argument${unknown.length > 1 ? "s" : ""} ${unknown.map((k) => `\`${k}\``).join(", ")}. ` +
+      `${tool} takes only: ${allowed.join(", ")}. ${hint} Nothing was done; call it again without ${unknown.length > 1 ? "them" : "it"}.`,
+  )
 }
 
 // ── Formatting ────────────────────────────────────────────
@@ -194,15 +268,23 @@ export const fmt = (n: number | null | undefined) =>
       ? String(n)
       : String(Number(n.toPrecision(8)))
 
-/** A percentage with enough digits that a tiny change doesn't read as "-0.0%". */
-export const pctText = (pct: number) =>
-  `${pct > 0 ? "+" : ""}${Math.abs(pct) >= 0.1 ? pct.toFixed(1) : Number(pct.toPrecision(2))}%`
-
-/** Change from `from` to `to` in percent, or "" when it can't be expressed. */
-export const changeText = (from: number | null, to: number | null) =>
-  from === null || to === null || from === 0 || from === to ? "" : ` (${pctText(((to - from) / Math.abs(from)) * 100)})`
-
 const withUnit = (n: number | null, unit: string) => `${fmt(n)}${unit ? ` ${unit}` : ""}`
+
+/**
+ * Where a segment stands, in the one wording used by tool output and `/autoresearch
+ * status`: kept experiments (never the baseline), their compounded gain, and the absolute
+ * values labelled as what they are (measured at different times, so not comparable).
+ */
+export function progressText(summary: SegmentSummary): string {
+  const { kept, gain, skipped, baseline, current, config } = summary
+  return (
+    `${kept} kept` +
+    (kept > skipped ? `, ${gainText(gain)} overall (the kept experiments' back-to-back gains, compounded)` : "") +
+    (baseline === null
+      ? ""
+      : ` · measured at the time: baseline ${withUnit(baseline, config.metric_unit)}, current ${withUnit(current, config.metric_unit)}`)
+  )
+}
 
 // ── Shared checks ─────────────────────────────────────────
 
@@ -218,7 +300,7 @@ export function limitReached(entries: LogEntry[], state: ActiveState, settings: 
   const streak = noImprovementStreak(entries, state.startRunCount)
   if (streak >= settings.maxNoImprovement) {
     return (
-      `${streak} runs in a row without an improvement (maxNoImprovement = ${settings.maxNoImprovement}). ` +
+      `${streak} runs in a row without a keep since the loop was last started (maxNoImprovement = ${settings.maxNoImprovement}). ` +
       "`/autoresearch` resumes with a fresh allowance; `/autoresearch finalize` wraps up what was kept."
     )
   }
@@ -272,20 +354,25 @@ async function gate(host: Host, sessionID: string, check: "branch" | "branch+hea
 }
 
 async function fingerprintNow(cwd: string): Promise<{ ok: true; fp: Fingerprint } | { ok: false; error: string }> {
-  const [head, branch, tree, measure, checks] = await Promise.all([
+  const [head, branch, tree, measure, checks, inputs] = await Promise.all([
     headSha(cwd),
     currentBranch(cwd),
     scopeTreeHash(cwd),
     fileHash(measurePath(cwd)),
     fileHash(checksPath(cwd)),
+    frozenInputs(autoDir(cwd)),
   ])
   if (!tree.ok) return { ok: false, error: tree.error }
   if (!head || !branch) return { ok: false, error: "no commit or no branch checked out" }
-  return { ok: true, fp: { head, branch, tree: tree.tree, measure, checks } }
+  return { ok: true, fp: { head, branch, tree: tree.tree, measure, checks, inputs: inputs.hash, inputFiles: inputs.files } }
 }
 
+/** The files a segment freezes besides the two scripts, for messages. */
+const FROZEN_NOTE = "every file under .auto/ except log.jsonl, ideas.md, config.json and prompt.md"
+
 /** Why a segment's frozen benchmark no longer matches the files, or "" if it does. */
-function benchmarkDrift(config: ConfigEntry, measure: string | null, checks: string | null): string {
+export function benchmarkDrift(config: ConfigEntry, fp: Pick<Fingerprint, "measure" | "checks" | "inputs" | "inputFiles">): string {
+  const { measure, checks } = fp
   if (measure === null) return ".auto/measure.sh is missing"
   if (measure !== config.measure_hash) return ".auto/measure.sh changed since this segment started"
   if (checks !== (config.checks_hash ?? null)) {
@@ -294,6 +381,16 @@ function benchmarkDrift(config: ConfigEntry, measure: string | null, checks: str
       : config.checks_hash
         ? ".auto/checks.sh changed since this segment started"
         : ".auto/checks.sh was added since this segment started"
+  }
+  // Segments started before v0.2.1 have no inputs hash; they keep working unchecked.
+  if (config.inputs_hash !== undefined && fp.inputs !== config.inputs_hash) {
+    const names = Object.keys(fp.inputFiles).sort()
+    return (
+      `a helper file under .auto/ was added, edited or removed since this segment started (frozen: ${FROZEN_NOTE}). ` +
+      (names.length
+        ? `Helper files there now: ${names.slice(0, 15).join(", ")}${names.length > 15 ? ", …" : ""}`
+        : "There are none now, so one was removed")
+    )
   }
   return ""
 }
@@ -309,13 +406,14 @@ interface Measurement {
 }
 
 /**
- * Run the benchmark `repeat` times, stopping at the first failure. Only the last run's
+ * Run the benchmark `count` times, stopping at the first failure. Only the last run's
  * output is kept (capped in shell.ts); earlier ones are parsed and dropped.
  */
 async function measure(
   host: Host,
   cwd: string,
   config: ConfigEntry,
+  count: number,
   timeoutSeconds: number,
   context: ToolCtx,
   label: string,
@@ -326,8 +424,8 @@ async function measure(
   let failure: string | undefined
   let wallMs = 0
   const startedAt = Date.now()
-  for (let i = 1; i <= config.repeat; i++) {
-    const step = config.repeat > 1 ? `${label} (${i}/${config.repeat})` : label
+  for (let i = 1; i <= count; i++) {
+    const step = count > 1 ? `${label} (${i}/${count})` : label
     await context.progress?.({ status: step }).catch(() => {})
     host.setStatus(cwd, { running: true, command: step, startedAt })
     last = await bash(MEASURE_COMMAND, cwd, timeoutSeconds * 1000, context.signal)
@@ -349,12 +447,103 @@ const seconds = (value: unknown, fallback: number) => {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
+// ── Interrupted swaps ─────────────────────────────────────
+
+type Recovery = { note?: string; failed?: string }
+
+/**
+ * Put back the experiment's files if a paired confirmation was cut off while the scope
+ * was swapped to HEAD (process killed, machine restarted, a restore that failed). Must be
+ * called with the folder's lock held and no swap under way in this process.
+ *
+ * It only ever moves files that are exactly HEAD's version to the candidate's version:
+ * - HEAD or the branch changed since: nothing is touched. The candidate was measured
+ *   against another commit; the marker is dropped and the tree id is reported.
+ * - A file differs from both HEAD's and the candidate's version: someone edited it after
+ *   the crash (the tree looked clean). Nothing is touched and the marker stays, so the
+ *   next call tries again once the edit is out of the way.
+ * A half-finished swap passes both tests (each file is at one version or the other).
+ */
+async function recoverLocked(host: Host, cwd: string): Promise<Recovery | null> {
+  const marker = (await host.storage.get(swapKey(cwd))) as SwapMarker | undefined
+  if (!marker) return null
+  const manual =
+    `The experiment's files are saved in git as tree ${marker.tree}; ` +
+    `\`git restore --source=${marker.tree} --worktree -- .\` (run in ${cwd}) brings them back.`
+  const [head, branch, tree] = await Promise.all([headSha(cwd), currentBranch(cwd), headTree(cwd)])
+  if (head !== marker.head || branch !== marker.branch || !tree) {
+    await host.storage.remove(swapKey(cwd))
+    await host.storage.remove(runKey(marker.sessionID))
+    return {
+      note:
+        `A keep was being confirmed when the plugin was cut off (${marker.at}), with the project's files set to the last commit. ` +
+        `The branch or commit has changed since, so the unfinished experiment was not restored. ${manual}`,
+    }
+  }
+  const res = await swapScope(cwd, marker.tree, { oneOf: [tree] })
+  if (!res.ok) {
+    return {
+      failed:
+        `A keep was being confirmed when the plugin was cut off (${marker.at}), with the project's files set to the last commit. ` +
+        `The experiment's files could not be put back: ${res.error}. Nothing was changed. ` +
+        "To get the experiment back, revert or stash those changes and run `/autoresearch` again. To drop it, commit them. " +
+        manual,
+    }
+  }
+  await host.storage.remove(swapKey(cwd))
+  return res.from === marker.tree
+    ? {} // the files were already the candidate's: only the marker was left over
+    : {
+        note:
+          "A keep was being confirmed when the plugin was cut off, with the project's files set to the last commit. " +
+          "The experiment's files have been put back exactly as measured.",
+      }
+}
+
+/**
+ * The same for callers outside the tools (the /autoresearch command, plugin start).
+ * Returns null when there was nothing to do, also while a confirmation is running right now.
+ */
+export async function recoverInterruptedSwap(host: Host, cwd: string): Promise<Recovery | null> {
+  if (shared.swapping.has(cwd)) return null
+  if (!(await host.storage.get(swapKey(cwd)))) return null
+  return withLock(cwd, async () => (shared.swapping.has(cwd) ? null : recoverLocked(host, cwd)))
+}
+
+/**
+ * First step of every tool call (inside the lock, before anything looks at the working
+ * tree): restore an interrupted swap. If that isn't possible, the tool must not go on (it
+ * would measure, revert or commit the wrong files), so the loop pauses.
+ */
+async function recoverFirst(host: Host, sessionID: string, cwd: string): Promise<{ stop?: ToolResult; note: string }> {
+  const recovery = await recoverLocked(host, cwd)
+  if (recovery?.failed) {
+    if (await host.loopState(sessionID)) await host.stopLoop(sessionID, `Loop paused: ${recovery.failed}`)
+    return {
+      note: "",
+      stop: error(`${recovery.failed}\nThe loop is paused and the user has been told. Don't change or revert files yourself; end your turn.`),
+    }
+  }
+  return { note: recovery?.note ? `NOTE: ${recovery.note}\n\n` : "" }
+}
+
+const withNote = (note: string, result: ToolResult): ToolResult => (note ? { content: note + result.content } : result)
+
 // ── autoresearch_init ─────────────────────────────────────
 
 export async function initExperiment(host: Host, input: unknown, context: ToolCtx): Promise<ToolResult> {
   const { sessionID } = context
   const cwd = await host.cwdOf(sessionID)
   return withLock(cwd, async () => {
+    const first = await recoverFirst(host, sessionID, cwd)
+    if (first.stop) return first.stop
+    return withNote(first.note, await initLocked(host, input, context, cwd))
+  })
+}
+
+async function initLocked(host: Host, input: unknown, context: ToolCtx, cwd: string): Promise<ToolResult> {
+  const { sessionID } = context
+  {
     // HEAD isn't checked here: setup creates the branch and commits the session files
     // before the first init, and init is where the loop learns what HEAD is.
     const gated = await gate(host, sessionID, "branch")
@@ -362,6 +551,13 @@ export async function initExperiment(host: Host, input: unknown, context: ToolCt
     const { state } = gated
     if (state.stopping) return error("The user turned the loop off. Don't start a new segment; end your turn.")
 
+    const bad = unknownArguments(
+      input,
+      ["name", "metric_name", "metric_unit", "direction", "repeat"],
+      "autoresearch_init",
+      "The benchmark is always ./.auto/measure.sh.",
+    )
+    if (bad) return bad
     const { name, metric_name, metric_unit = "", direction, repeat: rawRepeat = DEFAULT_REPEAT } = (input ?? {}) as {
       name?: string
       metric_name?: string
@@ -411,10 +607,25 @@ export async function initExperiment(host: Host, input: unknown, context: ToolCt
     } catch {
       return error("`.auto/measure.sh` isn't executable. Run `chmod +x .auto/measure.sh`.")
     }
+    // Every segment's benchmark must be in git: an uncommitted edit leaves no trace of what
+    // was measured once it's edited again, and the user couldn't review it.
+    const scripts = await benchmarkScriptStatus(cwd)
+    if (!scripts.ok) return error(`git status failed:\n${tailLines(scripts.error, 20)}`)
+    if (scripts.status) {
+      return error(
+        "The benchmark has uncommitted changes, or isn't in git yet:\n" +
+          tailLines(scripts.status, 10) +
+          "\nCommit it first, so every segment's benchmark can be reviewed later: " +
+          "`git add .auto/measure.sh .auto/checks.sh && git commit -m \"autoresearch: benchmark\"` (leave out checks.sh if there is none; " +
+          "lines starting with `!!` mean .auto/ is gitignored: use `git add -f`). This is the one kind of commit you make yourself. " +
+          "Then call autoresearch_init again.",
+      )
+    }
 
     const entries = await readLog(cwd)
     const segment = (currentSegment(entries).config?.segment ?? 0) + 1
     const checksHash = await fileHash(checksPath(cwd))
+    const inputs = await frozenInputs(autoDir(cwd))
     await appendLog(cwd, {
       type: "config",
       segment,
@@ -425,6 +636,7 @@ export async function initExperiment(host: Host, input: unknown, context: ToolCt
       repeat: rawRepeat,
       measure_hash: (await fileHash(measurePath(cwd)))!,
       checks_hash: checksHash,
+      inputs_hash: inputs.hash,
       timestamp: new Date().toISOString(),
     })
     // A measurement from before this init must never become the new segment's baseline.
@@ -438,33 +650,59 @@ export async function initExperiment(host: Host, input: unknown, context: ToolCt
 
     const settings = await readSettings(cwd)
     const total = countRuns(entries)
+    const helpers = Object.keys(inputs.files).sort()
     return {
       content: [
         `Initialized "${name.trim()}" (segment ${segment}) on branch ${branch}: ${metric_name}${metric_unit ? ` in ${metric_unit}` : ""}, ${direction} is better.`,
         `Each measurement runs ${MEASURE_COMMAND} ${rawRepeat}×` +
           (rawRepeat < 3
-            ? ` (fewer than 3: no noise estimate, so a keep needs at least ${settings.minImprovement * 100}% in two measurements).`
+            ? ` (fewer than 3: no noise estimate, so a keep needs at least ${settings.minImprovement * 100}% over the last commit).`
             : " and uses the median.") +
           ` Checks: ${checksHash ? "./.auto/checks.sh" : "none (no .auto/checks.sh)"}.`,
-        "The benchmark is now frozen for this segment: if measure.sh or checks.sh change, autoresearch_run refuses until you call autoresearch_init again.",
+        `A proposed keep is confirmed by measuring the last commit and your change back to back: about ${confirmationRuns(rawRepeat)} more benchmark runs.`,
+        `The benchmark is now frozen for this segment: measure.sh, checks.sh and ${FROZEN_NOTE}` +
+          (helpers.length ? ` (now: ${helpers.slice(0, 15).join(", ")}${helpers.length > 15 ? ", …" : ""})` : "") +
+          ". If any of them changes, autoresearch_run refuses until you call autoresearch_init again.",
         `Runs used: ${total}/${settings.maxIterations} (all segments).`,
         ...settings.warnings.map((w) => `Settings warning: ${w}`),
         "Next: autoresearch_run for the baseline (unchanged code), then autoresearch_log with status \"keep\".",
       ].join("\n"),
     }
-  })
+  }
 }
 
 // ── autoresearch_run ──────────────────────────────────────
+
+/** Advice for a benchmark that writes where it mustn't. */
+const WRITE_ELSEWHERE =
+  "Make measure.sh (and checks.sh) write their output to a gitignored path or outside the project (e.g. \"$TMPDIR\"); " +
+  "not under .auto/, whose files are frozen as benchmark inputs. Changing measure.sh needs a commit and a new autoresearch_init."
 
 export async function runExperiment(host: Host, input: unknown, context: ToolCtx): Promise<ToolResult> {
   const { sessionID } = context
   const cwd = await host.cwdOf(sessionID)
   return withLock(cwd, async () => {
+    const first = await recoverFirst(host, sessionID, cwd)
+    if (first.stop) return first.stop
+    return withNote(first.note, await runLocked(host, input, context, cwd))
+  })
+}
+
+async function runLocked(host: Host, input: unknown, context: ToolCtx, cwd: string): Promise<ToolResult> {
+  const { sessionID } = context
+  {
     const gated = await gate(host, sessionID, "branch+head")
     if (!gated.ok) return gated.result
     const { state } = gated
     if (state.stopping) return error("The user turned the loop off. Don't start another experiment; end your turn.")
+
+    const bad = unknownArguments(
+      input,
+      ["timeout_seconds", "checks_timeout_seconds"],
+      "autoresearch_run",
+      "The benchmark is always ./.auto/measure.sh, repeated as often as autoresearch_init fixed for the segment.",
+    )
+    if (bad) return bad
 
     const entries = await readLog(cwd)
     const { config, runs } = currentSegment(entries)
@@ -479,12 +717,12 @@ export async function runExperiment(host: Host, input: unknown, context: ToolCtx
 
     const before = await fingerprintNow(cwd)
     if (!before.ok) return error(`Couldn't read the repository state: ${before.error}`)
-    const drift = benchmarkDrift(config, before.fp.measure, before.fp.checks)
+    const drift = benchmarkDrift(config, before.fp)
     if (drift) {
       return error(
         `The benchmark changed: ${drift}. Results wouldn't be comparable with this segment's earlier runs. ` +
-          "If the change is intended and honest (see \"What counts as cheating\" in the skill), revert your code changes and call " +
-          "autoresearch_init to start a new segment with a fresh baseline. Otherwise restore the file.",
+          "If the change is intended and honest (see \"What counts as cheating\" in the skill), revert your code changes, commit the " +
+          "benchmark edit and call autoresearch_init to start a new segment with a fresh baseline. Otherwise restore the file.",
       )
     }
 
@@ -516,7 +754,7 @@ export async function runExperiment(host: Host, input: unknown, context: ToolCtx
         host.setStatus(cwd, { running: true, command: "warm-up", startedAt: Date.now() })
         await bash(MEASURE_COMMAND, cwd, timeoutSeconds * 1000, context.signal)
       }
-      result = await measure(host, cwd, config, timeoutSeconds, context, "measuring")
+      result = await measure(host, cwd, config, config.repeat, timeoutSeconds, context, "measuring")
       if (!result.failure && hasChecks) {
         await context.progress?.({ status: "running checks" }).catch(() => {})
         host.setStatus(cwd, { running: true, command: "checks.sh", startedAt: Date.now() })
@@ -530,10 +768,15 @@ export async function runExperiment(host: Host, input: unknown, context: ToolCtx
 
     // The benchmark must not change the code it measures: otherwise the tree that gets
     // committed isn't the tree that was measured, and every later "is there a diff?" lies.
+    // The same goes for its frozen inputs under .auto/: a benchmark that writes there would
+    // make the next run fail with "the benchmark changed", which says nothing useful.
     const after = await scopeTreeHash(cwd)
     if (!after.ok) return error(`Couldn't read the repository state after the run: ${after.error}`)
     const benchmarkWrites = after.tree === before.fp.tree ? [] : await changedBetween(cwd, before.fp.tree, after.tree)
     if (after.tree !== before.fp.tree && !benchmarkWrites.length) benchmarkWrites.push("(unknown files)")
+    const inputsAfter = await frozenInputs(autoDir(cwd))
+    const wroteInputs = changedInputs(before.fp.inputFiles, inputsAfter.files).map((f) => `.auto/${f}`)
+    benchmarkWrites.push(...wroteInputs)
 
     const complete = !result.failure
     const metric = complete ? median(result.samples) : null
@@ -548,7 +791,7 @@ export async function runExperiment(host: Host, input: unknown, context: ToolCtx
       checks: !hasChecks ? "none" : checks === null ? "skipped" : checksFailed ? "failed" : "passed",
       timeoutSeconds,
       checksTimeoutSeconds,
-      fingerprint: { ...before.fp, tree: after.tree },
+      fingerprint: { ...before.fp, tree: after.tree, inputs: inputsAfter.hash, inputFiles: inputsAfter.files },
       benchmarkWrites,
     }
     await host.storage.set(runKey(sessionID), pending)
@@ -581,25 +824,163 @@ export async function runExperiment(host: Host, input: unknown, context: ToolCtx
       verdict = "Checks failed, so this can't be kept. Log it as `checks_failed` (reverts your changes), or fix it and run again."
     } else if (benchmarkWrites.length) {
       verdict =
-        `The benchmark itself changed files in the project: ${benchmarkWrites.slice(0, 10).join(", ")}. A keep is refused in that state, ` +
-        "because the committed code would differ from the measured code. Make measure.sh write its output under .auto/ or to a " +
-        "gitignored path (changing measure.sh needs a new autoresearch_init), or add those files to .gitignore."
+        `The benchmark itself changed files: ${benchmarkWrites.slice(0, 10).join(", ")}. A keep is refused in that state` +
+        (wroteInputs.length
+          ? `, and the next run will be refused too, because ${FROZEN_NOTE} is frozen as benchmark input. `
+          : ", because the committed code would differ from the measured code. ") +
+        WRITE_ELSEWHERE +
+        (wroteInputs.length ? "" : " Or add those files to .gitignore.")
     } else if (isBaseline) {
       verdict = "This is the baseline (one warm-up run was done first and not counted). Log it with status `keep`."
     } else {
       const cur = median(sampleList(current))
       const better = isBetter(metric!, cur, config.direction)
+      const paired = confirmationRuns(config.repeat)
       verdict =
-        `current is ${withUnit(cur, unit)}; this first measurement is ${fmt(metric)}${changeText(cur, metric)}, ${better ? "better" : metric === cur ? "equal" : "worse"}. ` +
+        `First measurement: ${withUnit(metric, unit)}, ` +
+        (metric === cur ? "equal to" : `${gainText(relativeGain(metric!, cur, config.direction))} than`) +
+        ` current's logged ${withUnit(cur, unit)}. That number is from earlier and the machine's speed drifts, so this is only a first look. ` +
         (better
-          ? `Log \`keep\`: the plugin then measures ${config.repeat} more time${config.repeat > 1 ? "s" : ""} and commits only if that confirms the gain; otherwise it reverts and logs a discard.`
-          : "Log `discard`. Only if the change removes or simplifies code at equal performance: `keep` with `simplification: true` (also re-measured).")
+          ? `Log \`keep\`: the plugin then measures the last commit and your change back to back (${paired} more benchmark runs) ` +
+            "and commits only if that confirms the gain; otherwise it reverts and logs a discard."
+          : "Log `discard`. Only if the change removes more lines than it adds and performance is about equal: `keep` with " +
+            "`simplification: true` (also measured back to back).")
     }
     lines.push("", verdict, "Don't change any file before logging: a keep is refused if the code differs from what was measured.")
     lines.push("", "── output (tail) ──", tailLines(result.last.output, OUTPUT_TAIL_LINES))
     if (checksFailed) lines.push("", "── checks output (tail) ──", tailLines(checks!.output, OUTPUT_TAIL_LINES))
     return { content: lines.join("\n") }
+  }
+}
+
+// ── Paired confirmation ───────────────────────────────────
+
+/**
+ * Measure HEAD and the candidate back to back: HEAD, candidate, HEAD (halfRuns() runs of
+ * HEAD on each side).
+ *
+ * Why: the first design compared the candidate with current's LOGGED samples. On a loaded
+ * machine the same tree measured 13 % apart minutes later, which rejected sound changes
+ * and let no-ops through whenever the logged reference had been unluckily slow. Only
+ * numbers taken together are comparable.
+ *
+ * The scope's files are swapped to HEAD and back (swapScope). While they're swapped, a
+ * marker in plugin storage names the candidate's tree; whatever happens (an abort, a
+ * failing benchmark, an exception) the `finally` puts the candidate back, and if even
+ * that fails or the process dies, the next tool call or loop start does it from the marker.
+ */
+async function pairedConfirmation(
+  host: Host,
+  cwd: string,
+  config: ConfigEntry,
+  pending: PendingRun,
+  context: ToolCtx,
+  head: string,
+): Promise<{ ok: true; confirmation: Confirmation } | { ok: false; result: ToolResult; pause?: string }> {
+  const candidate = pending.fingerprint.tree
+  const half = halfRuns(config.repeat)
+  const marker: SwapMarker = {
+    directory: cwd,
+    sessionID: context.sessionID,
+    tree: candidate,
+    head: pending.fingerprint.head,
+    branch: pending.fingerprint.branch,
+    at: new Date().toISOString(),
+  }
+  const interrupted = (): { ok: false; result: ToolResult } => ({
+    ok: false,
+    result: error(
+      "Interrupted while the keep was being confirmed. Your change is back in the working tree as measured and nothing was logged; " +
+        "call autoresearch_log again to repeat the confirmation.",
+    ),
   })
+  const headFailed = (m: Measurement): { ok: false; result: ToolResult } => ({
+    ok: false,
+    result: error(
+      `The confirmation measures the last commit next to your change, and on the last commit ${m.failure}. ` +
+        "Your change is back in the working tree as measured and nothing was logged. If the benchmark is flaky, call autoresearch_log " +
+        "again; if it really fails without your change, log `discard` and call autoresearch_pause to tell the user.\n" +
+        `── output (tail) ──\n${tailLines(m.last.output, 30)}`,
+    ),
+  })
+  const swapFailed = (what: string, err: string): { ok: false; result: ToolResult } => ({
+    ok: false,
+    result: error(
+      `Couldn't ${what} for the confirmation: ${err}. Your change is back in the working tree as measured and nothing was logged. ` +
+        "Log `discard`, or call autoresearch_pause if you can't tell why.",
+    ),
+  })
+
+  let outcome: { ok: true; confirmation: Confirmation } | { ok: false; result: ToolResult; pause?: string }
+  shared.swapping.add(cwd)
+  try {
+    await host.storage.set(swapKey(cwd), marker)
+    // 1. To HEAD. The files must still be exactly the measured candidate: the permission
+    // prompts above can take a while, and whatever was edited meanwhile isn't in the
+    // candidate's tree, so swapping would lose it.
+    const first = await swapScope(cwd, head, { exactly: candidate })
+    if (!first.ok && first.untouched) {
+      await host.storage.remove(swapKey(cwd))
+      return {
+        ok: false,
+        result: error(
+          `Files changed since the measurement (${first.error}), so the result no longer describes this code. ` +
+            "Nothing was logged or changed. Call autoresearch_run again, then log. (Or log `discard` to revert.)",
+        ),
+      }
+    }
+    try {
+      outcome = await (async () => {
+        if (!first.ok) return swapFailed("set the files to the last commit", first.error)
+        const before = await measure(host, cwd, config, half, pending.timeoutSeconds, context, "confirming: last commit")
+        if (context.signal?.aborted) return interrupted()
+        if (before.failure) return headFailed(before)
+
+        // 2. The candidate. swapScope checks that the files hash to the fingerprint again.
+        // From exactly HEAD's files: an edit made during the measurement is refused here
+        // (and by the restore below, which then leaves it in place and pauses the loop).
+        let swap = await swapScope(cwd, candidate, { exactly: head })
+        if (!swap.ok) return swapFailed("put your change back", swap.error)
+        const mine = await measure(host, cwd, config, config.repeat, pending.timeoutSeconds, context, "confirming: your change")
+        if (context.signal?.aborted) return interrupted()
+        // A candidate that fails here is "not confirmed"; HEAD needn't be measured again.
+        if (mine.failure) {
+          return { ok: true as const, confirmation: { samples: mine.samples, currentSamples: before.samples, metrics: mine.metrics, failure: mine.failure } }
+        }
+
+        // 3. HEAD, second half.
+        swap = await swapScope(cwd, head, { exactly: candidate })
+        if (!swap.ok) return swapFailed("set the files to the last commit", swap.error)
+        const after = await measure(host, cwd, config, half, pending.timeoutSeconds, context, "confirming: last commit again")
+        if (context.signal?.aborted) return interrupted()
+        if (after.failure) return headFailed(after)
+        return {
+          ok: true as const,
+          confirmation: { samples: mine.samples, currentSamples: [...before.samples, ...after.samples], metrics: mine.metrics },
+        }
+      })()
+    } finally {
+      host.setStatus(cwd, { running: false })
+      // Back to the candidate, whatever happened above. Only files that are at HEAD's or
+      // the candidate's version are touched: one at neither was edited by someone
+      // meanwhile, and overwriting it would lose that edit.
+      const back = await swapScope(cwd, candidate, { oneOf: [head] }).catch((err) => ({ ok: false as const, error: String(err) }))
+      if (back.ok) {
+        await host.storage.remove(swapKey(cwd))
+      } else {
+        // The marker stays: the next tool call or loop start tries again.
+        const reason =
+          `Couldn't put the experiment's files back after measuring the last commit: ${back.error}. ` +
+          `Nothing was overwritten. The experiment's files are saved in git as tree ${candidate}; revert or stash the changed files ` +
+          "and `/autoresearch` puts the experiment back."
+        // eslint-disable-next-line no-unsafe-finally -- deliberate: this failure outranks whatever the measurement returned or threw
+        return { ok: false, pause: `Loop paused: ${reason}`, result: error(`${reason}\nThe loop is paused and the user has been told. Don't change or revert files yourself; end your turn.`) }
+      }
+    }
+  } finally {
+    shared.swapping.delete(cwd)
+  }
+  return outcome
 }
 
 // ── autoresearch_log ──────────────────────────────────────
@@ -610,10 +991,26 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
   const { sessionID } = context
   const cwd = await host.cwdOf(sessionID)
   return withLock(cwd, async () => {
+    const first = await recoverFirst(host, sessionID, cwd)
+    if (first.stop) return first.stop
+    return withNote(first.note, await logLocked(host, input, context, cwd))
+  })
+}
+
+async function logLocked(host: Host, input: unknown, context: ToolCtx, cwd: string): Promise<ToolResult> {
+  const { sessionID } = context
+  {
     const gated = await gate(host, sessionID, "branch+head")
     if (!gated.ok) return gated.result
     const { state } = gated
 
+    const bad = unknownArguments(
+      input,
+      ["status", "description", "asi", "simplification"],
+      "autoresearch_log",
+      "The plugin records the numbers it measured itself; a result can't be typed in.",
+    )
+    if (bad) return bad
     const { status, description, asi = {}, simplification = false } = (input ?? {}) as {
       status?: RunStatus
       description?: string
@@ -657,11 +1054,13 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
       // measuring, and saving the old copy would turn the loop back on.
       const fresh = await host.loopState(sessionID)
       if (fresh) await host.saveLoopState(sessionID, { ...fresh, head: (await headSha(cwd)) ?? fresh.head })
-      const { baseline, current: now } = summarize([...runs, entry])
       const lines = [
         headline,
-        `baseline ${withUnit(baseline, unit)} → current ${withUnit(now, unit)}${changeText(baseline, now)}`,
-        `Runs: ${countRuns(all)}/${settings.maxIterations} · without improvement: ${noImprovementStreak(all, state.startRunCount)}/${settings.maxNoImprovement}`,
+        `Segment ${config.segment} so far: ${progressText(segmentSummaries([config, ...runs, entry])[0])}`,
+        // "since the loop was last started": the count restarts on every `/autoresearch`,
+        // which read as a miscount next to the log's longer run of discards.
+        `Runs: ${countRuns(all)}/${settings.maxIterations} · runs without a keep since the loop was last started: ` +
+          `${noImprovementStreak(all, state.startRunCount)} (the loop pauses at ${settings.maxNoImprovement})`,
       ]
       const limit = limitReached(all, state, settings)
       if (!fresh) {
@@ -714,9 +1113,8 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
     if (pending.checks === "failed") return error("Checks failed on this run, so it can't be kept. Log it as `checks_failed`.")
     if (pending.benchmarkWrites.length) {
       return error(
-        `The benchmark changed files in the project while measuring (${pending.benchmarkWrites.slice(0, 10).join(", ")}), so the measured ` +
-          "code and the code that would be committed differ. Make the benchmark write under .auto/ or to a gitignored path, then run again. " +
-          "Or log this run as `discard`.",
+        `The benchmark changed files while measuring (${pending.benchmarkWrites.slice(0, 10).join(", ")}), so what was measured ` +
+          `can't be tied to what would be committed. ${WRITE_ELSEWHERE} Or log this run as \`discard\`.`,
       )
     }
     const now = await fingerprintNow(cwd)
@@ -729,7 +1127,9 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
           ? "the branch or commit changed"
           : now.fp.measure !== fp.measure || now.fp.checks !== fp.checks
             ? "the benchmark files changed"
-            : ""
+            : now.fp.inputs !== fp.inputs
+              ? `the benchmark files changed (under .auto/: ${changedInputs(fp.inputFiles ?? {}, now.fp.inputFiles).slice(0, 10).join(", ")})`
+              : ""
     if (changed) {
       return error(
         `${changed[0].toUpperCase()}${changed.slice(1)} since the measurement, so the result no longer describes this code. ` +
@@ -737,6 +1137,7 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
       )
     }
     const tree = await headTree(cwd)
+    if (!tree) return error("Couldn't read the last commit's tree.")
 
     // 2. Baseline: the unchanged code. Nothing to commit, nothing to confirm against.
     if (!current) {
@@ -762,53 +1163,60 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
     if (fp.tree === tree) {
       return error("There are no code changes to keep (the working tree equals the last commit). Log this run as `discard`.")
     }
-    const currentSamples = sampleList(current)
-    const currentMetric = median(currentSamples)
+    const loggedCurrent = median(sampleList(current))
     const neutral = simplification === true
-    // Not in the design's list of refusals, but in its spirit: a keep is proposed on a
-    // measurement that looked better. Without this, proposing a keep on everything gives
-    // each no-op a second draw against the noise. Nothing is lost: the agent can still
-    // discard, or keep as a simplification.
-    if (!neutral && !isBetter(pending.metric, currentMetric, config.direction)) {
+    if (neutral) {
+      // "Simplification" used to be a claim the agent made, and it was used to get a
+      // performance change past the filter below. Now it's something the diff shows.
+      const lines = await diffLineCounts(cwd, tree, fp.tree)
+      if (!lines) return error("Couldn't read the size of the change (git diff failed). Try again, or log `discard`.")
+      if (lines.removed <= lines.added) {
+        return error(
+          `\`simplification: true\` is only for changes that remove more lines than they add; this one adds ${lines.added} and removes ${lines.removed}. ` +
+            "If it's meant to perform better, log `keep` without `simplification` (that needs a first measurement better than current). Otherwise log `discard`.",
+        )
+      }
+    } else if (!isBetter(pending.metric, loggedCurrent, config.direction)) {
+      // A cheap filter, not a judgment: a keep is proposed on a measurement that looked
+      // better. Without it, proposing a keep on everything gives each no-op a full
+      // confirmation, i.e. twice the chances against the noise.
       return error(
-        `The measurement (${fmt(pending.metric)}) isn't better than current (${fmt(currentMetric)}), so there's no gain to confirm. ` +
-          "Log it as `discard`. If the change removes or simplifies code at equal performance, log `keep` with `simplification: true`.",
+        `The measurement (${fmt(pending.metric)}) isn't better than current (${fmt(loggedCurrent)}), so there's no gain to confirm. ` +
+          "Log it as `discard`. Only if the change removes more lines than it adds at about equal performance: `keep` with `simplification: true`.",
       )
     }
 
-    // 4. Confirmation. Ask for every permission first: a rejection halfway would leave a
-    // measured-but-undecided tree behind.
-    await host.assertShell(context, [MEASURE_COMMAND, gitCommandLine(GIT_ADD), gitCommandLine(GIT_COMMIT)], true)
+    // 4. Paired confirmation. Ask for every permission first: a rejection halfway would
+    // leave a measured-but-undecided tree behind.
+    await host.assertShell(context, [MEASURE_COMMAND, gitCommandLine(GIT_SWAP), gitCommandLine(GIT_ADD), gitCommandLine(GIT_COMMIT)], true)
     await host.assertShell(context, revertCommands, false)
 
     let confirmation = pending.confirmation
     if (!confirmation) {
-      let result: Measurement
-      try {
-        result = await measure(host, cwd, config, pending.timeoutSeconds, context, "confirming")
-      } finally {
-        host.setStatus(cwd, { running: false })
+      const paired = await pairedConfirmation(host, cwd, config, pending, context, tree)
+      if (!paired.ok) {
+        if (paired.pause) await host.stopLoop(sessionID, paired.pause)
+        return paired.result
       }
-      if (context.signal?.aborted) return error("Interrupted while confirming. Nothing was logged or changed; call autoresearch_log again.")
-      // The confirmed tree must still be the measured tree.
-      const afterTree = await scopeTreeHash(cwd)
-      if (!afterTree.ok || afterTree.tree !== fp.tree) {
+      // The helper files must still be the measured ones (the code is checked by the swap).
+      const inputsAfter = await frozenInputs(autoDir(cwd))
+      if (inputsAfter.hash !== fp.inputs) {
         await host.storage.remove(runKey(sessionID))
         return error(
-          "Files changed while the keep was being confirmed, so nothing was logged. Don't edit files while autoresearch_log runs. " +
-            "Call autoresearch_run again, then log.",
+          `Files under .auto/ changed while the keep was being confirmed (${changedInputs(fp.inputFiles ?? {}, inputsAfter.files).slice(0, 10).join(", ")}), ` +
+            "so nothing was logged. Don't edit files while autoresearch_log runs. Call autoresearch_run again, then log.",
         )
       }
-      confirmation = { samples: result.samples, metrics: result.metrics, failure: result.failure }
+      confirmation = paired.confirmation
       await host.storage.set(runKey(sessionID), { ...pending, confirmation })
     }
 
+    const headMetric = median(confirmation.currentSamples)
     const verdict: Verdict = confirmation.failure
-      ? { confirmed: false, gain: 0, relGain: 0, se: null, confidence: null, exact: false, reason: `Not confirmed: ${confirmation.failure} during the confirmation runs.` }
+      ? { confirmed: false, gain: 0, relGain: 0, se: null, confidence: null, exact: false, reason: `Not confirmed: ${confirmation.failure} when your change was measured again.` }
       : judge({
-          current: currentSamples,
+          current: confirmation.currentSamples,
           candidate: confirmation.samples,
-          firstMetric: pending.metric,
           direction: config.direction,
           minImprovement: settings.minImprovement,
           neutral,
@@ -818,9 +1226,12 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
       metric: confirmedMetric,
       metrics: confirmation.failure ? {} : confirmation.metrics,
       samples: confirmation.failure ? [] : confirmation.samples,
+      current_samples: confirmation.currentSamples,
       noise: !confirmation.failure && confirmation.samples.length >= 3 ? mad(confirmation.samples) : null,
       first_metric: pending.metric,
-      vs: currentMetric,
+      vs: headMetric,
+      // Recorded for unconfirmed keeps too, so the decision can be audited from the log.
+      confidence: verdict.confidence === null ? null : Number(verdict.confidence.toFixed(2)),
     }
 
     // 5a. Not confirmed: revert, and record it as a discard. The same tree can't be tried again.
@@ -833,10 +1244,11 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
         )
       }
       const note = confirmation.failure
-        ? `keep not confirmed: ${confirmation.failure} during confirmation (first ${fmt(pending.metric)}, current ${fmt(currentMetric)})`
-        : `keep not confirmed: first ${fmt(pending.metric)}, confirmed ${fmt(confirmedMetric)}, current ${fmt(currentMetric)}`
+        ? `keep not confirmed: ${confirmation.failure} during the confirmation (first measurement ${fmt(pending.metric)}, HEAD ${fmt(headMetric)})`
+        : `keep not confirmed: candidate ${fmt(confirmedMetric)} vs HEAD ${fmt(headMetric)} back to back ` +
+          `(${gainText(verdict.relGain)}); first measurement ${fmt(pending.metric)}`
       return finish(
-        { ...entryBase, status: "discard", ...measured, commit: null, confidence: null, note, timestamp: new Date().toISOString() },
+        { ...entryBase, status: "discard", ...measured, commit: null, note, timestamp: new Date().toISOString() },
         `Run #${entryBase.run}: keep NOT confirmed, so the changes were reverted and the run is logged as discard.\n${verdict.reason}\n` +
           "Don't retry the same change hoping for a luckier measurement; move on to a different idea.",
       )
@@ -864,7 +1276,6 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
         status: "keep",
         ...measured,
         commit: res.commit,
-        confidence: verdict.confidence === null ? null : Number(verdict.confidence.toFixed(2)),
         ...(neutral ? { neutral: true as const } : {}),
         ...(mismatch ? { note: mismatch } : {}),
         timestamp: new Date().toISOString(),
@@ -872,23 +1283,29 @@ export async function logExperiment(host: Host, input: unknown, context: ToolCtx
       `Run #${entryBase.run} logged as keep @ ${res.commit}${neutral ? " (simplification)" : ""}.\n${verdict.reason}` +
         (mismatch ? `\n${mismatch}` : ""),
     )
-  })
+  }
 }
 
 // ── autoresearch_pause ────────────────────────────────────
 
 export async function pauseLoop(host: Host, input: unknown, context: ToolCtx): Promise<ToolResult> {
   const { sessionID } = context
+  const bad = unknownArguments(input, ["reason"], "autoresearch_pause", "")
+  if (bad) return bad
   const reason = String((input as { reason?: unknown } | undefined)?.reason ?? "").trim()
   if (!reason) return error("`reason` is required: one or two sentences for the user on why you're pausing and what you need.")
   const state = await host.loopState(sessionID)
   if (!state) return { content: "The loop is already off. End your turn." }
+  // If a confirmation was cut off earlier, the files must be back before "uncommitted
+  // changes?" is answered below. (Skipped while one is running right now.)
+  const recovery = await recoverInterruptedSwap(host, state.directory)
   const unlogged = await host.storage.get(runKey(sessionID))
   const status = await scopeStatus(state.directory)
   const leftovers = status.ok && status.status !== ""
   await host.stopLoop(
     sessionID,
     `Loop paused by the agent: ${reason}` +
+      (recovery?.failed ? `\nAlso: ${recovery.failed}` : "") +
       (leftovers
         ? `\nNote: the working tree has uncommitted changes${unlogged ? " from an experiment that wasn't logged" : ""}. \`/autoresearch\` won't resume until they're committed, stashed or reverted.`
         : "") +

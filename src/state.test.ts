@@ -3,13 +3,20 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  compoundedGain,
+  CONFIRM_AT,
   DEFAULT_SETTINGS,
+  gainText,
+  halfRuns,
   judge,
+  keptRuns,
   median,
   noImprovementStreak,
   parseMetrics,
   readSettings,
+  relativeGain,
   sampleList,
+  segmentSummaries,
   summarize,
   type LogEntry,
   type RunEntry,
@@ -64,42 +71,107 @@ describe("noImprovementStreak", () => {
   })
 })
 
+describe("compounded gain", () => {
+  const keep = (metric: number, vs: number, extra: Partial<RunEntry> = {}) => run(metric, "keep", { vs, ...extra })
+
+  test("the product of the keeps' back-to-back ratios, not current / baseline", () => {
+    // The baseline was logged at 100 on a slow day; the two keeps were each 10 % better
+    // than HEAD when measured next to it, at whatever speed the machine had then.
+    const runs = [run(100, "keep", { baseline: true }), keep(72, 80), run(70, "discard", { vs: 72 }), keep(108, 120)]
+    const g = compoundedGain(runs, "lower")
+    expect(g.ratio).toBeCloseTo(0.81)
+    expect(g.gain).toBeCloseTo(0.19)
+    expect(g).toMatchObject({ keeps: 2, skipped: 0 })
+    // current / baseline would say "8 % worse".
+    expect(summarize(runs)).toMatchObject({ baseline: 100, current: 108 })
+  })
+
+  test("direction higher; baselines, discards and keeps without a usable ratio don't count", () => {
+    const runs = [run(50, "keep", { baseline: true, vs: 1 }), keep(110, 100), keep(5, 0), run(200, "keep"), run(999, "discard", { vs: 1 })]
+    const g = compoundedGain(runs, "higher")
+    expect(g.gain).toBeCloseTo(0.1)
+    expect(g).toMatchObject({ keeps: 1, skipped: 2 })
+    expect(keptRuns(runs)).toHaveLength(3)
+    expect(compoundedGain([run(100, "keep", { baseline: true })], "lower")).toMatchObject({ ratio: 1, gain: 0, keeps: 0 })
+  })
+
+  test("segmentSummaries: one per segment, kept without the baseline", () => {
+    const config = (segment: number, name: string) => ({ type: "config", segment, name, direction: "lower", metric_unit: "ms" }) as LogEntry
+    const entries = [
+      config(1, "first"),
+      run(100, "keep", { segment: 1, baseline: true }),
+      keep(90, 100, { segment: 1 }),
+      run(95, "discard", { segment: 1 }),
+      config(2, "second"),
+      run(50, "keep", { segment: 2, baseline: true }),
+    ] as LogEntry[]
+    const [a, b] = segmentSummaries(entries)
+    expect(a).toMatchObject({ runs: 3, kept: 1, baseline: 100, current: 90 })
+    expect(a.gain).toBeCloseTo(0.1)
+    expect(b).toMatchObject({ runs: 1, kept: 0, gain: 0, baseline: 50, current: 50 })
+  })
+
+  test("gainText: one wording, never a sign", () => {
+    expect(gainText(0.0812)).toBe("8.1% better")
+    expect(gainText(-0.699)).toBe("69.9% worse")
+    expect(gainText(0)).toBe("no change")
+    expect(gainText(-0.0004)).toBe("0.04% worse") // not "0.0%"
+    expect(gainText(Infinity)).toContain("better")
+    expect(relativeGain(90, 100, "lower")).toBeCloseTo(0.1)
+    expect(relativeGain(90, 100, "higher")).toBeCloseTo(-0.1)
+  })
+})
+
 describe("judge", () => {
   const base = { direction: "lower" as const, minImprovement: 0.01 }
 
   test("a clear gain over the noise is confirmed, with a per-keep confidence", () => {
-    const v = judge({ ...base, current: [100, 101, 99, 100.5, 99.5], candidate: [90, 91, 89, 90.5, 89.5], firstMetric: 90 })
+    const v = judge({ ...base, current: [100, 101, 99, 100.5, 99.5], candidate: [90, 91, 89, 90.5, 89.5] })
     expect(v.confirmed).toBe(true)
     expect(v.gain).toBeCloseTo(10)
     expect(v.relGain).toBeCloseTo(0.1)
-    expect(v.confidence!).toBeGreaterThan(2)
+    expect(v.confidence!).toBeGreaterThan(CONFIRM_AT)
     expect(v.reason).toContain("Confirmed")
+    expect(v.reason).toContain("10.0% better")
   })
 
   test("a gain inside the noise is not confirmed", () => {
-    const v = judge({ ...base, current: [100, 104, 96, 102, 98], candidate: [99, 103, 95, 101, 97], firstMetric: 97 })
+    const v = judge({ ...base, current: [100, 104, 96, 102, 98], candidate: [99, 103, 95, 101, 97] })
     expect(v.confirmed).toBe(false)
-    expect(v.confidence!).toBeLessThan(2)
+    expect(v.confidence!).toBeLessThan(CONFIRM_AT)
     expect(v.reason).toContain("Not confirmed")
   })
 
-  test("direction higher: more is better", () => {
-    const v = judge({ ...base, direction: "higher", current: [100, 101, 99], candidate: [120, 121, 119], firstMetric: 120 })
-    expect(v.confirmed).toBe(true)
-    expect(v.gain).toBeCloseTo(20)
-    expect(judge({ ...base, direction: "higher", current: [100, 101, 99], candidate: [80, 81, 79], firstMetric: 80 }).confirmed).toBe(false)
+  test("the threshold is 2.5 standard errors (see the simulation below)", () => {
+    expect(CONFIRM_AT).toBe(2.5)
+    // 2.2 standard errors: passed at 2, doesn't pass now.
+    const current = [100, 101, 99, 100.5, 99.5, 100]
+    const candidate = [98.76, 99.76, 97.76, 99.26, 98.26]
+    const v = judge({ ...base, current, candidate })
+    expect(v.confidence!).toBeGreaterThan(2)
+    expect(v.confidence!).toBeLessThan(2.5)
+    expect(v.confirmed).toBe(false)
+    expect(judge({ ...base, current, candidate, confirmAt: 2 }).confirmed).toBe(true)
   })
 
-  test("a confirmation that looks good doesn't rescue a first measurement that wasn't better", () => {
-    const v = judge({ ...base, current: [100, 101, 99, 100.5, 99.5], candidate: [90, 91, 89, 90.5, 89.5], firstMetric: 100.2 })
-    expect(v.confirmed).toBe(false)
-    expect(v.reason).toContain("first measurement")
+  test("direction higher: more is better", () => {
+    const v = judge({ ...base, direction: "higher", current: [100, 101, 99], candidate: [120, 121, 119] })
+    expect(v.confirmed).toBe(true)
+    expect(v.gain).toBeCloseTo(20)
+    expect(judge({ ...base, direction: "higher", current: [100, 101, 99], candidate: [80, 81, 79] }).confirmed).toBe(false)
+  })
+
+  test("the wording never mixes a signed percentage with better/worse", () => {
+    const worse = judge({ ...base, current: [77.4, 77.5, 77.3], candidate: [131.6, 131.5, 131.7] })
+    expect(worse.reason).toContain("70.0% worse")
+    expect(worse.reason).not.toMatch(/[+-]\d+(\.\d+)?%/)
+    expect(worse.reason).toContain("below HEAD")
   })
 
   test("deterministic metric: exact comparison, confidence reported as exact (null)", () => {
-    const better = judge({ ...base, current: [1000, 1000, 1000], candidate: [999, 999, 999], firstMetric: 999 })
+    const better = judge({ ...base, current: [1000, 1000, 1000], candidate: [999, 999, 999] })
     expect(better).toMatchObject({ confirmed: true, exact: true, confidence: null, se: 0 })
-    const same = judge({ ...base, current: [1000, 1000, 1000], candidate: [1000, 1000, 1000], firstMetric: 1000 })
+    const same = judge({ ...base, current: [1000, 1000, 1000], candidate: [1000, 1000, 1000] })
     expect(same.confirmed).toBe(false)
     expect(judge({ ...base, neutral: true, current: [1000, 1000, 1000], candidate: [1000, 1000, 1000] }).confirmed).toBe(true)
     expect(judge({ ...base, neutral: true, current: [1000, 1000, 1000], candidate: [1001, 1001, 1001] }).confirmed).toBe(false)
@@ -107,84 +179,106 @@ describe("judge", () => {
 
   test("zero spread from ties in a coarse metric is NOT treated as exact", () => {
     // MAD is 0 on both sides although the samples differ (integer milliseconds).
-    const v = judge({ ...base, current: [100, 100, 100, 101, 99], candidate: [100, 100, 100, 99, 99.9], firstMetric: 99.9 })
+    const v = judge({ ...base, current: [100, 100, 100, 101, 99], candidate: [100, 100, 100, 99, 99.9] })
     expect(v.exact).toBe(false)
     expect(v.confirmed).toBe(false) // falls back to minImprovement: 0 % < 1 %
   })
 
-  test("fewer than 3 samples: needs minImprovement in BOTH measurements", () => {
-    expect(judge({ ...base, current: [100], candidate: [98], firstMetric: 97 }).confirmed).toBe(true)
-    expect(judge({ ...base, current: [100], candidate: [99.5], firstMetric: 97 }).confirmed).toBe(false)
-    expect(judge({ ...base, current: [100], candidate: [97], firstMetric: 99.5 }).confirmed).toBe(false)
-    const v = judge({ ...base, current: [100, 101], candidate: [90, 91], firstMetric: 90 })
+  test("fewer than 3 samples: the paired gain must reach minImprovement", () => {
+    expect(judge({ ...base, current: [100], candidate: [98] }).confirmed).toBe(true)
+    expect(judge({ ...base, current: [100], candidate: [99.5] }).confirmed).toBe(false)
+    const v = judge({ ...base, current: [100, 101], candidate: [90, 91] })
     expect(v).toMatchObject({ confirmed: true, se: null, confidence: null })
   })
 
-  test("simplification: confirmed unless worse beyond the noise", () => {
+  test("simplification: not worse beyond the noise AND not worse by more than minImprovement", () => {
     const current = [100, 101, 99, 100.5, 99.5]
     expect(judge({ ...base, neutral: true, current, candidate: [100.2, 101.1, 99.3, 100.4, 99.8] }).confirmed).toBe(true)
     expect(judge({ ...base, neutral: true, current, candidate: [110, 111, 109, 110.5, 109.5] }).confirmed).toBe(false)
+    // A noisy benchmark: 3 % slower is "within the noise", and used to pass as a simplification.
+    const noisy = judge({ ...base, neutral: true, current: [100, 110, 90, 105, 95], candidate: [103, 113, 93, 108, 98] })
+    expect(noisy.confidence!).toBeGreaterThan(-CONFIRM_AT)
+    expect(noisy.confirmed).toBe(false)
+    expect(noisy.reason).toContain("may not cost more than 1%")
+    expect(judge({ ...base, minImprovement: 0.05, neutral: true, current: [100, 110, 90, 105, 95], candidate: [103, 113, 93, 108, 98] }).confirmed).toBe(true)
     // few samples: not worse by more than minImprovement
     expect(judge({ ...base, neutral: true, current: [100], candidate: [100.5] }).confirmed).toBe(true)
     expect(judge({ ...base, neutral: true, current: [100], candidate: [102] }).confirmed).toBe(false)
   })
 
   test("a zero current value doesn't produce NaN", () => {
-    const v = judge({ ...base, current: [0], candidate: [0], firstMetric: 0 })
+    const v = judge({ ...base, current: [0], candidate: [0] })
     expect(v.relGain).toBe(0)
     expect(v.confirmed).toBe(false)
   })
 })
 
-// The reason judge() exists: under the old rules (keep whatever beats the best so far,
-// confidence = cumulative gain / one MAD) experiments that changed NOTHING were kept and
-// called "likely real" in 50–85 % of sessions. This simulates the new procedure the way
-// the tools apply it: one fixed set of current samples per session, the agent proposes a
-// keep only when its first measurement looks better, the plugin re-measures and judges,
-// and a false keep becomes the new current.
-describe("judge: simulation with 2 % noise", () => {
-  function simulate(opts: { repeat: number; effectPct: number; attempts: number; sessions: number; seed: number }) {
+// The procedure the tools apply, simulated with the real judge(), as docs/design.md asks:
+// experiments that change NOTHING, uniform ±2 % noise, a keep proposed whenever the first
+// measurement looks better than current's logged samples, then HEAD / candidate / HEAD
+// measured fresh and judged. Every no-op counts in the denominator, proposed or not.
+//
+// Two versions of "current's logged samples":
+// - fresh: an unbiased measurement of the same code (the state after a baseline or a real
+//   keep). This is the rate that decides the threshold: it's what a session's first no-ops see.
+// - ratchet: after a false keep its (lucky) samples become the logged current, so later
+//   no-ops rarely even pass the first look. Over a long run of no-ops the rate drops far
+//   below the fresh one; it's reported, but nothing relies on it.
+describe("judge: simulation of the paired confirmation", () => {
+  test("halfRuns: equal halves around the candidate, at least 3 each once repeat ≥ 3", () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 10].map(halfRuns)).toEqual([1, 1, 3, 3, 3, 3, 4, 5])
+  })
+
+  function simulate(opts: { repeat: number; effect: number; confirmAt: number; trials: number; seed: number; ratchet?: boolean }) {
     let seed = opts.seed
     const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0), seed / 2 ** 32)
-    const gauss = () => Math.sqrt(-2 * Math.log(rnd() || 1e-12)) * Math.cos(2 * Math.PI * rnd())
-    const draw = (mean: number) => Array.from({ length: opts.repeat }, () => mean + 2 * gauss())
+    const draw = (mean: number, n: number) => Array.from({ length: n }, () => mean * (1 + 0.02 * (2 * rnd() - 1)))
+    const half = halfRuns(opts.repeat)
+    const candidateMean = 100 * (1 - opts.effect)
     let kept = 0
-    let total = 0
-    for (let s = 0; s < opts.sessions; s++) {
-      let current = draw(100)
-      for (let a = 0; a < opts.attempts; a++) {
-        total++
-        const candidateMean = 100 - opts.effectPct
-        const first = median(draw(candidateMean))
-        if (!(first < median(current))) continue // the agent logs a discard
-        const confirmation = draw(candidateMean)
-        const v = judge({ current, candidate: confirmation, firstMetric: first, direction: "lower", minImprovement: 0.01 })
-        if (!v.confirmed) continue
-        kept++
-        if (opts.effectPct === 0) current = confirmation // a false keep moves the bar
-      }
+    let logged = draw(100, opts.repeat)
+    for (let i = 0; i < opts.trials; i++) {
+      if (!opts.ratchet) logged = draw(100, opts.repeat)
+      const first = median(draw(candidateMean, opts.repeat))
+      if (!(first < median(logged))) continue // the pre-filter: the agent logs a discard
+      const headBefore = draw(100, half)
+      const candidate = draw(candidateMean, opts.repeat)
+      const headAfter = draw(100, half)
+      const v = judge({ current: [...headBefore, ...headAfter], candidate, direction: "lower", minImprovement: 0.01, confirmAt: opts.confirmAt })
+      if (!v.confirmed) continue
+      kept++
+      if (opts.ratchet) logged = candidate
     }
-    return kept / total
+    return kept / opts.trials
   }
+  const noop = { effect: 0, trials: 400_000, seed: 42 }
 
-  test("no-op experiments, repeat 5: only a few percent of attempts are kept", () => {
-    const rate = simulate({ repeat: 5, effectPct: 0, attempts: 50, sessions: 2000, seed: 42 })
-    // Measured ≈ 1 %. The bound leaves room for other seeds; the old rules gave ≈ 7 % per attempt.
-    expect(rate).toBeLessThan(0.03)
+  test("no-ops, repeat 5: 2 standard errors lets through more than 3 %, so the threshold is 2.5", () => {
+    // Measured (400 000 no-ops, standard error of the estimate ≈ 0.03 points): 4.9 % at 2, 3.2 % at 2.5.
+    const at2 = simulate({ ...noop, repeat: 5, confirmAt: 2 })
+    const at25 = simulate({ ...noop, repeat: 5, confirmAt: CONFIRM_AT })
+    expect(at2).toBeGreaterThan(0.045)
+    expect(at2).toBeLessThan(0.053)
+    expect(at2).toBeGreaterThan(0.03) // the design's condition for raising the threshold
+    expect(at25).toBeGreaterThan(0.029)
+    expect(at25).toBeLessThan(0.036)
   })
 
-  test("no-op experiments, repeat 3 and 10: same picture", () => {
-    expect(simulate({ repeat: 3, effectPct: 0, attempts: 50, sessions: 2000, seed: 7 })).toBeLessThan(0.04)
-    expect(simulate({ repeat: 10, effectPct: 0, attempts: 50, sessions: 2000, seed: 7 })).toBeLessThan(0.03)
+  test("no-ops, other repeat counts (measured: repeat 3 ≈ 4.2 %, repeat 10 ≈ 1.7 %)", () => {
+    // Repeat 3 judges on 6 + 3 samples; the candidate's spread estimate is rough there.
+    expect(simulate({ ...noop, repeat: 3, confirmAt: CONFIRM_AT })).toBeLessThan(0.05)
+    expect(simulate({ ...noop, repeat: 10, confirmAt: CONFIRM_AT })).toBeLessThan(0.025)
   })
 
-  test("a real 5 % gain, repeat 5: mostly confirmed", () => {
-    const rate = simulate({ repeat: 5, effectPct: 5, attempts: 1, sessions: 20000, seed: 42 })
-    expect(rate).toBeGreaterThan(0.8) // measured ≈ 90 %
+  test("no-ops in a row with the ratchet: far fewer (measured ≈ 0.05 % per no-op)", () => {
+    expect(simulate({ ...noop, repeat: 5, confirmAt: CONFIRM_AT, ratchet: true })).toBeLessThan(0.003)
   })
 
-  test("a real 10 % gain is practically always confirmed", () => {
-    expect(simulate({ repeat: 5, effectPct: 10, attempts: 1, sessions: 5000, seed: 1 })).toBeGreaterThan(0.99)
+  test("a real 5 % gain, repeat 5: practically always confirmed (measured: 100 %); a 2 % gain about half the time (≈ 48 %)", () => {
+    expect(simulate({ repeat: 5, effect: 0.05, confirmAt: CONFIRM_AT, trials: 100_000, seed: 7 })).toBeGreaterThan(0.999)
+    const small = simulate({ repeat: 5, effect: 0.02, confirmAt: CONFIRM_AT, trials: 100_000, seed: 7 })
+    expect(small).toBeGreaterThan(0.4)
+    expect(small).toBeLessThan(0.56)
   })
 })
 

@@ -11,10 +11,12 @@
 //     and every later keep and discard then fails on the lock.
 //   - Output is capped while it's captured. One benchmark printed a 3 MB line and all of
 //     it reached the model.
+//   - Every git call runs with hooks off. The plugin calls git many times per experiment,
+//     and a user's post-index-change (or post-checkout…) hook ran on each of them.
 
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { copyFile, mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises"
+import { copyFile, lstat, mkdtemp, readdir, readFile, readlink, rm, stat, utimes } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { isAbsolute, join } from "node:path"
 
@@ -174,12 +176,24 @@ export interface GitOptions {
 }
 
 /**
+ * Hooks off, for every git call the plugin makes. Not only commit hooks: git runs
+ * post-index-change whenever an index is written (also our temporary ones) and
+ * post-checkout on restores; a slow or failing hook there stalls or breaks the loop, and a
+ * hook with side effects would run dozens of times per experiment. The user's hooks still
+ * apply to what they do themselves and to what they merge later.
+ */
+export const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
+
+/**
  * Run git with an argument list. On timeout it gets SIGTERM (so it removes its lock
  * files), SIGKILL only if it ignores that, and the output says "timed out".
  * GIT_TERMINAL_PROMPT=0: nobody is there to answer a credentials prompt.
+ * NO_HOOKS is put in front unless the caller's list already starts with it (the exported
+ * command constants do, so the permission prompt shows the command exactly as it runs).
  */
 export async function git(args: string[], cwd: string, options: GitOptions = {}): Promise<ShellResult> {
   const timeoutMs = options.timeoutMs ?? GIT_TIMEOUT_MS
+  if (args[0] !== NO_HOOKS[0] || args[1] !== NO_HOOKS[1]) args = [...NO_HOOKS, ...args]
   const res = await run("git", args, {
     cwd,
     timeoutMs,
@@ -203,7 +217,7 @@ export const SCOPE = ["--", ".", ":(exclude,glob)**/.auto/**", ":(exclude,glob)*
 
 // The git commands that change the repo, as argument lists. They're exported so the
 // permission check can show the user exactly what will run.
-export const GIT_ADD = ["add", "-A", ...SCOPE]
+export const GIT_ADD = [...NO_HOOKS, "add", "-A", ...SCOPE]
 /**
  * Experiment commits skip hooks and signing: a hook that runs lint or tests, or a signing
  * prompt with no terminal, hangs or fails an unattended loop. The user's hooks still apply
@@ -213,10 +227,9 @@ export const GIT_ADD = ["add", "-A", ...SCOPE]
  * hooks folder is pointed at nothing as well.
  */
 export const GIT_COMMIT = [
+  ...NO_HOOKS,
   "-c",
   "commit.gpgsign=false",
-  "-c",
-  "core.hooksPath=/dev/null",
   "commit",
   "--no-verify",
   "-q",
@@ -224,8 +237,13 @@ export const GIT_COMMIT = [
   "-",
   ...SCOPE,
 ]
-export const GIT_RESTORE = ["restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE]
-export const GIT_CLEAN = ["clean", "-fd", ...SCOPE]
+export const GIT_RESTORE = [...NO_HOOKS, "restore", "--source=HEAD", "--staged", "--worktree", ...SCOPE]
+export const GIT_CLEAN = [...NO_HOOKS, "clean", "-fd", ...SCOPE]
+/**
+ * The swap of a paired confirmation (see swapScope). Two tree ids follow at run time, so
+ * this prefix is what the permission prompt shows and what "always allow" can match.
+ */
+export const GIT_SWAP = [...NO_HOOKS, "read-tree", "-m", "-u"]
 
 /** A git argument list as the command line a person would type (for permission prompts). */
 export const gitCommandLine = (args: string[]) =>
@@ -292,6 +310,17 @@ export async function headTree(cwd: string): Promise<string | null> {
  * result doesn't depend on what happens to be staged.
  */
 export async function scopeTreeHash(cwd: string): Promise<{ ok: true; tree: string } | { ok: false; error: string }> {
+  return withScopeIndex(cwd, async (tree) => ({ ok: true as const, tree }))
+}
+
+/**
+ * Build the temporary index described at scopeTreeHash, write its tree, and hand both to
+ * `then` while the index still exists (the swap needs an index that matches the files).
+ */
+async function withScopeIndex<T>(
+  cwd: string,
+  then: (tree: string, env: Record<string, string>) => Promise<T>,
+): Promise<T | { ok: false; error: string }> {
   const dir = await mkdtemp(join(tmpdir(), "autoresearch-index-"))
   const env = { GIT_INDEX_FILE: join(dir, "index") }
   try {
@@ -313,10 +342,130 @@ export async function scopeTreeHash(cwd: string): Promise<{ ok: true; tree: stri
     if (add.code !== 0) return { ok: false, error: `git add (temporary index) failed: ${add.output.trim()}` }
     const tree = await git(["write-tree"], cwd, { env })
     if (tree.code !== 0) return { ok: false, error: `git write-tree failed: ${tree.output.trim()}` }
-    return { ok: true, tree: tree.output.trim() }
+    return await then(tree.output.trim(), env)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+}
+
+/**
+ * Make the scope's files equal `target`, a tree that scopeTreeHash() produced earlier (the
+ * candidate's fingerprint) or HEAD's tree. This is the swap of the paired confirmation:
+ * candidate → HEAD → candidate → HEAD → candidate.
+ *
+ * How: a temporary index is filled with the files as they are now (tree A), then
+ * `git read-tree -m -u A target` moves index and files from A to the target. That is the
+ * machinery behind `git checkout <branch>`, and it has the properties the swap needs:
+ *   - Only paths that differ between A and the target are written or deleted. Both trees
+ *     are "HEAD with the scope replaced", so `.auto/`, other packages of a monorepo and
+ *     their uncommitted changes are equal on both sides and never touched.
+ *   - Ignored files are in neither tree (git add skips them), so node_modules and build
+ *     caches stay. The one way to lose one: the target has a file at a path where an
+ *     ignored file sits now, and read-tree overwrites ignored files without asking (git
+ *     ≥ 2.34). So that case is looked for first and refused (occupiedPaths).
+ *   - Unchanged files keep their mtime; changed ones get a new one, so a benchmark that
+ *     builds incrementally rebuilds what was swapped, as after a checkout.
+ *   - The real index and HEAD are never touched. Everything the files held before is in
+ *     git's object store as tree A, so no state is lost even if something goes wrong.
+ * Afterwards the result is checked by hashing the files again: equal to `target` or an error.
+ *
+ * A swap never overwrites a file nobody told it about. The caller says where the files
+ * are expected to be:
+ * - `expect.exactly`: the files must hash to this tree (the steps of a confirmation: the
+ *   candidate before going to HEAD, HEAD before going back). An edit made meanwhile, by a
+ *   parallel tool call or by the user, is refused instead of silently replaced.
+ * - `expect.oneOf`: every path must equal its version in one of these trees or in the
+ *   target (putting the candidate back after an abort, and crash recovery, where a swap
+ *   may be half done). A path at none of these versions is someone's edit: refused.
+ * A refusal for these reasons, or for an ignored file in the way, has `untouched: true`:
+ * nothing on disk was changed.
+ */
+export async function swapScope(
+  cwd: string,
+  target: string,
+  expect?: { exactly: string } | { oneOf: string[] },
+): Promise<{ ok: true; from: string } | { ok: false; error: string; from?: string; untouched?: true }> {
+  const names = (paths: string[]) => `${paths.slice(0, 10).join(", ")}${paths.length > 10 ? ", …" : ""}`
+  const swapped = await withScopeIndex(cwd, async (from, env) => {
+    if (from === target) return { ok: true as const, from }
+    const refuse = (error: string) => ({ ok: false as const, from, error, untouched: true as const })
+    if (expect) {
+      const foreign = await foreignPaths(cwd, from, "exactly" in expect ? [expect.exactly] : [target, ...expect.oneOf])
+      if (foreign === null) return refuse("git diff failed while checking the working tree")
+      if (foreign.length) return refuse(`these files were changed by something else: ${names(foreign)}`)
+    }
+    const occupied = await occupiedPaths(cwd, from, target)
+    if (occupied === null) return refuse("git diff failed while checking the working tree")
+    if (occupied.length) return refuse(`gitignored files are in the way and would be overwritten: ${names(occupied)}`)
+    const res = await git([...GIT_SWAP, from, target], cwd, { env })
+    if (res.code !== 0) return { ok: false as const, from, error: `git read-tree failed: ${res.output.trim()}` }
+    return { ok: true as const, from }
+  })
+  if (!swapped.ok) return swapped
+  if (swapped.from === target) return swapped
+  // Trust nothing: hash what is on disk now. (A changed submodule pointer, for one, is
+  // something read-tree doesn't check out.)
+  const after = await scopeTreeHash(cwd)
+  if (!after.ok) return { ok: false, from: swapped.from, error: after.error }
+  if (after.tree !== target) {
+    return { ok: false, from: swapped.from, error: "the files don't match the expected tree after the swap (submodules, or files changed meanwhile)" }
+  }
+  return swapped
+}
+
+/**
+ * Paths that `target` has and `from` doesn't, but where something exists on disk. `from`
+ * is the tree of the files as they are (ignored ones left out), so whatever sits there is
+ * an ignored file or folder, which the swap would overwrite or replace. Null when git fails.
+ */
+async function occupiedPaths(cwd: string, from: string, target: string): Promise<string[] | null> {
+  const added = await git(["diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", from, target], cwd)
+  const top = await git(["rev-parse", "--show-toplevel"], cwd)
+  if (added.code !== 0 || top.code !== 0) return null
+  const root = top.output.trim()
+  const occupied: string[] = []
+  for (const path of added.output.split("\0").filter(Boolean)) {
+    // The path itself, or a parent that is a file where a folder is needed.
+    const parts = path.split("/")
+    for (let i = parts.length; i >= 1; i--) {
+      const info = await lstat(join(root, ...parts.slice(0, i))).catch(() => null)
+      if (!info) continue
+      if (i === parts.length || !info.isDirectory()) occupied.push(parts.slice(0, i).join("/"))
+      break
+    }
+  }
+  return [...new Set(occupied)]
+}
+
+/** Paths whose version in `tree` equals none of their versions in `known`. Null when git fails. */
+async function foreignPaths(cwd: string, tree: string, known: string[]): Promise<string[] | null> {
+  let foreign: string[] | undefined
+  for (const other of known) {
+    const res = await git(["diff", "--name-only", "--no-renames", "-z", tree, other], cwd)
+    if (res.code !== 0) return null
+    const differing = new Set(res.output.split("\0").filter(Boolean))
+    foreign = foreign === undefined ? [...differing] : foreign.filter((p) => differing.has(p))
+  }
+  return foreign ?? []
+}
+
+/**
+ * Lines added and removed between two trees (binary files count as 0). With HEAD's tree
+ * and a candidate's fingerprint tree this is the experiment's whole diff, new files included.
+ */
+export async function diffLineCounts(cwd: string, treeA: string, treeB: string): Promise<{ added: number; removed: number } | null> {
+  const res = await git(["diff", "--numstat", "--no-renames", treeA, treeB], cwd)
+  if (res.code !== 0) return null
+  let added = 0
+  let removed = 0
+  for (const line of res.output.split("\n")) {
+    const m = line.match(/^(\d+)\t(\d+)\t/)
+    if (m) {
+      added += Number(m[1])
+      removed += Number(m[2])
+    }
+  }
+  return { added, removed }
 }
 
 /**
@@ -352,6 +501,79 @@ export async function fileHash(path: string): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+/** Files under `.auto/` that are session state, not benchmark input: they change during a session by design. */
+const UNFROZEN = new Set(["log.jsonl", "ideas.md", "config.json", "prompt.md"])
+/** Hashed on their own (measure_hash, checks_hash), so not part of the inputs hash. */
+const BENCHMARK_SCRIPTS = new Set(["measure.sh", "checks.sh"])
+
+export interface FrozenInputs {
+  /** One hash over all files below; equal hashes mean equal files. */
+  hash: string
+  /** Path relative to `.auto/` → content hash, to say WHICH file changed. */
+  files: Record<string, string>
+}
+
+/**
+ * Everything else under `.auto/`: helper files a benchmark may read (a workload size, test
+ * data, a script it sources). They're frozen with the benchmark, because a benchmark that
+ * read `.auto/scale` was "improved" by editing that file while measure.sh's hash stayed
+ * the same. `.auto/` is outside the scope, so the tree fingerprint doesn't see these files.
+ */
+export async function frozenInputs(autoDir: string): Promise<FrozenInputs> {
+  const files: Record<string, string> = {}
+  const walk = async (dir: string, prefix: string) => {
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return // no .auto/ yet
+    }
+    for (const entry of entries) {
+      const rel = prefix + entry.name
+      if (!prefix && (UNFROZEN.has(entry.name) || BENCHMARK_SCRIPTS.has(entry.name))) continue
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) await walk(path, `${rel}/`)
+      else if (entry.isSymbolicLink()) files[rel] = `link:${await readlink(path).catch(() => "?")}`
+      else files[rel] = (await fileHash(path)) ?? "unreadable"
+    }
+  }
+  await walk(autoDir, "")
+  const hash = createHash("sha256")
+  for (const rel of Object.keys(files).sort()) hash.update(`${rel}\0${files[rel]}\n`)
+  return { hash: hash.digest("hex"), files }
+}
+
+/** Names of the files that differ between two frozenInputs() results. */
+export function changedInputs(a: Record<string, string>, b: Record<string, string>): string[] {
+  return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((k) => a[k] !== b[k]).sort()
+}
+
+/**
+ * `git status` of the benchmark scripts, "" when both are exactly as committed at HEAD.
+ * Untracked ("??"), ignored ("!!"), modified, staged and mode changes all show up.
+ */
+export async function benchmarkScriptStatus(cwd: string): Promise<{ ok: true; status: string } | { ok: false; error: string }> {
+  const res = await git(["status", "--porcelain", "--ignored", "--untracked-files=all", "--", ".auto/measure.sh", ".auto/checks.sh"], cwd)
+  if (res.code !== 0) return { ok: false, error: res.output.trim() }
+  return { ok: true, status: res.output.trimEnd() }
+}
+
+/**
+ * `autoresearch/*` branches that hold a session for this folder (`.auto/prompt.md` at the
+ * folder's path), newest commit first. Used when `/autoresearch` runs on a branch without
+ * session files: the session is probably on one of these.
+ */
+export async function sessionBranches(cwd: string): Promise<string[]> {
+  const list = await git(["branch", "--list", "autoresearch/*", "--sort=-committerdate", "--format=%(refname:short)"], cwd)
+  if (list.code !== 0) return []
+  const prefix = (await git(["rev-parse", "--show-prefix"], cwd)).output.trim()
+  const found: string[] = []
+  for (const branch of list.output.split("\n").filter(Boolean)) {
+    if ((await git(["cat-file", "-e", `${branch}:${prefix}.auto/prompt.md`], cwd)).code === 0) found.push(branch)
+  }
+  return found
 }
 
 // ── Commands that change the repo ─────────────────────────
